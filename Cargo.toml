@@ -10,3 +10,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "process", "net", "time"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+vt100 = "0.15"
+
+[dev-dependencies]
+# start_paused = true でプロセス kill の猶予待ちを実時間で待たないため。
+tokio = { version = "1", features = ["test-util"] }

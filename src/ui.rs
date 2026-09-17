@@ -5,7 +5,27 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+/// 再生中は [映像, ステータス, ヘルプ] の3段。映像に残り全体を渡す。
+fn playing_areas(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area)
+}
+
+/// mpv に渡す `--vo-tct-width/height` は描画先と同じ寸法でなければならない。
+pub fn video_area(area: Rect) -> Rect {
+    playing_areas(area)[0]
+}
+
 pub fn draw(frame: &mut Frame, app: &App) {
+    if app.mode == Mode::Playing {
+        draw_playing(frame, app);
+        return;
+    }
+
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -41,6 +61,22 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     frame.render_stateful_widget(list, areas[1], &mut state);
 
+    draw_footer(frame, app, areas[2], areas[3]);
+
+    if app.mode == Mode::Input {
+        frame.set_cursor_position((cursor_x(areas[0], &app.query), areas[0].y + 1));
+    }
+}
+
+fn draw_playing(frame: &mut Frame, app: &App) {
+    let [video, status, help] = playing_areas(frame.area());
+    if let Some(screen) = &app.video {
+        screen.render(video, frame.buffer_mut());
+    }
+    draw_footer(frame, app, status, help);
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
     let status_style = if app.error.is_some() {
         Style::default().fg(Color::Red)
     } else {
@@ -48,16 +84,12 @@ pub fn draw(frame: &mut Frame, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(app.status_line()).style(status_style),
-        areas[2],
+        status,
     );
     frame.render_widget(
         Paragraph::new(help_text(app.mode)).style(Style::default().fg(Color::DarkGray)),
-        areas[3],
+        help,
     );
-
-    if app.mode == Mode::Input {
-        frame.set_cursor_position((cursor_x(areas[0], &app.query), areas[0].y + 1));
-    }
 }
 
 /// 全角文字はセル幅2で描画されるため、文字数ではなく表示幅で桁を数える。

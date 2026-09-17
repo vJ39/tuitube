@@ -2,6 +2,7 @@ mod app;
 mod mpv;
 mod search;
 mod ui;
+mod video;
 
 use anyhow::Result;
 use app::{App, AppEvent, Mode, Playback};
@@ -10,12 +11,16 @@ use crossterm::event::{
 };
 use mpv::MpvController;
 use ratatui::DefaultTerminal;
+use ratatui::layout::Rect;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
+use video::VideoScreen;
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// ドラッグ中は Resize が連続して届くので、落ち着くまで mpv の作り直しを待つ。
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
 
 struct Player {
     controller: MpvController,
@@ -28,6 +33,9 @@ struct Session {
     player_nonce: u64,
     search_nonce: u64,
     search_task: Option<JoinHandle<()>>,
+    /// 直近の端末サイズと、それを映像へ反映する時刻。
+    pending_resize: Option<(u16, u16)>,
+    resize_at: Option<Instant>,
 }
 
 #[tokio::main]
@@ -63,6 +71,10 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     }
                 }
             }
+            _ = wait_until(session.resize_at) => {
+                session.resize_at = None;
+                apply_resize(&mut app, &mut session).await;
+            }
         }
         if app.should_quit {
             break;
@@ -71,20 +83,33 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     if let Some(task) = session.search_task.take() {
         task.abort();
     }
+    stop_playback(&mut session).await;
     Ok(())
+}
+
+/// 予定が無いときは永久に待つ (select! の他の枝だけを動かす)。
+async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn spawn_input_reader(tx: UnboundedSender<AppEvent>) {
     std::thread::spawn(move || {
         loop {
-            match event::read() {
+            let sent = match event::read() {
                 Ok(CrosstermEvent::Key(key)) if key.kind == KeyEventKind::Press => {
-                    if tx.send(AppEvent::Key(key)).is_err() {
-                        break;
-                    }
+                    tx.send(AppEvent::Key(key))
                 }
-                Ok(_) => {}
+                Ok(CrosstermEvent::Resize(width, height)) => {
+                    tx.send(AppEvent::Resize { width, height })
+                }
+                Ok(_) => Ok(()),
                 Err(_) => break,
+            };
+            if sent.is_err() {
+                break;
             }
         }
     });
@@ -98,6 +123,11 @@ async fn handle_event(
 ) {
     match event {
         AppEvent::Key(key) => handle_key(app, key, tx, session).await,
+        AppEvent::Resize { width, height } => {
+            // 連続して届くので、最後の1つだけを少し置いてから反映する。
+            session.pending_resize = Some((width, height));
+            session.resize_at = Some(Instant::now() + RESIZE_DEBOUNCE);
+        }
         AppEvent::SearchDone { nonce, result } => {
             if nonce != session.search_nonce {
                 return;
@@ -117,21 +147,39 @@ async fn handle_event(
                 app.apply_property(id, data);
             }
         }
+        AppEvent::VideoFrame { nonce } => {
+            // このループは1周ごとに描き直すので、要求を受け取るだけで次の描画に乗る。
+            if session.player.as_ref().is_some_and(|p| p.nonce == nonce)
+                && let Some(video) = &app.video
+            {
+                video.clear_redraw();
+            }
+        }
+        AppEvent::VideoError { nonce, error } => {
+            if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
+                end_playback(app, session, Some(error)).await;
+            }
+        }
         AppEvent::MpvExited { nonce, error } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
-                session.player = None;
-                app.playback = Playback::default();
-                if error.is_some() {
-                    app.error = error;
-                }
-                app.mode = if app.results.is_empty() {
-                    Mode::Input
-                } else {
-                    Mode::Results
-                };
+                end_playback(app, session, error).await;
             }
         }
     }
+}
+
+async fn end_playback(app: &mut App, session: &mut Session, error: Option<String>) {
+    stop_playback(session).await;
+    app.playback = Playback::default();
+    app.video = None;
+    if error.is_some() {
+        app.error = error;
+    }
+    app.mode = if app.results.is_empty() {
+        Mode::Input
+    } else {
+        Mode::Results
+    };
 }
 
 async fn handle_key(
@@ -231,22 +279,59 @@ async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: 
     stop_playback(session).await;
     session.player_nonce += 1;
     let nonce = session.player_nonce;
-    match MpvController::launch(&result.url(), nonce, tx.clone()).await {
+    let video = video_screen();
+    match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone()).await {
         Ok(controller) => {
             app.playback = Playback {
                 title: result.title.clone(),
                 ..Playback::default()
             };
+            app.video = Some(video);
             app.mode = Mode::Playing;
             app.error = None;
             session.player = Some(Player { controller, nonce });
         }
-        Err(e) => app.error = Some(e),
+        Err(e) => {
+            app.video = None;
+            app.error = Some(e);
+        }
+    }
+}
+
+fn video_screen() -> VideoScreen {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (width, height) = video_size(cols, rows);
+    VideoScreen::new(width, height)
+}
+
+/// mpv に渡す寸法は ratatui の映像領域と一致していなければならない。
+fn video_size(cols: u16, rows: u16) -> (u16, u16) {
+    let area = ui::video_area(Rect::new(0, 0, cols, rows));
+    (area.width.max(1), area.height.max(1))
+}
+
+/// 端末サイズが変わったら、仮想画面と mpv の出力寸法を作り直して食い違いを解消する。
+async fn apply_resize(app: &mut App, session: &mut Session) {
+    let Some((cols, rows)) = session.pending_resize.take() else {
+        return;
+    };
+    let Some(video) = app.video.clone() else {
+        return;
+    };
+    let (width, height) = video_size(cols, rows);
+    if video.size() == (width, height) {
+        return;
+    }
+    video.resize(width, height);
+    if let Some(p) = session.player.as_mut()
+        && let Err(e) = p.controller.resize_video(width, height).await
+    {
+        app.error = Some(e);
     }
 }
 
 async fn stop_playback(session: &mut Session) {
-    if let Some(mut p) = session.player.take() {
-        let _ = p.controller.send(&mpv::quit()).await;
+    if let Some(p) = session.player.take() {
+        p.controller.shutdown().await;
     }
 }

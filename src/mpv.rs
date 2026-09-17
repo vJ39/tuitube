@@ -1,4 +1,5 @@
 use crate::app::AppEvent;
+use crate::video::VideoScreen;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs;
@@ -7,12 +8,13 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::{Instant, sleep};
+use tokio::sync::oneshot;
+use tokio::time::{Instant, sleep, timeout};
 
 pub const REQ_TIME_POS: u64 = 1;
 pub const REQ_DURATION: u64 = 2;
@@ -21,6 +23,8 @@ pub const REQ_VOLUME: u64 = 4;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+/// quit を送ってから SIGKILL に切り替えるまでの猶予。
+const QUIT_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct MpvCommand {
@@ -63,6 +67,24 @@ pub fn quit() -> MpvCommand {
         command: vec![json!("quit")],
         request_id: None,
     }
+}
+
+fn set_property(name: &str, value: Value) -> MpvCommand {
+    MpvCommand {
+        command: vec![json!("set_property"), json!(name), value],
+        request_id: None,
+    }
+}
+
+/// tct の寸法はオプションを書き換えるだけでは反映されない (実測: 出力サイズが変わらない)。
+/// 映像トラックを外して入れ直すと VO が作り直され、新しい寸法で描き始める。
+pub fn resize_video(width: u16, height: u16) -> [MpvCommand; 4] {
+    [
+        set_property("vo-tct-width", json!(width)),
+        set_property("vo-tct-height", json!(height)),
+        set_property("vid", json!("no")),
+        set_property("vid", json!("auto")),
+    ]
 }
 
 pub fn get_property(name: &str, request_id: u64) -> MpvCommand {
@@ -223,6 +245,8 @@ pub struct MpvController {
     writer: OwnedWriteHalf,
     socket_path: PathBuf,
     log_path: PathBuf,
+    /// 送信側を落とすと終了待ちタスクが猶予後に mpv を kill する。
+    _kill: oneshot::Sender<()>,
 }
 
 impl MpvController {
@@ -230,6 +254,7 @@ impl MpvController {
         url: &str,
         nonce: u64,
         events: UnboundedSender<AppEvent>,
+        video: VideoScreen,
     ) -> Result<Self, String> {
         let dir = socket_dir()?;
         let socket_path = socket_path(&dir, nonce);
@@ -237,15 +262,20 @@ impl MpvController {
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_file(&log_path);
 
+        let (width, height) = video.size();
         // --no-terminal: mpv shares this terminal and its status line would corrupt the TUI.
         // --log-file: そのぶん失われる失敗理由の受け皿。
+        // --vo-tct-width/height: stdout がパイプだと TTY 検出に失敗し何も描かないため明示する。
         let mut child = Command::new("mpv")
             .arg(format!("--input-ipc-server={}", socket_path.display()))
             .arg(format!("--log-file={}", log_path.display()))
             .arg("--no-terminal")
+            .arg("--vo=tct")
+            .arg(format!("--vo-tct-width={width}"))
+            .arg(format!("--vo-tct-height={height}"))
             .arg(url)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -256,6 +286,9 @@ impl MpvController {
                     format!("mpv の起動に失敗しました: {e}")
                 }
             })?;
+
+        // IPC 接続を待つ間にパイプが詰まって mpv が止まらないよう、先に読み手を立てる。
+        spawn_video_reader(child.stdout.take(), video, events.clone(), nonce);
 
         let stream = match connect_with_retry(&socket_path, &mut child).await {
             Ok(stream) => stream,
@@ -282,10 +315,9 @@ impl MpvController {
             }
         });
 
+        // 終了要求を待てるよう、stderr の吸い出しは別タスクにする。
         let stderr = child.stderr.take();
-        let exit_socket = socket_path.clone();
-        let exit_log = log_path.clone();
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut stderr_tail = String::new();
             if let Some(stderr) = stderr {
                 let mut lines = BufReader::new(stderr).lines();
@@ -296,7 +328,16 @@ impl MpvController {
                     }
                 }
             }
-            let error = match child.wait().await {
+            stderr_tail
+        });
+
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let exit_socket = socket_path.clone();
+        let exit_log = log_path.clone();
+        tokio::spawn(async move {
+            let status = wait_or_kill(&mut child, kill_rx).await;
+            let stderr_tail = stderr_task.await.unwrap_or_default();
+            let error = match status {
                 Ok(status) if !status.success() => Some(with_detail(
                     format!("mpv が異常終了しました ({})", describe_status(status)),
                     &failure_detail(stderr_tail, &exit_log),
@@ -314,6 +355,7 @@ impl MpvController {
             writer,
             socket_path,
             log_path,
+            _kill: kill_tx,
         })
     }
 
@@ -335,6 +377,35 @@ impl MpvController {
         }
         Ok(())
     }
+
+    /// 端末リサイズに合わせて映像の寸法を作り直す。
+    pub async fn resize_video(&mut self, width: u16, height: u16) -> Result<(), String> {
+        for command in resize_video(width, height) {
+            self.send(&command).await?;
+        }
+        Ok(())
+    }
+
+    /// quit を送って手放す。届かなくても終了待ちタスクが猶予後に kill するので取り残さない。
+    pub async fn shutdown(mut self) {
+        let _ = self.send(&quit()).await;
+    }
+}
+
+/// 終了要求 (kill 送信側の drop を含む) が来たら、猶予を置いてから確実に落とす。
+async fn wait_or_kill(
+    child: &mut Child,
+    mut kill: oneshot::Receiver<()>,
+) -> std::io::Result<ExitStatus> {
+    tokio::select! {
+        status = child.wait() => return status,
+        _ = &mut kill => {}
+    }
+    if let Ok(status) = timeout(QUIT_GRACE, child.wait()).await {
+        return status;
+    }
+    let _ = child.start_kill();
+    child.wait().await
 }
 
 impl Drop for MpvController {
@@ -345,6 +416,45 @@ impl Drop for MpvController {
             let _ = fs::remove_dir(dir);
         }
     }
+}
+
+/// `--vo=tct` の ANSI 列を仮想端末へ流し込み続ける。実端末へは書かない。
+/// フレームが揃うたびに再描画を促す (これが無いと画面はティッカー任せの毎秒1回になる)。
+fn spawn_video_reader(
+    stdout: Option<ChildStdout>,
+    video: VideoScreen,
+    events: UnboundedSender<AppEvent>,
+    nonce: u64,
+) {
+    let Some(mut stdout) = stdout else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            match stdout.read(&mut buffer).await {
+                // mpv が stdout を閉じた = 再生終了。終了は wait 側が通知する。
+                Ok(0) => break,
+                Ok(n) => {
+                    if video.feed(&buffer[..n])
+                        && video.request_redraw()
+                        && events.send(AppEvent::VideoFrame { nonce }).is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                // 黙って抜けると mpv だけが生き残るので、停止の判断は UI 側へ渡す。
+                Err(e) => {
+                    let _ = events.send(AppEvent::VideoError {
+                        nonce,
+                        error: format!("mpv の映像出力を読めません: {e}"),
+                    });
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn kill_and_collect_stderr(mut child: Child) -> String {
@@ -422,6 +532,21 @@ mod tests {
     #[test]
     fn serializes_quit() {
         assert_eq!(quit().to_line(), "{\"command\":[\"quit\"]}\n");
+    }
+
+    #[test]
+    fn resize_sets_the_size_then_reinitializes_the_video() {
+        let lines: Vec<String> = resize_video(100, 30).iter().map(|c| c.to_line()).collect();
+        assert_eq!(
+            lines,
+            [
+                "{\"command\":[\"set_property\",\"vo-tct-width\",100]}\n",
+                "{\"command\":[\"set_property\",\"vo-tct-height\",30]}\n",
+                // 寸法だけ変えても tct は描き直さないので、映像トラックを入れ直す。
+                "{\"command\":[\"set_property\",\"vid\",\"no\"]}\n",
+                "{\"command\":[\"set_property\",\"vid\",\"auto\"]}\n",
+            ]
+        );
     }
 
     #[test]
@@ -545,6 +670,59 @@ mod tests {
             "mpv が異常終了しました: no such file"
         );
         assert_eq!(with_detail("boom".to_string(), ""), "boom");
+    }
+
+    #[tokio::test]
+    async fn video_reader_asks_for_a_redraw_once_per_frame() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            // mpv と同じく synchronized output で囲んだ2フレーム。
+            .arg(
+                "printf '\\033[?2026h\\033[0;0fAB\\033[?2026l\\033[?2026h\\033[0;0fCD\\033[?2026l'",
+            )
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn printf");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let video = VideoScreen::new(2, 1);
+        spawn_video_reader(child.stdout.take(), video.clone(), tx, 7);
+
+        let event = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("redraw request must arrive")
+            .expect("channel stays open");
+        assert!(matches!(event, AppEvent::VideoFrame { nonce: 7 }));
+
+        let _ = child.wait().await;
+        // 通知を受けた側が片付けるまで、次の要求は畳まれる。
+        assert!(!video.request_redraw());
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
+        video.render(ratatui::layout::Rect::new(0, 0, 2, 1), &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), "C");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_kills_a_child_that_ignores_the_request() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let (kill_tx, kill_rx) = oneshot::channel();
+        // MpvController を手放した状況 (quit が届かなかった場合) を模す。
+        drop(kill_tx);
+        let status = wait_or_kill(&mut child, kill_rx).await.expect("wait");
+        assert!(!status.success());
+        assert_eq!(status.code(), None, "SIGKILL で落ちるはず");
+    }
+
+    #[tokio::test]
+    async fn wait_or_kill_reports_the_real_exit_status() {
+        let mut child = Command::new("false").spawn().expect("spawn false");
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let status = wait_or_kill(&mut child, kill_rx).await.expect("wait");
+        assert_eq!(status.code(), Some(1));
+        drop(kill_tx);
     }
 
     #[tokio::test]

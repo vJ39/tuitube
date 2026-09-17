@@ -1,9 +1,14 @@
 use crate::search::SearchResult;
+use crate::video::VideoScreen;
 use crossterm::event::KeyEvent;
 use serde_json::Value;
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Resize {
+        width: u16,
+        height: u16,
+    },
     // nonce identifies the search, so results of a superseded query are ignored.
     SearchDone {
         nonce: u64,
@@ -14,6 +19,15 @@ pub enum AppEvent {
         nonce: u64,
         id: u64,
         data: Option<Value>,
+    },
+    /// 映像が1フレーム揃った合図。これが無いと再描画はティッカー任せになる。
+    VideoFrame {
+        nonce: u64,
+    },
+    /// mpv の映像出力を読めなくなった。放っておくと mpv だけが生き残る。
+    VideoError {
+        nonce: u64,
+        error: String,
     },
     MpvExited {
         nonce: u64,
@@ -45,6 +59,8 @@ pub struct App {
     pub searching: bool,
     pub error: Option<String>,
     pub playback: Playback,
+    /// 再生中だけ、mpv の tct 出力を解釈した仮想画面が入る。
+    pub video: Option<VideoScreen>,
     pub should_quit: bool,
 }
 
@@ -58,6 +74,7 @@ impl Default for App {
             searching: false,
             error: None,
             playback: Playback::default(),
+            video: None,
             should_quit: false,
         }
     }
