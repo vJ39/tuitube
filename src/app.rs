@@ -1,5 +1,5 @@
 use crate::search::SearchResult;
-use crate::video::VideoScreen;
+use crate::video::VideoSink;
 use crossterm::event::KeyEvent;
 use serde_json::Value;
 
@@ -59,8 +59,8 @@ pub struct App {
     pub searching: bool,
     pub error: Option<String>,
     pub playback: Playback,
-    /// 再生中だけ、mpv の tct 出力を解釈した仮想画面が入る。
-    pub video: Option<VideoScreen>,
+    /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
+    pub video: Option<VideoSink>,
     pub should_quit: bool,
 }
 

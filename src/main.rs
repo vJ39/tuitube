@@ -1,4 +1,5 @@
 mod app;
+mod kitty;
 mod mpv;
 mod search;
 mod ui;
@@ -12,11 +13,12 @@ use crossterm::event::{
 use mpv::MpvController;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use std::io::Write;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
-use video::VideoScreen;
+use video::{Geometry, VideoSink};
 
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// ドラッグ中は Resize が連続して届くので、落ち着くまで mpv の作り直しを待つ。
@@ -36,6 +38,8 @@ struct Session {
     /// 直近の端末サイズと、それを映像へ反映する時刻。
     pending_resize: Option<(u16, u16)>,
     resize_at: Option<Instant>,
+    /// 再生が終わった後など、sink 越しに出せない画像削除の持ち越し。
+    owe_clear: bool,
 }
 
 #[tokio::main]
@@ -56,7 +60,9 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
-        terminal.draw(|frame| ui::draw(frame, &app))?;
+        // draw は必ず MoveTo で始まり SGR を閉じて flush するので、その直後なら割り込まずに書ける。
+        let area = ui::video_area(terminal.draw(|frame| ui::draw(frame, &app))?.area);
+        present_video(&mut session, &app, area, terminal.backend_mut())?;
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break };
@@ -84,7 +90,42 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         task.abort();
     }
     stop_playback(&mut session).await;
+    // alt screen を抜ければ仕様上は消えるが、端末差を当てにしない。
+    let mut out = Vec::new();
+    video::encode_clear(&mut out);
+    let backend = terminal.backend_mut();
+    let _ = backend.write_all(&out);
+    let _ = backend.flush();
     Ok(())
+}
+
+/// draw の直後に、保留中の画像削除と最新フレームを実端末へ書く。書き手はここだけ。
+fn present_video(
+    session: &mut Session,
+    app: &App,
+    area: Rect,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let mut pending = app
+        .video
+        .as_ref()
+        .and_then(VideoSink::take)
+        .unwrap_or_default();
+    if std::mem::take(&mut session.owe_clear) {
+        pending.clear = true;
+    }
+    if !pending.clear && pending.frame.is_none() {
+        return Ok(());
+    }
+    let cell = app
+        .video
+        .as_ref()
+        .map(|sink| sink.geometry().cell)
+        .unwrap_or(video::FALLBACK_CELL);
+    let mut bytes = Vec::new();
+    video::encode(&pending, area, cell, &mut bytes);
+    out.write_all(&bytes)?;
+    out.flush()
 }
 
 /// 予定が無いときは永久に待つ (select! の他の枝だけを動かす)。
@@ -172,6 +213,8 @@ async fn end_playback(app: &mut App, session: &mut Session, error: Option<String
     stop_playback(session).await;
     app.playback = Playback::default();
     app.video = None;
+    // sink を手放した後も残骸は消す。SIGKILL 経路では mpv 自身が消せない。
+    session.owe_clear = true;
     if error.is_some() {
         app.error = error;
     }
@@ -279,7 +322,7 @@ async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: 
     stop_playback(session).await;
     session.player_nonce += 1;
     let nonce = session.player_nonce;
-    let video = video_screen();
+    let video = VideoSink::new(video_geometry());
     match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone()).await {
         Ok(controller) => {
             app.playback = Playback {
@@ -298,19 +341,26 @@ async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: 
     }
 }
 
-fn video_screen() -> VideoScreen {
+fn video_geometry() -> Geometry {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let (width, height) = video_size(cols, rows);
-    VideoScreen::new(width, height)
+    geometry_for(cols, rows)
 }
 
 /// mpv に渡す寸法は ratatui の映像領域と一致していなければならない。
-fn video_size(cols: u16, rows: u16) -> (u16, u16) {
-    let area = ui::video_area(Rect::new(0, 0, cols, rows));
-    (area.width.max(1), area.height.max(1))
+fn geometry_for(cols: u16, rows: u16) -> Geometry {
+    // ピクセルを報告しない端末では既定のセル寸法で進める (画像が小さめに出るだけ)。
+    let cell = crossterm::terminal::window_size()
+        .ok()
+        .and_then(|size| video::cell_size(size.columns, size.rows, size.width, size.height))
+        .unwrap_or(video::FALLBACK_CELL);
+    Geometry::new(
+        ui::video_area(Rect::new(0, 0, cols, rows)),
+        cell,
+        video::MAX_FRAME_PIXELS,
+    )
 }
 
-/// 端末サイズが変わったら、仮想画面と mpv の出力寸法を作り直して食い違いを解消する。
+/// 端末サイズが変わったら、映像の寸法を mpv ごと作り直して食い違いを解消する。
 async fn apply_resize(app: &mut App, session: &mut Session) {
     let Some((cols, rows)) = session.pending_resize.take() else {
         return;
@@ -318,13 +368,13 @@ async fn apply_resize(app: &mut App, session: &mut Session) {
     let Some(video) = app.video.clone() else {
         return;
     };
-    let (width, height) = video_size(cols, rows);
-    if video.size() == (width, height) {
+    let geometry = geometry_for(cols, rows);
+    if video.geometry() == geometry {
         return;
     }
-    video.resize(width, height);
+    video.resize(geometry);
     if let Some(p) = session.player.as_mut()
-        && let Err(e) = p.controller.resize_video(width, height).await
+        && let Err(e) = p.controller.resize_video(geometry).await
     {
         app.error = Some(e);
     }
@@ -333,5 +383,162 @@ async fn apply_resize(app: &mut App, session: &mut Session) {
 async fn stop_playback(session: &mut Session) {
     if let Some(p) = session.player.take() {
         p.controller.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
+    use crate::search::SearchResult;
+    use crate::video::{CellSize, MAX_FRAME_PIXELS};
+
+    const CELL: CellSize = CellSize {
+        width_px: 8,
+        height_px: 16,
+    };
+
+    fn area() -> Rect {
+        Rect::new(0, 0, 80, 22)
+    }
+
+    fn sink() -> VideoSink {
+        VideoSink::new(Geometry::new(area(), CELL, MAX_FRAME_PIXELS))
+    }
+
+    fn clear_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        video::encode_clear(&mut out);
+        out
+    }
+
+    fn present(session: &mut Session, app: &App) -> Vec<u8> {
+        let mut out = Vec::new();
+        present_video(session, app, area(), &mut out).expect("Vec への書き込みは失敗しない");
+        out
+    }
+
+    fn result(id: &str) -> SearchResult {
+        SearchResult {
+            id: id.to_string(),
+            title: format!("title {id}"),
+            duration: None,
+            uploader: None,
+        }
+    }
+
+    #[test]
+    fn present_writes_nothing_when_there_is_nothing_to_show() {
+        let mut session = Session::default();
+        assert!(present(&mut session, &App::default()).is_empty());
+        // 再生中でも保留が無ければ何も書かない。
+        let app = App {
+            video: Some(sink()),
+            ..App::default()
+        };
+        assert!(present(&mut session, &app).is_empty());
+    }
+
+    #[test]
+    fn present_writes_clear_then_cup_then_frame() {
+        let video = sink();
+        assert!(video.feed(KITTY_RECONFIG));
+        assert!(video.feed(&frame(320, 176, b"DATA")));
+        let app = App {
+            video: Some(video),
+            ..App::default()
+        };
+        let mut session = Session::default();
+
+        let out = present(&mut session, &app);
+        // 40x11 セルの画像を 80x22 の領域に中央寄せした CUP が、削除列の直後に来る。
+        let mut expected = clear_bytes();
+        expected.extend_from_slice(b"\x1b[6;21H");
+        assert!(
+            out.starts_with(&expected),
+            "clear → CUP の順になっていない: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(out.ends_with(b"\x1b\\"), "APC が最後まで書かれていない");
+        // 取り出し済みなので次の周では何も書かない。
+        assert!(present(&mut session, &app).is_empty());
+    }
+
+    #[test]
+    fn present_consumes_the_owed_clear_without_a_sink() {
+        // sink を手放した後の持ち越し。セル寸法は FALLBACK_CELL に退避する。
+        let app = App::default();
+        assert!(app.video.is_none());
+        let mut session = Session {
+            owe_clear: true,
+            ..Session::default()
+        };
+        assert_eq!(present(&mut session, &app), clear_bytes());
+        assert!(!session.owe_clear);
+        assert!(present(&mut session, &app).is_empty());
+    }
+
+    #[test]
+    fn present_merges_the_owed_clear_with_a_pending_frame() {
+        let video = sink();
+        assert!(video.feed(&frame(320, 176, b"DATA")));
+        let app = App {
+            video: Some(video),
+            ..App::default()
+        };
+        let mut session = Session {
+            owe_clear: true,
+            ..Session::default()
+        };
+        let out = present(&mut session, &app);
+        assert!(out.starts_with(&clear_bytes()));
+        assert!(out.ends_with(b"\x1b\\"));
+        assert!(!session.owe_clear);
+    }
+
+    #[tokio::test]
+    async fn end_playback_owes_a_clear_that_the_next_present_writes() {
+        let mut app = App {
+            mode: Mode::Playing,
+            results: vec![result("a")],
+            video: Some(sink()),
+            playback: Playback {
+                title: "song".to_string(),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        let mut session = Session::default();
+        end_playback(&mut app, &mut session, Some("boom".to_string())).await;
+
+        assert!(session.owe_clear);
+        assert!(app.video.is_none());
+        assert_eq!(app.mode, Mode::Results);
+        assert_eq!(app.error.as_deref(), Some("boom"));
+        assert!(app.playback.title.is_empty());
+        assert_eq!(present(&mut session, &app), clear_bytes());
+    }
+
+    #[tokio::test]
+    async fn end_playback_without_results_returns_to_input() {
+        let mut app = App {
+            mode: Mode::Playing,
+            video: Some(sink()),
+            ..App::default()
+        };
+        let mut session = Session::default();
+        end_playback(&mut app, &mut session, None).await;
+
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.error.is_none());
+        assert!(session.owe_clear);
+    }
+
+    #[test]
+    fn geometry_matches_the_video_area_of_the_same_terminal_size() {
+        let geometry = geometry_for(80, 24);
+        assert_eq!(geometry.area, ui::video_area(Rect::new(0, 0, 80, 24)));
+        let pixels = u64::from(geometry.frame_px.0) * u64::from(geometry.frame_px.1);
+        assert!(pixels <= u64::from(video::MAX_FRAME_PIXELS), "{pixels} px");
     }
 }

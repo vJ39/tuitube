@@ -15,7 +15,7 @@ fn playing_areas(area: Rect) -> [Rect; 3] {
     .areas(area)
 }
 
-/// mpv に渡す `--vo-tct-width/height` は描画先と同じ寸法でなければならない。
+/// mpv に渡す `--vo-kitty-*` は描画先と同じ寸法でなければならない。
 pub fn video_area(area: Rect) -> Rect {
     playing_areas(area)[0]
 }
@@ -68,11 +68,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
+/// 映像領域には何も描かない。画像は draw の後にメインループが APC で重ねる。
 fn draw_playing(frame: &mut Frame, app: &App) {
-    let [video, status, help] = playing_areas(frame.area());
-    if let Some(screen) = &app.video {
-        screen.render(video, frame.buffer_mut());
-    }
+    let [_video, status, help] = playing_areas(frame.area());
     draw_footer(frame, app, status, help);
 }
 

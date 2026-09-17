@@ -1,5 +1,5 @@
 use crate::app::AppEvent;
-use crate::video::VideoScreen;
+use crate::video::{Geometry, VideoSink};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs;
@@ -76,12 +76,14 @@ fn set_property(name: &str, value: Value) -> MpvCommand {
     }
 }
 
-/// tct の寸法はオプションを書き換えるだけでは反映されない (実測: 出力サイズが変わらない)。
+/// VO のオプションは生成時にしか読まれないので、書き換えるだけでは反映されない (実測)。
 /// 映像トラックを外して入れ直すと VO が作り直され、新しい寸法で描き始める。
-pub fn resize_video(width: u16, height: u16) -> [MpvCommand; 4] {
+pub fn resize_video(geometry: Geometry) -> [MpvCommand; 6] {
     [
-        set_property("vo-tct-width", json!(width)),
-        set_property("vo-tct-height", json!(height)),
+        set_property("vo-kitty-cols", json!(geometry.area.width.max(1))),
+        set_property("vo-kitty-rows", json!(geometry.area.height.max(1))),
+        set_property("vo-kitty-width", json!(geometry.frame_px.0)),
+        set_property("vo-kitty-height", json!(geometry.frame_px.1)),
         set_property("vid", json!("no")),
         set_property("vid", json!("auto")),
     ]
@@ -254,7 +256,7 @@ impl MpvController {
         url: &str,
         nonce: u64,
         events: UnboundedSender<AppEvent>,
-        video: VideoScreen,
+        video: VideoSink,
     ) -> Result<Self, String> {
         let dir = socket_dir()?;
         let socket_path = socket_path(&dir, nonce);
@@ -262,17 +264,15 @@ impl MpvController {
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_file(&log_path);
 
-        let (width, height) = video.size();
         // --no-terminal: mpv shares this terminal and its status line would corrupt the TUI.
         // --log-file: そのぶん失われる失敗理由の受け皿。
-        // --vo-tct-width/height: stdout がパイプだと TTY 検出に失敗し何も描かないため明示する。
+        // --vo-kitty-*: stdout がパイプだと端末サイズを取得できず既定値に落ちるため全て明示する。
         let mut child = Command::new("mpv")
             .arg(format!("--input-ipc-server={}", socket_path.display()))
             .arg(format!("--log-file={}", log_path.display()))
             .arg("--no-terminal")
-            .arg("--vo=tct")
-            .arg(format!("--vo-tct-width={width}"))
-            .arg(format!("--vo-tct-height={height}"))
+            .arg("--vo=kitty")
+            .args(video.geometry().mpv_args())
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -379,8 +379,8 @@ impl MpvController {
     }
 
     /// 端末リサイズに合わせて映像の寸法を作り直す。
-    pub async fn resize_video(&mut self, width: u16, height: u16) -> Result<(), String> {
-        for command in resize_video(width, height) {
+    pub async fn resize_video(&mut self, geometry: Geometry) -> Result<(), String> {
+        for command in resize_video(geometry) {
             self.send(&command).await?;
         }
         Ok(())
@@ -418,11 +418,11 @@ impl Drop for MpvController {
     }
 }
 
-/// `--vo=tct` の ANSI 列を仮想端末へ流し込み続ける。実端末へは書かない。
+/// `--vo=kitty` の APC チャンクを解釈し続ける。実端末へはメインループだけが書く。
 /// フレームが揃うたびに再描画を促す (これが無いと画面はティッカー任せの毎秒1回になる)。
 fn spawn_video_reader(
     stdout: Option<ChildStdout>,
-    video: VideoScreen,
+    video: VideoSink,
     events: UnboundedSender<AppEvent>,
     nonce: u64,
 ) {
@@ -495,6 +495,20 @@ async fn connect_with_retry(path: &Path, child: &mut Child) -> Result<UnixStream
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kitty::fixtures::frame;
+    use crate::video::{CellSize, MAX_FRAME_PIXELS};
+    use ratatui::layout::Rect;
+
+    fn test_geometry(width: u16, height: u16) -> Geometry {
+        Geometry::new(
+            Rect::new(0, 0, width, height),
+            CellSize {
+                width_px: 8,
+                height_px: 16,
+            },
+            MAX_FRAME_PIXELS,
+        )
+    }
 
     fn temp_base(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tuitube-test-{}-{name}", std::process::id()));
@@ -535,14 +549,19 @@ mod tests {
     }
 
     #[test]
-    fn resize_sets_the_size_then_reinitializes_the_video() {
-        let lines: Vec<String> = resize_video(100, 30).iter().map(|c| c.to_line()).collect();
+    fn resize_sets_kitty_sizes_then_reinitializes_the_video() {
+        let lines: Vec<String> = resize_video(test_geometry(80, 22))
+            .iter()
+            .map(|c| c.to_line())
+            .collect();
         assert_eq!(
             lines,
             [
-                "{\"command\":[\"set_property\",\"vo-tct-width\",100]}\n",
-                "{\"command\":[\"set_property\",\"vo-tct-height\",30]}\n",
-                // 寸法だけ変えても tct は描き直さないので、映像トラックを入れ直す。
+                "{\"command\":[\"set_property\",\"vo-kitty-cols\",80]}\n",
+                "{\"command\":[\"set_property\",\"vo-kitty-rows\",22]}\n",
+                "{\"command\":[\"set_property\",\"vo-kitty-width\",640]}\n",
+                "{\"command\":[\"set_property\",\"vo-kitty-height\",352]}\n",
+                // 寸法だけ変えても VO は作り直されないので、映像トラックを入れ直す。
                 "{\"command\":[\"set_property\",\"vid\",\"no\"]}\n",
                 "{\"command\":[\"set_property\",\"vid\",\"auto\"]}\n",
             ]
@@ -674,17 +693,19 @@ mod tests {
 
     #[tokio::test]
     async fn video_reader_asks_for_a_redraw_once_per_frame() {
+        // mpv が出すのと同じ APC チャンク列で2フレーム。
+        let stream = [frame(2, 1, b"AAAA"), frame(4, 2, b"BBBB")].concat();
         let mut child = Command::new("sh")
             .arg("-c")
-            // mpv と同じく synchronized output で囲んだ2フレーム。
-            .arg(
-                "printf '\\033[?2026h\\033[0;0fAB\\033[?2026l\\033[?2026h\\033[0;0fCD\\033[?2026l'",
-            )
+            .arg(format!(
+                "printf '%s' '{}'",
+                String::from_utf8(stream).expect("ascii fixture")
+            ))
             .stdout(Stdio::piped())
             .spawn()
             .expect("spawn printf");
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let video = VideoScreen::new(2, 1);
+        let video = VideoSink::new(test_geometry(80, 22));
         spawn_video_reader(child.stdout.take(), video.clone(), tx, 7);
 
         let event = timeout(Duration::from_secs(5), rx.recv())
@@ -696,9 +717,11 @@ mod tests {
         let _ = child.wait().await;
         // 通知を受けた側が片付けるまで、次の要求は畳まれる。
         assert!(!video.request_redraw());
-        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
-        video.render(ratatui::layout::Rect::new(0, 0, 2, 1), &mut buf);
-        assert_eq!(buf[(0, 0)].symbol(), "C");
+        let frame = video
+            .take()
+            .and_then(|pending| pending.frame)
+            .expect("最新フレームが残っているはず");
+        assert_eq!((frame.width_px, frame.height_px), (4, 2));
     }
 
     #[tokio::test(start_paused = true)]
