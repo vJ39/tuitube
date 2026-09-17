@@ -1,46 +1,25 @@
+mod actions;
 mod app;
+mod geometry;
+mod input;
 mod kitty;
 mod mpv;
 mod search;
 mod ui;
 mod video;
 
+use actions::{Session, apply_resize, end_playback, schedule_resize, stop_playback};
 use anyhow::Result;
-use app::{App, AppEvent, Mode, Playback};
-use crossterm::event::{
-    self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
-use mpv::MpvController;
+use app::{App, AppEvent, Mode};
+use crossterm::event::{self, Event as CrosstermEvent, KeyEventKind};
+use input::handle_key;
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use std::io::Write;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout};
-use video::{Geometry, VideoSink};
-
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
-/// ドラッグ中は Resize が連続して届くので、落ち着くまで mpv の作り直しを待つ。
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
-
-struct Player {
-    controller: MpvController,
-    nonce: u64,
-}
-
-#[derive(Default)]
-struct Session {
-    player: Option<Player>,
-    player_nonce: u64,
-    search_nonce: u64,
-    search_task: Option<JoinHandle<()>>,
-    /// 直近の端末サイズと、それを映像へ反映する時刻。
-    pending_resize: Option<(u16, u16)>,
-    resize_at: Option<Instant>,
-    /// 再生が終わった後など、sink 越しに出せない画像削除の持ち越し。
-    owe_clear: bool,
-}
+use tokio::time::Instant;
+use video::VideoSink;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -146,6 +125,7 @@ fn spawn_input_reader(tx: UnboundedSender<AppEvent>) {
                 Ok(CrosstermEvent::Resize(width, height)) => {
                     tx.send(AppEvent::Resize { width, height })
                 }
+                // マウスは捨てる。拾うには ratatui::init() の後で EnableMouseCapture が要る。
                 Ok(_) => Ok(()),
                 Err(_) => break,
             };
@@ -164,11 +144,7 @@ async fn handle_event(
 ) {
     match event {
         AppEvent::Key(key) => handle_key(app, key, tx, session).await,
-        AppEvent::Resize { width, height } => {
-            // 連続して届くので、最後の1つだけを少し置いてから反映する。
-            session.pending_resize = Some((width, height));
-            session.resize_at = Some(Instant::now() + RESIZE_DEBOUNCE);
-        }
+        AppEvent::Resize { width, height } => schedule_resize(session, width, height),
         AppEvent::SearchDone { nonce, result } => {
             if nonce != session.search_nonce {
                 return;
@@ -209,189 +185,13 @@ async fn handle_event(
     }
 }
 
-async fn end_playback(app: &mut App, session: &mut Session, error: Option<String>) {
-    stop_playback(session).await;
-    app.playback = Playback::default();
-    app.video = None;
-    // sink を手放した後も残骸は消す。SIGKILL 経路では mpv 自身が消せない。
-    session.owe_clear = true;
-    if error.is_some() {
-        app.error = error;
-    }
-    app.mode = if app.results.is_empty() {
-        Mode::Input
-    } else {
-        Mode::Results
-    };
-}
-
-async fn handle_key(
-    app: &mut App,
-    key: KeyEvent,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-) {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        stop_playback(session).await;
-        app.should_quit = true;
-        return;
-    }
-
-    match app.mode {
-        Mode::Input => match key.code {
-            KeyCode::Enter => start_search(app, tx, session),
-            KeyCode::Backspace => {
-                app.query.pop();
-            }
-            KeyCode::Char(c) => {
-                app.query.push(c);
-                app.error = None;
-            }
-            KeyCode::Esc => {
-                if app.results.is_empty() {
-                    app.should_quit = true;
-                } else {
-                    app.mode = Mode::Results;
-                }
-            }
-            _ => {}
-        },
-        Mode::Results => match key.code {
-            KeyCode::Down => app.select_next(),
-            KeyCode::Up => app.select_prev(),
-            KeyCode::Enter => start_playback(app, tx, session).await,
-            KeyCode::Char('/') | KeyCode::Esc => {
-                app.mode = Mode::Input;
-                app.error = None;
-            }
-            KeyCode::Char('q') => app.should_quit = true,
-            _ => {}
-        },
-        Mode::Playing => {
-            let command = match key.code {
-                KeyCode::Char(' ') => Some(mpv::cycle_pause()),
-                KeyCode::Left => Some(mpv::seek(-5)),
-                KeyCode::Right => Some(mpv::seek(5)),
-                KeyCode::Up => Some(mpv::add_volume(5)),
-                KeyCode::Down => Some(mpv::add_volume(-5)),
-                KeyCode::Char('q') | KeyCode::Esc => Some(mpv::quit()),
-                _ => None,
-            };
-            if let (Some(command), Some(p)) = (command, session.player.as_mut())
-                && let Err(e) = p.controller.send(&command).await
-            {
-                app.error = Some(e);
-            }
-            if key.code == KeyCode::Char('q') {
-                app.should_quit = true;
-            }
-        }
-    }
-}
-
-fn start_search(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
-    let query = app.query.trim().to_string();
-    if query.is_empty() {
-        return;
-    }
-    // 連打しても yt-dlp が並走しないよう、先行の検索は打ち切る (kill_on_drop で子プロセスも落ちる)。
-    if let Some(task) = session.search_task.take() {
-        task.abort();
-    }
-    session.search_nonce += 1;
-    let nonce = session.search_nonce;
-    app.searching = true;
-    app.error = None;
-    let tx = tx.clone();
-    session.search_task = Some(tokio::spawn(async move {
-        let result = match timeout(SEARCH_TIMEOUT, search::search(&query)).await {
-            Ok(result) => result,
-            Err(_) => Err(format!(
-                "検索がタイムアウトしました ({} 秒)",
-                SEARCH_TIMEOUT.as_secs()
-            )),
-        };
-        let _ = tx.send(AppEvent::SearchDone { nonce, result });
-    }));
-}
-
-async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
-    let Some(result) = app.selected_result().cloned() else {
-        return;
-    };
-    stop_playback(session).await;
-    session.player_nonce += 1;
-    let nonce = session.player_nonce;
-    let video = VideoSink::new(video_geometry());
-    match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone()).await {
-        Ok(controller) => {
-            app.playback = Playback {
-                title: result.title.clone(),
-                ..Playback::default()
-            };
-            app.video = Some(video);
-            app.mode = Mode::Playing;
-            app.error = None;
-            session.player = Some(Player { controller, nonce });
-        }
-        Err(e) => {
-            app.video = None;
-            app.error = Some(e);
-        }
-    }
-}
-
-fn video_geometry() -> Geometry {
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    geometry_for(cols, rows)
-}
-
-/// mpv に渡す寸法は ratatui の映像領域と一致していなければならない。
-fn geometry_for(cols: u16, rows: u16) -> Geometry {
-    // ピクセルを報告しない端末では既定のセル寸法で進める (画像が小さめに出るだけ)。
-    let cell = crossterm::terminal::window_size()
-        .ok()
-        .and_then(|size| video::cell_size(size.columns, size.rows, size.width, size.height))
-        .unwrap_or(video::FALLBACK_CELL);
-    Geometry::new(
-        ui::video_area(Rect::new(0, 0, cols, rows)),
-        cell,
-        video::MAX_FRAME_PIXELS,
-    )
-}
-
-/// 端末サイズが変わったら、映像の寸法を mpv ごと作り直して食い違いを解消する。
-async fn apply_resize(app: &mut App, session: &mut Session) {
-    let Some((cols, rows)) = session.pending_resize.take() else {
-        return;
-    };
-    let Some(video) = app.video.clone() else {
-        return;
-    };
-    let geometry = geometry_for(cols, rows);
-    if video.geometry() == geometry {
-        return;
-    }
-    video.resize(geometry);
-    if let Some(p) = session.player.as_mut()
-        && let Err(e) = p.controller.resize_video(geometry).await
-    {
-        app.error = Some(e);
-    }
-}
-
-async fn stop_playback(session: &mut Session) {
-    if let Some(p) = session.player.take() {
-        p.controller.shutdown().await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Playback;
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
     use crate::search::SearchResult;
-    use crate::video::{CellSize, MAX_FRAME_PIXELS};
+    use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
 
     const CELL: CellSize = CellSize {
         width_px: 8,
@@ -517,28 +317,5 @@ mod tests {
         assert_eq!(app.error.as_deref(), Some("boom"));
         assert!(app.playback.title.is_empty());
         assert_eq!(present(&mut session, &app), clear_bytes());
-    }
-
-    #[tokio::test]
-    async fn end_playback_without_results_returns_to_input() {
-        let mut app = App {
-            mode: Mode::Playing,
-            video: Some(sink()),
-            ..App::default()
-        };
-        let mut session = Session::default();
-        end_playback(&mut app, &mut session, None).await;
-
-        assert_eq!(app.mode, Mode::Input);
-        assert!(app.error.is_none());
-        assert!(session.owe_clear);
-    }
-
-    #[test]
-    fn geometry_matches_the_video_area_of_the_same_terminal_size() {
-        let geometry = geometry_for(80, 24);
-        assert_eq!(geometry.area, ui::video_area(Rect::new(0, 0, 80, 24)));
-        let pixels = u64::from(geometry.frame_px.0) * u64::from(geometry.frame_px.1);
-        assert!(pixels <= u64::from(video::MAX_FRAME_PIXELS), "{pixels} px");
     }
 }

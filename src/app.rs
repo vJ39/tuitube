@@ -120,25 +120,32 @@ impl App {
         }
     }
 
+    /// 分岐は網羅する。モードを増やしたときの書き分け漏れをコンパイラに拾わせる。
     pub fn status_line(&self) -> String {
-        // 再生中はエラーで再生状況を隠さず、併記する。
-        if self.mode == Mode::Playing {
-            let line = self.playback_line();
-            return match &self.error {
-                Some(error) => format!("{line}  |  エラー: {error}"),
-                None => line,
-            };
+        match self.mode {
+            Mode::Playing => self.playing_status(),
+            Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
+            Mode::Results => self.search_status(format!("{} 件", self.results.len())),
         }
+    }
+
+    /// 再生中はエラーで再生状況を隠さず、併記する。
+    fn playing_status(&self) -> String {
+        let line = self.playback_line();
+        match &self.error {
+            Some(error) => format!("{line}  |  エラー: {error}"),
+            None => line,
+        }
+    }
+
+    fn search_status(&self, idle: String) -> String {
         if let Some(error) = &self.error {
             return format!("エラー: {error}");
         }
         if self.searching {
             return "検索中...".to_string();
         }
-        match self.mode {
-            Mode::Results => format!("{} 件", self.results.len()),
-            _ => "検索したい語句を入力して Enter".to_string(),
-        }
+        idle
     }
 
     fn playback_line(&self) -> String {

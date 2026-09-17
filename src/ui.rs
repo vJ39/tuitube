@@ -20,12 +20,25 @@ pub fn video_area(area: Rect) -> Rect {
     playing_areas(area)[0]
 }
 
-pub fn draw(frame: &mut Frame, app: &App) {
-    if app.mode == Mode::Playing {
-        draw_playing(frame, app);
-        return;
-    }
+/// 再生位置を出す行。クリック桁から再生位置を求めるときもこの矩形を使う。
+pub fn status_area(area: Rect) -> Rect {
+    playing_areas(area)[1]
+}
 
+/// 操作説明の行。
+pub fn help_area(area: Rect) -> Rect {
+    playing_areas(area)[2]
+}
+
+/// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
+pub fn draw(frame: &mut Frame, app: &App) {
+    match app.mode {
+        Mode::Playing => draw_playing(frame, app),
+        Mode::Input | Mode::Results => draw_search(frame, app),
+    }
+}
+
+fn draw_search(frame: &mut Frame, app: &App) {
     let areas = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(1),
@@ -70,8 +83,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
 /// 映像領域には何も描かない。画像は draw の後にメインループが APC で重ねる。
 fn draw_playing(frame: &mut Frame, app: &App) {
-    let [_video, status, help] = playing_areas(frame.area());
-    draw_footer(frame, app, status, help);
+    let area = frame.area();
+    draw_footer(frame, app, status_area(area), help_area(area));
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
@@ -130,5 +143,13 @@ mod tests {
     #[test]
     fn results_help_mentions_esc() {
         assert!(help_text(Mode::Results).contains("Esc"));
+    }
+
+    #[test]
+    fn playing_rows_do_not_overlap_the_video() {
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 22));
+        assert_eq!(status_area(area), Rect::new(0, 22, 80, 1));
+        assert_eq!(help_area(area), Rect::new(0, 23, 80, 1));
     }
 }

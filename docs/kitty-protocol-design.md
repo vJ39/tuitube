@@ -132,8 +132,11 @@ main loop: terminal.draw(ui) ──▶ CompletedFrame.area ──▶ present(sin
 | `src/kitty.rs` | 新規 | Kitty graphics protocol の**純粋な**解釈。`ApcParser`(バイト列 → `GraphicsCommand`)、`FrameAssembler`(`GraphicsCommand` → `FrameEvent`)。ratatui・tokio・mpv に依存しない |
 | `src/video.rs` | 書き換え | `CellSize` / `Geometry`(mpv へ渡す寸法)、`placement()`(画像を領域内に中央配置)、`encode()`(書き込むバイト列の生成)、`VideoSink`(読み取りタスクとメインループの共有スロット) |
 | `src/mpv.rs` | 変更 | `launch()` の引数生成を `Geometry::mpv_args()` に置き換え。`resize_video()` を `vo-kitty-{cols,rows,width,height}` の `set_property` ×4 + `vid no/auto` に変更。`spawn_video_reader` は `VideoSink` に feed(構造は現状維持) |
-| `src/ui.rs` | 変更 | `video_area()` は現状維持。`draw_playing()` は映像領域に何も描かない(空白セルにする) |
-| `src/main.rs` | 変更 | `video_screen()` → `video_geometry()`(`window_size()` を使う)。ループで `terminal.draw()` の直後に `present_video()`。`apply_resize` で `Geometry` 再計算 → `VideoSink::resize()`(Clear 保留)→ mpv へ寸法送信。`end_playback` で Clear を保留(`Session.owe_clear`) |
+| `src/ui.rs` | 変更 | `draw()` は `Mode` の網羅 match。`draw_playing()` は映像領域に何も描かない(空白セルにする)。再生中の3段は `video_area()` / `status_area()` / `help_area()` で外から取れる |
+| `src/geometry.rs` | 新規 | 端末への寸法問い合わせ(`video_geometry()`、`cell_size()`)と、引数だけで決まる `geometry_for(cols, rows, cell)` |
+| `src/actions.rs` | 新規 | `Session`(player・nonce・保留リサイズ・`owe_clear`)と、それを進めるアクション。`start_search` / `start_playback` / `end_playback` / `stop_playback` / `send_to_player` / `schedule_resize` / `apply_resize`(`Geometry` 再計算 → `VideoSink::resize()` → mpv へ寸法送信) |
+| `src/input.rs` | 新規 | キー入力の振り分け。モードごとの分岐と `playing_command()`(キー → `MpvCommand` の対応表)。Session を触る操作は `actions.rs` へ渡す |
+| `src/main.rs` | 変更 | イベントループ本体。`terminal.draw()` の直後に `present_video()`、入力読み取りスレッドと `handle_event` の分配。マウスイベントは捨てている(拾うには `EnableMouseCapture` と `AppEvent` の追加が要る) |
 | `src/app.rs` | 変更 | `video: Option<VideoScreen>` → `Option<VideoSink>`。`AppEvent::VideoFrame` は現状維持 |
 | `Cargo.toml` | 変更 | `vt100` を削除。新規依存は不要(base64 はデコードしないので不要) |
 
