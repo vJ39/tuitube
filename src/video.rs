@@ -1,4 +1,4 @@
-use crate::kitty::{ApcParser, FrameAssembler, FrameEvent, GraphicsCommand, VideoFrame};
+use crate::kitty::{ApcParser, FrameAssembler, FrameEvent, GraphicsCommand, ST, VideoFrame};
 use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -72,25 +72,45 @@ fn fit_budget(width: u32, height: u32, max_pixels: u32) -> (u32, u32) {
     (shrink(width), shrink(height))
 }
 
-/// 1 始まり・画面絶対座標の CUP 位置。
+/// 1 始まり・画面絶対座標の CUP 位置と、端末に拡大させる表示セル数 (c=/r=)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Placement {
     pub row: u16,
     pub col: u16,
+    pub cols: u16,
+    pub rows: u16,
 }
 
-/// 画像が占めるセル数 = ceil(px / cell_px)。領域に収まらなければ None (描かない)。
+/// アスペクト比を保ったまま領域内で最大のセル矩形を求め、中央に置く。
+/// セルは正方形でないので、拡大率はセル数でなくピクセル換算で決める。
+/// 等倍のセル数が領域に収まらないフレームは None (描かない)。
 pub fn placement(area: Rect, cell: CellSize, image_px: (u32, u32)) -> Option<Placement> {
-    let cols = image_px.0.div_ceil(u32::from(cell.width_px.max(1)));
-    let rows = image_px.1.div_ceil(u32::from(cell.height_px.max(1)));
-    if cols == 0 || rows == 0 || cols > u32::from(area.width) || rows > u32::from(area.height) {
+    if area.width == 0 || area.height == 0 || image_px.0 == 0 || image_px.1 == 0 {
         return None;
     }
-    let col = u32::from(area.x) + (u32::from(area.width) - cols) / 2 + 1;
-    let row = u32::from(area.y) + (u32::from(area.height) - rows) / 2 + 1;
+    // c=/r= を解釈しない端末では等倍で描かれるので、等倍で領域外に出るものは捨てる。
+    // リサイズのデバウンス中に届く旧寸法のフレームもここで落ちる。
+    if image_px.0.div_ceil(u32::from(cell.width_px.max(1))) > u32::from(area.width)
+        || image_px.1.div_ceil(u32::from(cell.height_px.max(1))) > u32::from(area.height)
+    {
+        return None;
+    }
+    let cell_w = f64::from(cell.width_px.max(1));
+    let cell_h = f64::from(cell.height_px.max(1));
+    let scale = (f64::from(area.width) * cell_w / f64::from(image_px.0))
+        .min(f64::from(area.height) * cell_h / f64::from(image_px.1));
+    let cells = |px: u32, cell_px: f64, limit: u16| {
+        ((f64::from(px) * scale / cell_px).round() as u32).clamp(1, u32::from(limit)) as u16
+    };
+    let cols = cells(image_px.0, cell_w, area.width);
+    let rows = cells(image_px.1, cell_h, area.height);
+    let col = u32::from(area.x) + u32::from(area.width - cols) / 2 + 1;
+    let row = u32::from(area.y) + u32::from(area.height - rows) / 2 + 1;
     Some(Placement {
         row: u16::try_from(row).ok()?,
         col: u16::try_from(col).ok()?,
+        cols,
+        rows,
     })
 }
 
@@ -106,8 +126,8 @@ impl Pending {
     }
 }
 
-/// clear なら削除列を、フレームが領域に収まるなら CUP + APC バイト列を積む。
-/// 戻り値はフレームを書いたか。
+/// clear なら削除列を、置き場があるなら CUP + 表示セル数を足した APC バイト列を積む。
+/// 等倍で領域に収まらないフレームは捨てる。戻り値はフレームを書いたか。
 pub fn encode(pending: &Pending, area: Rect, cell: CellSize, out: &mut Vec<u8>) -> bool {
     if pending.clear {
         encode_clear(out);
@@ -119,8 +139,25 @@ pub fn encode(pending: &Pending, area: Rect, cell: CellSize, out: &mut Vec<u8>) 
         return false;
     };
     out.extend_from_slice(format!("\x1b[{};{}H", at.row, at.col).as_bytes());
-    out.extend_from_slice(&frame.bytes);
+    push_scaled(&frame.bytes, at.cols, at.rows, out);
     true
+}
+
+/// 先頭チャンクの制御部に c=/r= を足し、端末側でセル矩形いっぱいに拡大させる。
+/// 制御部の終端は最初の ";" (後続の base64 データに ";" は現れない)。
+/// 継続チャンクは m と q しか持てないので、探索は先頭チャンク (最初の ST まで) に限る。
+fn push_scaled(bytes: &[u8], cols: u16, rows: u16, out: &mut Vec<u8>) {
+    let head = bytes
+        .windows(ST.len())
+        .position(|w| w == ST)
+        .unwrap_or(bytes.len());
+    let Some(end) = bytes[..head].iter().position(|b| *b == b';') else {
+        out.extend_from_slice(bytes);
+        return;
+    };
+    out.extend_from_slice(&bytes[..end]);
+    out.extend_from_slice(format!(",c={cols},r={rows}").as_bytes());
+    out.extend_from_slice(&bytes[end..]);
 }
 
 /// q=2 が無いと端末の応答が tuitube の stdin に入りキーイベントとして誤読される (§1-2)。
@@ -242,25 +279,112 @@ mod tests {
         Geometry::new(Rect::new(0, 0, width, height), CELL, MAX_FRAME_PIXELS)
     }
 
+    /// セルは正方形でないので、比が合っているかはピクセル換算で見る。
+    fn aspect_error(at: Placement, image_px: (u32, u32)) -> f64 {
+        let shown = f64::from(u32::from(at.cols) * u32::from(CELL.width_px))
+            / f64::from(u32::from(at.rows) * u32::from(CELL.height_px));
+        let source = f64::from(image_px.0) / f64::from(image_px.1);
+        (shown / source - 1.0).abs()
+    }
+
     #[test]
-    fn placement_centers_the_image_and_refuses_overflow() {
-        // 40x11 セルの画像を 80x22 の領域に中央寄せ。余白は 20 桁 / 5 行。
+    fn placement_fills_the_area_when_the_aspect_matches() {
+        // 640x352 px は 80x22 セル (8x16 px) ちょうど。領域いっぱいに広げる。
         assert_eq!(
-            placement(Rect::new(0, 0, 80, 22), CELL, (320, 176)),
-            Some(Placement { row: 6, col: 21 })
+            placement(Rect::new(0, 0, 80, 22), CELL, (640, 352)),
+            Some(Placement {
+                row: 1,
+                col: 1,
+                cols: 80,
+                rows: 22
+            })
         );
         // 領域の原点ぶんだけずれる。
         assert_eq!(
-            placement(Rect::new(5, 2, 80, 22), CELL, (320, 176)),
-            Some(Placement { row: 8, col: 26 })
+            placement(Rect::new(5, 2, 80, 22), CELL, (640, 352)),
+            Some(Placement {
+                row: 3,
+                col: 6,
+                cols: 80,
+                rows: 22
+            })
         );
-        // 領域より大きい画像は描かない。
-        assert_eq!(placement(Rect::new(0, 0, 80, 22), CELL, (800, 400)), None);
-        // 端数は切り上げでセル数を数える。
+    }
+
+    #[test]
+    fn placement_enlarges_a_small_frame_to_the_area() {
+        // mpv の送る 640x360 上限のフレームが領域より小さくても、端末側で拡大させる。
+        let at = placement(Rect::new(0, 0, 80, 22), CELL, (16, 16)).expect("置けるはず");
         assert_eq!(
-            placement(Rect::new(0, 0, 4, 2), CELL, (17, 1)),
-            Some(Placement { row: 1, col: 1 })
+            at,
+            Placement {
+                row: 1,
+                col: 19,
+                cols: 44,
+                rows: 22
+            }
         );
+        assert!(aspect_error(at, (16, 16)) < 0.05);
+    }
+
+    #[test]
+    fn placement_keeps_aspect_for_tall_and_wide_frames() {
+        // 縦に余裕が無い比率: 高さを使い切り、幅が縮む。
+        let tall = placement(Rect::new(0, 0, 80, 22), CELL, (320, 180)).expect("置けるはず");
+        assert_eq!(
+            tall,
+            Placement {
+                row: 1,
+                col: 2,
+                cols: 78,
+                rows: 22
+            }
+        );
+        assert!(aspect_error(tall, (320, 180)) < 0.05);
+
+        // 横長: 幅を使い切り、高さが縮んで上下に余白が出る。
+        let wide = placement(Rect::new(0, 0, 80, 22), CELL, (640, 180)).expect("置けるはず");
+        assert_eq!(
+            wide,
+            Placement {
+                row: 6,
+                col: 1,
+                cols: 80,
+                rows: 11
+            }
+        );
+        assert!(aspect_error(wide, (640, 180)) < 0.05);
+    }
+
+    #[test]
+    fn placement_refuses_a_frame_that_overflows_the_area_at_native_size() {
+        // 等倍で 100x25 セル要る画像は 80x22 の領域に置かない。c=/r= を解釈しない端末では
+        // 縮まずステータス行・ヘルプ行に被るため。
+        assert_eq!(placement(Rect::new(0, 0, 80, 22), CELL, (800, 400)), None);
+        // 片側だけはみ出す場合も同じ。
+        assert_eq!(placement(Rect::new(0, 0, 80, 22), CELL, (800, 176)), None);
+        assert_eq!(placement(Rect::new(0, 0, 80, 22), CELL, (320, 400)), None);
+        // リサイズのデバウンス中に届く旧寸法 (80x22 ぶん) のフレームは新領域では弾かれる。
+        assert_eq!(placement(Rect::new(0, 0, 40, 12), CELL, (640, 352)), None);
+        // 端数は切り上げで数える。1 セルに収まる画像は 1 セルの領域にも置ける。
+        assert_eq!(placement(Rect::new(0, 0, 1, 1), CELL, (9, 16)), None);
+        assert_eq!(
+            placement(Rect::new(0, 0, 1, 1), CELL, (8, 16)),
+            Some(Placement {
+                row: 1,
+                col: 1,
+                cols: 1,
+                rows: 1
+            })
+        );
+    }
+
+    #[test]
+    fn placement_is_none_for_a_degenerate_area_or_image() {
+        assert_eq!(placement(Rect::new(0, 0, 0, 22), CELL, (640, 352)), None);
+        assert_eq!(placement(Rect::new(0, 0, 80, 0), CELL, (640, 352)), None);
+        assert_eq!(placement(Rect::new(0, 0, 80, 22), CELL, (0, 352)), None);
+        assert_eq!(placement(Rect::new(0, 0, 80, 22), CELL, (640, 0)), None);
     }
 
     #[test]
@@ -312,30 +436,81 @@ mod tests {
             frame: Some(VideoFrame {
                 width_px: 16,
                 height_px: 16,
-                bytes: b"<apc>".to_vec(),
+                bytes: b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=0;DATA\x1b\\".to_vec(),
             }),
         };
         let mut out = Vec::new();
         assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
-        assert_eq!(out, b"\x1b_Ga=d,q=2;\x1b\\\x1b[11;40H<apc>");
+        assert_eq!(
+            out,
+            b"\x1b_Ga=d,q=2;\x1b\\\x1b[1;19H\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=0,c=44,r=22;DATA\x1b\\"
+        );
 
-        // 収まらないフレームは捨て、削除だけ書く。
-        let oversized = Pending {
-            clear: true,
-            frame: Some(VideoFrame {
-                width_px: 800,
-                height_px: 400,
-                bytes: b"<apc>".to_vec(),
-            }),
-        };
+        // 置き場が無いときはフレームを捨て、削除だけ書く。
         let mut out = Vec::new();
-        assert!(!encode(&oversized, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        assert!(!encode(&pending, Rect::new(0, 0, 0, 0), CELL, &mut out));
+        assert_eq!(out, b"\x1b_Ga=d,q=2;\x1b\\");
+
+        // 等倍で領域からはみ出すフレーム (リサイズ直後の旧寸法) も捨てる。
+        let mut out = Vec::new();
+        assert!(!encode(&pending, Rect::new(0, 0, 1, 1), CELL, &mut out));
         assert_eq!(out, b"\x1b_Ga=d,q=2;\x1b\\");
 
         // 端末の応答を stdin に流し込まないよう q=2 を必ず付ける。
         let mut out = Vec::new();
         encode_clear(&mut out);
         assert_eq!(out, b"\x1b_Ga=d,q=2;\x1b\\");
+    }
+
+    #[test]
+    fn encode_adds_the_display_cell_size_to_the_first_chunk_only() {
+        let sink = VideoSink::new(geometry(80, 22));
+        assert!(sink.feed(&frame(640, 352, b"DATA")));
+        let pending = sink.take().expect("フレームがあるはず");
+
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        assert_eq!(
+            out,
+            b"\x1b[1;1H\
+              \x1b_Ga=T,f=24,s=640,v=352,C=1,q=2,m=1,c=80,r=22;DATA\x1b\\\
+              \x1b_Gm=0;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn encode_leaves_bytes_alone_when_there_is_no_control_section() {
+        let pending = Pending {
+            clear: false,
+            frame: Some(VideoFrame {
+                width_px: 640,
+                height_px: 352,
+                bytes: b"<apc>".to_vec(),
+            }),
+        };
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        assert_eq!(out, b"\x1b[1;1H<apc>");
+    }
+
+    #[test]
+    fn encode_never_scales_a_continuation_chunk() {
+        // 先頭チャンクが ";" の手前で切れた列 (素の ESC で打ち切られ ApcParser が正規化した形)。
+        // 継続チャンクは m と q しか持てないので c=/r= を足さず、そのまま流す。
+        let bytes = b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=1\x1b\\\x1b_Gm=0;DATA\x1b\\".to_vec();
+        let pending = Pending {
+            clear: false,
+            frame: Some(VideoFrame {
+                width_px: 16,
+                height_px: 16,
+                bytes: bytes.clone(),
+            }),
+        };
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        let mut expected = b"\x1b[1;19H".to_vec();
+        expected.extend_from_slice(&bytes);
+        assert_eq!(out, expected);
     }
 
     #[test]

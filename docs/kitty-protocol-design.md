@@ -17,7 +17,7 @@ mpv の `--vo=kitty` 出力(Kitty graphics protocol の APC `G` コマンド)を
 | 端末サイズ取得 | `ioctl(tty_in, TIOCGWINSZ)`。`--no-terminal` では `tty_in = -1` で失敗し既定値に落ちる(ユーザー観測の `s=320,v=180` はこれ) | cols/rows/width/height の 4 つを **必ず明示**する |
 | 起動時(preinit) | `ESC[?25l`(カーソル非表示) `ESC[?1003h`(マウス追跡) [+ `ESC[?1049h`(alt-screen=yes 時)] | 全部捨てる |
 | 構成時(reconfig) | `ESC_Ga=d;ESC\`(全 placement 削除) [+ `ESC[2J`(config-clear=yes 時)]。再生開始・リサイズ・panscan 変更で走る | `a=d` は「消去要求」として解釈し tuitube が正規化して出す。`2J` は捨てる |
-| 毎フレーム(flip_page) | `ESC[<top>;<left>f`(HVP) → `ESC_Ga=T,f=24,s=<W>,v=<H>,C=1,q=2,m=1;<base64 ≤4096>ESC\` → `ESC_Gm=1;<4096>ESC\` … → `ESC_Gm=0;<残り>ESC\`。画像 ID(`i=`)・表示セル数(`c=`/`r=`)は付かない | フレーム境界 = `m=0` チャンクの ST。synchronized output(`?2026`)は kitty VO には無い |
+| 毎フレーム(flip_page) | `ESC[<top>;<left>f`(HVP) → `ESC_Ga=T,f=24,s=<W>,v=<H>,C=1,q=2,m=1;<base64 ≤4096>ESC\` → `ESC_Gm=1;<4096>ESC\` … → `ESC_Gm=0;<残り>ESC\`。画像 ID(`i=`)・表示セル数(`c=`/`r=`)は付かない | フレーム境界 = `m=0` チャンクの ST。表示セル数は tuitube が先頭チャンクに足す(§3-3)。synchronized output(`?2026`)は kitty VO には無い |
 | 終了時(uninit) | `ESC_Ga=d;`(**ST 無し**、mpv のバグ) → `ESC[?25h` `ESC[?1003l` → `ESC[?1049l`(alt-screen=yes) または `ESC[<cols>;0f`(no) | APC は ST だけでなく素の ESC でも打ち切れるパーサにする。打ち切った後続 CSI を巻き込まない |
 | 小さすぎる画像 | base64 が 4096 バイト以下(生 3072 バイト以下)のとき `m=0` チャンクが出ない(mpv のバグ) | 実用寸法では起きない。「次の `a=T` が来たら未完成フレームを捨てる」規則で自然に回復する |
 | 寸法の動的変更 | `set_property vo-kitty-*` だけでは反映されない(tct と同じ。opts は VO 生成時に読まれる)。`vid no` → `vid auto` で VO が作り直され新しい値で描き始める | tct 方式の `resize_video` と同じ手順を踏む |
@@ -76,7 +76,7 @@ B への移行コストを下げるため、`present()` は `&mut dyn Write` を
 | 再生開始 | mpv(reconfig)→ tuitube が正規化 | `ESC_Ga=d;ESC\` | 前回の残骸を掃除 |
 | 毎フレーム | 出さない | — | 同じ位置に重ね描き。削除→描画はちらつく |
 | 一時停止 / バッファリング | 出さない | — | 最後のフレームが残るのが正しい見え方 |
-| 端末リサイズ | ratatui(`2J`)+ tuitube(`apply_resize`) | `a=d` を保留にして次の present で書き、続けて mpv を作り直す | `2J` で画像も消えるのが仕様だが、端末実装差を吸収する保険として明示する。古い寸法のフレームは placement 判定(§3-3)で弾く |
+| 端末リサイズ | ratatui(`2J`)+ tuitube(`apply_resize`) | `a=d` を保留にして次の present で書き、続けて mpv を作り直す | `2J` で画像も消えるのが仕様だが、端末実装差を吸収する保険として明示する。新しい領域に等倍で収まらない古い寸法のフレームは placement 判定(§3-3)で弾く |
 | 再生停止(Esc / q) | mpv(uninit、ST 無し)→ 正規化 + tuitube(`end_playback`) | `a=d` | SIGKILL 経路では mpv が出せないので tuitube 側でも必ず出す |
 | mpv 異常終了 | tuitube(`end_playback`) | `a=d` | 同上 |
 | tuitube 終了 | tuitube(`stop_playback`)→ `ratatui::restore()`(`?1049l`) | `a=d` → alt screen 離脱 | alt 側の画像は仕様上消えるが、明示も入れる |
@@ -89,9 +89,9 @@ B への移行コストを下げるため、`present()` は `&mut dyn Write` を
 
 ### 2-5. セル/ピクセル幾何とスループット
 
-mpv に渡すピクセル窓 = 映像領域のセル数 × セル 1 個のピクセル寸法。セル寸法は `crossterm::terminal::window_size()` から `width / columns`, `height / rows` で求める。0 が返る端末では控えめな既定値(8×16 px)に落とす。既定値が実際より小さければ画像が領域より小さく中央寄せされるだけで済み、大きければ領域を突き抜けてステータス行に被る。既定値は小さめに置く。
+mpv に渡すピクセル窓 = 映像領域のセル数 × セル 1 個のピクセル寸法。セル寸法は `crossterm::terminal::window_size()` から `width / columns`, `height / rows` で求める。0 が返る端末では控えめな既定値(8×16 px)に落とす。既定値が実際より小さければ画像が領域より小さく中央寄せされるだけで済む。大きい側に外すと `c=`/`r=` 対応端末ではセル数が領域にクランプされるので被らないが、非対応端末(§6)では等倍のピクセル寸法で描かれてステータス行に被りうる。既定値は小さめに置く。
 
-ピクセル数には上限 `MAX_FRAME_PIXELS` を設け、超える場合はアスペクトを保って縮小する(v1 では画像が領域より小さくなり中央寄せ。端末側で拡大させる `c=`/`r=` の追記は Phase 2、§7)。上限が必要なのはパイプと端末の処理量が画像面積に比例するため:
+ピクセル数には上限 `MAX_FRAME_PIXELS` を設け、超える場合はアスペクトを保って縮小する。縮小したぶんは先頭チャンクへ `c=`/`r=` を足して端末側で拡大させるので、エンコード解像度を下げても表示は映像領域いっぱいのままになる(§3-3 `placement`)。上限が必要なのはパイプと端末の処理量が画像面積に比例するため:
 
 | ピクセル窓 | RGB 生データ / フレーム | base64 / フレーム | 30fps の転送量 |
 |---|---|---|---|
@@ -203,15 +203,17 @@ impl Geometry {
     pub fn mpv_args(&self) -> Vec<String>;
 }
 
-/// 1 始まり・画面絶対座標の CUP 位置。
+/// 1 始まり・画面絶対座標の CUP 位置と、端末に拡大させる表示セル数(c=/r=)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Placement { pub row: u16, pub col: u16 }
-/// 画像が占めるセル数 = ceil(px / cell_px)。領域に収まらなければ None(描かない)。
+pub struct Placement { pub row: u16, pub col: u16, pub cols: u16, pub rows: u16 }
+/// アスペクト比を保ったまま領域内で最大のセル矩形を求め、中央に置く。
+/// 領域か画像の面積が 0、または等倍(ceil(px / cell_px))で領域に収まらないときは None。
 pub fn placement(area: Rect, cell: CellSize, image_px: (u32, u32)) -> Option<Placement>;
 
 pub struct Pending { pub clear: bool, pub frame: Option<VideoFrame> }
-/// clear なら ESC_Ga=d;ESC\ を、frame があり placement が取れれば CUP + frame.bytes を out に積む。
-/// 戻り値はフレームを書いたか(収まらず捨てた場合 false)。
+/// clear なら ESC_Ga=d;ESC\ を、frame があり placement が取れれば
+/// CUP + c=/r= を差し込んだ frame.bytes を out に積む。戻り値はフレームを書いたか
+/// (収まらず捨てた場合 false)。c=/r= は先頭チャンクの制御部にだけ足す。
 pub fn encode(pending: &Pending, area: Rect, cell: CellSize, out: &mut Vec<u8>) -> bool;
 pub fn encode_clear(out: &mut Vec<u8>);
 
@@ -296,7 +298,7 @@ mpv --input-ipc-server=<sock> --log-file=<log> --no-terminal
 | 再生開始 | `window_size()` → `cell_size()`(None なら `FALLBACK_CELL`)→ `Geometry::new(video_area(terminal.size()), cell, MAX_FRAME_PIXELS)` → `VideoSink::new` → `MpvController::launch(url, nonce, tx, sink)`。mpv の reconfig `a=d` が Clear として届き、最初の present で残骸を掃除 |
 | フレーム到着 | 上記 §3-6 |
 | 一時停止 / シーク / 音量 | IPC のみ。映像は最後のフレームが残る。ステータス行の更新は映像に影響しない(文字上書きは画像を消さない) |
-| 端末リサイズ | crossterm Resize → 既存の 200ms デバウンス → `apply_resize`: 新 `Geometry` を計算し、変化があれば `sink.resize(geometry)`(Clear 保留 + 古いフレーム破棄)→ `controller.resize_video(geometry)`。デバウンス待ちの間に届く古い寸法のフレームは `placement()` が None を返せば書かれない |
+| 端末リサイズ | crossterm Resize → 既存の 200ms デバウンス → `apply_resize`: 新 `Geometry` を計算し、変化があれば `sink.resize(geometry)`(Clear 保留 + 古いフレーム破棄)→ `controller.resize_video(geometry)`。デバウンス待ちと VO 作り直しの間に届く古い寸法のフレームは、新しい領域に等倍で収まらなければ `placement()` が None を返して書かれない |
 | 映像なし(音声のみ) | reconfig が走らずフレームも来ない。映像領域は空白のまま、ステータス行は再生状況を出す。任意: 一定時間フレームが無ければステータス行に「映像なし」を添える |
 | 再生停止・mpv 終了・異常終了 | `end_playback` → `stop_playback`(quit / 猶予後 kill)→ `Session.owe_clear = true` → 次の present で `a=d` |
 | tuitube 終了 | `stop_playback` → present で `a=d`(可能な範囲で)→ `ratatui::restore()`(alt screen 離脱で残骸も消える) |
@@ -386,8 +388,8 @@ fn frame(s: u32, v: u32, data: &[u8]) -> Vec<u8>;
 
 - tmux / GNU screen 内では動かない(APC を DCS で包む passthrough が必要。パーサは DCS を読み飛ばす)。
 - Kitty graphics protocol 非対応端末では映像領域が空白のまま(エラーは出ない。`q=2` で端末も何も返さない)。検出して案内する機能は対象外。
+- `c=`/`r=`(端末側スケーリング)に対応しない端末では拡大が効かず、`MAX_FRAME_PIXELS` で縮めたぶんだけ映像が領域より小さく中央寄せで出る。等倍で領域に収まらないフレームは `placement()` が捨てるので、ステータス行・ヘルプ行には被らない。
 - 共有メモリ転送(`--vo-kitty-use-shm`)、画像 ID / placement ID による差分更新は対象外。
-- 端末側スケーリング(`c=`/`r=` の追記)は Phase 2。
 
 ## 7. 実装順
 
@@ -397,4 +399,5 @@ fn frame(s: u32, v: u32, data: &[u8]) -> Vec<u8>;
 4. `src/main.rs` / `src/ui.rs` / `src/app.rs`: present の組み込み、リサイズ・終了時の Clear。
 5. tct 実装と `vt100` の削除、`cargo test` 全緑。
 6. 実機確認(§4-5)、`MAX_FRAME_PIXELS` 調整。
-7. Phase 2(必要なら): 先頭チャンク制御部に `c=<cols>,r=<rows>` を追記して端末側で領域いっぱいに拡大(iTerm2 の対応確認が先)、shm 転送、非対応端末の検出。
+7. 先頭チャンク制御部へ `c=<cols>,r=<rows>` を追記し、端末側で領域いっぱいに拡大。
+8. Phase 2(必要なら): shm 転送、非対応端末の検出。

@@ -251,12 +251,18 @@ mod tests {
         let mut session = Session::default();
 
         let out = present(&mut session, &app);
-        // 40x11 セルの画像を 80x22 の領域に中央寄せした CUP が、削除列の直後に来る。
+        // 320x176 px は 80x22 の領域と同じ比率なので、原点から領域いっぱいに広がる。
         let mut expected = clear_bytes();
-        expected.extend_from_slice(b"\x1b[6;21H");
+        expected.extend_from_slice(b"\x1b[1;1H");
         assert!(
             out.starts_with(&expected),
             "clear → CUP の順になっていない: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        let scale_keys = b",c=80,r=22";
+        assert!(
+            out.windows(scale_keys.len()).any(|w| w == scale_keys),
+            "表示セル数が入っていない: {:?}",
             String::from_utf8_lossy(&out)
         );
         assert!(out.ends_with(b"\x1b\\"), "APC が最後まで書かれていない");

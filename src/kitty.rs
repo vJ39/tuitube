@@ -7,7 +7,8 @@ const MAX_APC_LEN: usize = 8192;
 /// MAX_FRAME_PIXELS を f=24(3 バイト/px)で base64 化した長さの 2 倍。
 const MAX_FRAME_LEN: usize = crate::video::MAX_FRAME_PIXELS as usize * 3 * 4 / 3 * 2;
 const APC_INTRO: &[u8] = b"\x1b_G";
-const ST: &[u8] = b"\x1b\\";
+/// APC の終端 (String Terminator)。チャンクの切れ目でもある。
+pub const ST: &[u8] = b"\x1b\\";
 
 /// 完結した APC G コマンド 1 個。
 #[derive(Debug, Clone, PartialEq, Eq)]
