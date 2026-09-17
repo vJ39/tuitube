@@ -41,8 +41,8 @@ mod tests {
         let geometry = geometry_for(80, 24, CELL);
         assert_eq!(geometry.area, ui::video_area(Rect::new(0, 0, 80, 24)));
         assert_eq!(geometry.cell, CELL);
-        // 映像領域 80x22 セル × 8x16 px。予算 640*360 に収まるので縮まない。
-        assert_eq!(geometry.frame_px, (640, 352));
+        // 映像領域 80x21 セル × 8x16 px。予算 640*360 に収まるので縮まない。
+        assert_eq!(geometry.frame_px, (640, 336));
     }
 
     #[test]

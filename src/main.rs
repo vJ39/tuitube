@@ -5,14 +5,18 @@ mod input;
 mod kitty;
 mod mpv;
 mod search;
+mod seekbar;
 mod ui;
 mod video;
 
 use actions::{Session, apply_resize, end_playback, schedule_resize, stop_playback};
 use anyhow::Result;
 use app::{App, AppEvent, Mode};
-use crossterm::event::{self, Event as CrosstermEvent, KeyEventKind};
-use input::handle_key;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyEventKind,
+};
+use crossterm::execute;
+use input::{handle_key, handle_mouse};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use std::io::Write;
@@ -21,13 +25,42 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::Instant;
 use video::VideoSink;
 
+/// ホバーの Moved は1セルごとに届く。溜まった分をまとめて捌いてから描き直す。
+const EVENT_DRAIN_LIMIT: usize = 64;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     mpv::sweep_stale_sockets();
+    // マウス追跡は alt screen に入った後で有効化し、抜ける前に解除する。
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal).await;
+    let result = match enable_mouse_capture() {
+        Ok(()) => {
+            install_mouse_panic_hook();
+            run(&mut terminal).await
+        }
+        Err(e) => Err(e),
+    };
+    disable_mouse_capture();
     ratatui::restore();
     result
+}
+
+fn enable_mouse_capture() -> Result<()> {
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+    Ok(())
+}
+
+fn disable_mouse_capture() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+}
+
+/// ratatui の hook (restore) より先に追跡を止める。残すとシェルに戻った後もゴミが出る。
+fn install_mouse_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        disable_mouse_capture();
+        previous(info);
+    }));
 }
 
 async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
@@ -40,12 +73,21 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 
     loop {
         // draw は必ず MoveTo で始まり SGR を閉じて flush するので、その直後なら割り込まずに書ける。
-        let area = ui::video_area(terminal.draw(|frame| ui::draw(frame, &app))?.area);
+        // マウスの当たり判定は「ユーザーが今見ている画面」で行うので、描いた寸法を控える。
+        app.screen = terminal.draw(|frame| ui::draw(frame, &app))?.area;
+        let area = ui::video_area(app.screen);
         present_video(&mut session, &app, area, terminal.backend_mut())?;
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break };
                 handle_event(&mut app, event, &tx, &mut session).await;
+                for _ in 0..EVENT_DRAIN_LIMIT {
+                    if app.should_quit {
+                        break;
+                    }
+                    let Ok(event) = rx.try_recv() else { break };
+                    handle_event(&mut app, event, &tx, &mut session).await;
+                }
             }
             _ = ticker.tick() => {
                 if let Some(p) = session.player.as_mut() {
@@ -125,7 +167,8 @@ fn spawn_input_reader(tx: UnboundedSender<AppEvent>) {
                 Ok(CrosstermEvent::Resize(width, height)) => {
                     tx.send(AppEvent::Resize { width, height })
                 }
-                // マウスは捨てる。拾うには ratatui::init() の後で EnableMouseCapture が要る。
+                // 種別の選り分けは input::mouse_input に寄せる。
+                Ok(CrosstermEvent::Mouse(mouse)) => tx.send(AppEvent::Mouse(mouse)),
                 Ok(_) => Ok(()),
                 Err(_) => break,
             };
@@ -144,6 +187,7 @@ async fn handle_event(
 ) {
     match event {
         AppEvent::Key(key) => handle_key(app, key, tx, session).await,
+        AppEvent::Mouse(mouse) => handle_mouse(app, mouse, session).await,
         AppEvent::Resize { width, height } => schedule_resize(session, width, height),
         AppEvent::SearchDone { nonce, result } => {
             if nonce != session.search_nonce {

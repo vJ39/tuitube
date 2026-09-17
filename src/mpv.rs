@@ -55,6 +55,15 @@ pub fn seek(seconds: i64) -> MpvCommand {
     }
 }
 
+/// 絶対シーク。負値は「末尾から」、duration ちょうどは終了を意味するので、
+/// 呼び出し側で seekbar::clamp_target を通した値を渡す。
+pub fn seek_absolute(seconds: f64) -> MpvCommand {
+    MpvCommand {
+        command: vec![json!("seek"), json!(seconds), json!("absolute")],
+        request_id: None,
+    }
+}
+
 pub fn add_volume(delta: i64) -> MpvCommand {
     MpvCommand {
         command: vec![json!("add"), json!("volume"), json!(delta)],
@@ -529,6 +538,18 @@ mod tests {
     fn serializes_seek_both_directions() {
         assert_eq!(seek(-5).to_line(), "{\"command\":[\"seek\",-5]}\n");
         assert_eq!(seek(5).to_line(), "{\"command\":[\"seek\",5]}\n");
+    }
+
+    #[test]
+    fn seek_absolute_serializes_with_the_absolute_flag() {
+        assert_eq!(
+            seek_absolute(83.5).to_line(),
+            "{\"command\":[\"seek\",83.5,\"absolute\"]}\n"
+        );
+        assert_eq!(
+            seek_absolute(30.0).to_line(),
+            "{\"command\":[\"seek\",30.0,\"absolute\"]}\n"
+        );
     }
 
     #[test]

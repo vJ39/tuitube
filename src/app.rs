@@ -1,10 +1,19 @@
 use crate::search::SearchResult;
+use crate::seekbar::SeekBarState;
 use crate::video::VideoSink;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
+use ratatui::layout::Rect;
 use serde_json::Value;
+use std::time::{Duration, Instant};
+
+/// シークを送ってから確定値を待つ間、ポーリングの古い値を無視する時間。
+pub const SEEK_HOLD: Duration = Duration::from_secs(2);
+/// 相対シークは keyframes で着地がずれるので、この幅までは目標どおり着いたとみなす。
+pub const SEEK_TOLERANCE_SECS: f64 = 3.0;
 
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Resize {
         width: u16,
         height: u16,
@@ -42,6 +51,13 @@ pub enum Mode {
     Playing,
 }
 
+/// シーク送信から確定までの先行表示。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PendingSeek {
+    pub target: f64,
+    pub sent_at: Instant,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Playback {
     pub title: String,
@@ -49,6 +65,37 @@ pub struct Playback {
     pub time_pos: Option<f64>,
     pub duration: Option<f64>,
     pub volume: Option<f64>,
+    pub pending_seek: Option<PendingSeek>,
+}
+
+impl Playback {
+    /// 送信と同時に表示だけ目標値へ進める。
+    pub fn begin_seek(&mut self, target: f64, now: Instant) {
+        self.time_pos = Some(target);
+        self.pending_seek = Some(PendingSeek {
+            target,
+            sent_at: now,
+        });
+    }
+
+    /// 相対シークの基準。押し続けたときに目標値が積み上がる。
+    pub fn seek_base(&self) -> Option<f64> {
+        self.pending_seek.map(|p| p.target).or(self.time_pos)
+    }
+
+    /// ポーリングの値を取り込む。保持時間中の古い値は捨てる。
+    pub fn reconcile_time_pos(&mut self, polled: Option<f64>, now: Instant) {
+        // シーク直後のポーリングは playback-restart より前に返って旧位置を寄越す。
+        if let Some(pending) = self.pending_seek {
+            let within_hold = now.saturating_duration_since(pending.sent_at) < SEEK_HOLD;
+            let stale = polled.is_none_or(|p| (p - pending.target).abs() > SEEK_TOLERANCE_SECS);
+            if within_hold && stale {
+                return;
+            }
+        }
+        self.pending_seek = None;
+        self.time_pos = polled;
+    }
 }
 
 pub struct App {
@@ -61,6 +108,9 @@ pub struct App {
     pub playback: Playback,
     /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
     pub video: Option<VideoSink>,
+    /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
+    pub screen: Rect,
+    pub seek_bar: SeekBarState,
     pub should_quit: bool,
 }
 
@@ -75,6 +125,8 @@ impl Default for App {
             error: None,
             playback: Playback::default(),
             video: None,
+            screen: Rect::default(),
+            seek_bar: SeekBarState::default(),
             should_quit: false,
         }
     }
@@ -112,7 +164,9 @@ impl App {
 
     pub fn apply_property(&mut self, id: u64, data: Option<Value>) {
         match id {
-            crate::mpv::REQ_TIME_POS => self.playback.time_pos = data.and_then(|v| v.as_f64()),
+            crate::mpv::REQ_TIME_POS => self
+                .playback
+                .reconcile_time_pos(data.and_then(|v| v.as_f64()), Instant::now()),
             crate::mpv::REQ_DURATION => self.playback.duration = data.and_then(|v| v.as_f64()),
             crate::mpv::REQ_PAUSE => self.playback.paused = data.and_then(|v| v.as_bool()),
             crate::mpv::REQ_VOLUME => self.playback.volume = data.and_then(|v| v.as_f64()),
@@ -297,12 +351,68 @@ mod tests {
                 time_pos: Some(30.0),
                 duration: Some(60.0),
                 volume: Some(70.0),
+                ..Playback::default()
             },
             ..App::default()
         };
         let line = app.status_line();
         assert!(line.starts_with("PAUSED  song  00:30 / 01:00  vol 70"));
         assert!(line.ends_with("エラー: boom"));
+    }
+
+    #[test]
+    fn optimistic_seek_survives_a_stale_poll_within_the_hold() {
+        let t0 = Instant::now();
+        let mut playback = Playback {
+            time_pos: Some(10.0),
+            ..Playback::default()
+        };
+        playback.begin_seek(100.0, t0);
+        assert_eq!(playback.time_pos, Some(100.0));
+        assert!(playback.pending_seek.is_some());
+
+        // シーク直後のポーリングは旧位置を返しうる。
+        playback.reconcile_time_pos(Some(11.0), t0 + Duration::from_millis(500));
+        assert_eq!(playback.time_pos, Some(100.0));
+        playback.reconcile_time_pos(None, t0 + Duration::from_millis(800));
+        assert_eq!(playback.time_pos, Some(100.0));
+
+        playback.reconcile_time_pos(Some(101.5), t0 + Duration::from_millis(900));
+        assert_eq!(playback.time_pos, Some(101.5));
+        assert_eq!(playback.pending_seek, None);
+    }
+
+    #[test]
+    fn a_stale_poll_wins_after_the_hold_expires() {
+        let t0 = Instant::now();
+        let mut playback = Playback {
+            time_pos: Some(10.0),
+            ..Playback::default()
+        };
+        playback.begin_seek(100.0, t0);
+        playback.reconcile_time_pos(Some(11.0), t0 + SEEK_HOLD);
+
+        assert_eq!(playback.time_pos, Some(11.0));
+        assert_eq!(playback.pending_seek, None);
+    }
+
+    #[test]
+    fn relative_seeks_stack_on_the_pending_target() {
+        let t0 = Instant::now();
+        let mut playback = Playback {
+            time_pos: Some(10.0),
+            ..Playback::default()
+        };
+        assert_eq!(playback.seek_base(), Some(10.0));
+        playback.begin_seek(15.0, t0);
+        assert_eq!(playback.seek_base(), Some(15.0));
+
+        let t1 = t0 + Duration::from_millis(100);
+        playback.begin_seek(20.0, t1);
+        assert_eq!(playback.time_pos, Some(20.0));
+        let pending = playback.pending_seek.expect("先行更新が入っている");
+        assert_eq!(pending.target, 20.0);
+        assert_eq!(pending.sent_at, t1);
     }
 
     #[test]

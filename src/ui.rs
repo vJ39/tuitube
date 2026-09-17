@@ -1,14 +1,16 @@
 use crate::app::{App, Mode, format_time};
+use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-/// 再生中は [映像, ステータス, ヘルプ] の3段。映像に残り全体を渡す。
-fn playing_areas(area: Rect) -> [Rect; 3] {
+/// 再生中は [映像, シークバー, ステータス, ヘルプ] の4段。映像に残り全体を渡す。
+fn playing_areas(area: Rect) -> [Rect; 4] {
     Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -20,14 +22,28 @@ pub fn video_area(area: Rect) -> Rect {
     playing_areas(area)[0]
 }
 
-/// 再生位置を出す行。クリック桁から再生位置を求めるときもこの矩形を使う。
-pub fn status_area(area: Rect) -> Rect {
+/// シークバーの行。クリック桁から再生位置を求めるときもこの矩形を使う。
+pub fn seek_bar_area(area: Rect) -> Rect {
     playing_areas(area)[1]
+}
+
+/// 再生状態を出す行。
+pub fn status_area(area: Rect) -> Rect {
+    playing_areas(area)[2]
 }
 
 /// 操作説明の行。
 pub fn help_area(area: Rect) -> Rect {
-    playing_areas(area)[2]
+    playing_areas(area)[3]
+}
+
+/// 描画とヒットテストが共有する割り付け。
+pub fn seek_bar_layout(app: &App) -> SeekBarLayout {
+    layout_for(app.screen, app.playback.duration)
+}
+
+fn layout_for(screen: Rect, duration: Option<f64>) -> SeekBarLayout {
+    SeekBarLayout::new(seek_bar_area(screen), label_width(duration))
 }
 
 /// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
@@ -84,7 +100,33 @@ fn draw_search(frame: &mut Frame, app: &App) {
 /// 映像領域には何も描かない。画像は draw の後にメインループが APC で重ねる。
 fn draw_playing(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    draw_seek_bar(frame, app, area);
     draw_footer(frame, app, status_area(area), help_area(area));
+}
+
+/// ポインタが指す列と時刻。duration が無いとシークできないので、印もラベルも出さない。
+fn seek_pointer(app: &App, layout: &SeekBarLayout) -> Option<(u16, f64)> {
+    let (column, duration) = app.seek_bar.shown_column().zip(app.playback.duration)?;
+    Some((column, layout.seconds_at(column, duration)))
+}
+
+fn draw_seek_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let layout = layout_for(area, app.playback.duration);
+    let pointer = seek_pointer(app, &layout);
+    let label = label_text(
+        pointer
+            .map(|(_, seconds)| seconds)
+            .or(app.playback.time_pos),
+        app.playback.duration,
+    );
+    let bar = SeekBar {
+        layout,
+        filled: layout.filled_cells(app.playback.time_pos, app.playback.duration),
+        marker: pointer.map(|(column, _)| column),
+        label: &label,
+        highlighted: pointer.is_some(),
+    };
+    frame.render_widget(bar, seek_bar_area(area));
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
@@ -117,13 +159,43 @@ fn help_text(mode: Mode) -> &'static str {
     match mode {
         Mode::Input => "Enter:検索  Esc:結果へ/終了",
         Mode::Results => "↑↓:選択  Enter:再生  /またはEsc:検索入力へ  q:終了",
-        Mode::Playing => "space:一時停止  ←→:5秒シーク  ↑↓:音量±5  Esc:停止  q:終了",
+        Mode::Playing => {
+            "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  Esc:停止  q:終了"
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Playback;
+    use crate::seekbar::SeekBarState;
+
+    #[test]
+    fn a_video_without_duration_gets_no_marker_to_seek_with() {
+        let mut app = App {
+            mode: Mode::Playing,
+            screen: Rect::new(0, 0, 80, 24),
+            playback: Playback {
+                time_pos: Some(10.0),
+                duration: None,
+                ..Playback::default()
+            },
+            seek_bar: SeekBarState {
+                hover: Some(10),
+                drag: None,
+            },
+            ..App::default()
+        };
+        assert_eq!(seek_pointer(&app, &seek_bar_layout(&app)), None);
+
+        // duration が届けば同じホバー列に印と時刻が出る (トラック 65 セルで 1 セル 10 秒)。
+        app.playback.duration = Some(650.0);
+        assert_eq!(
+            seek_pointer(&app, &seek_bar_layout(&app)),
+            Some((10, 100.0))
+        );
+    }
 
     #[test]
     fn cursor_follows_display_width_not_char_count() {
@@ -148,8 +220,14 @@ mod tests {
     #[test]
     fn playing_rows_do_not_overlap_the_video() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 22));
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
+        assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
         assert_eq!(status_area(area), Rect::new(0, 22, 80, 1));
         assert_eq!(help_area(area), Rect::new(0, 23, 80, 1));
+    }
+
+    #[test]
+    fn playing_help_mentions_the_mouse() {
+        assert!(help_text(Mode::Playing).contains("シーク"));
     }
 }

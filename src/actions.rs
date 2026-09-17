@@ -2,8 +2,9 @@
 
 use crate::app::{App, AppEvent, Mode, Playback};
 use crate::geometry::{cell_size, geometry_for, video_geometry};
-use crate::mpv::{MpvCommand, MpvController};
+use crate::mpv::{self, MpvCommand, MpvController};
 use crate::search;
+use crate::seekbar::{SeekBarState, clamp_target};
 use crate::video::VideoSink;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -13,6 +14,8 @@ use tokio::time::{Instant, timeout};
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// ドラッグ中は Resize が連続して届くので、落ち着くまで mpv の作り直しを待つ。
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// ←→ 1 回あたりのシーク幅。
+pub const SEEK_STEP_SECS: f64 = 5.0;
 
 pub struct Player {
     pub controller: MpvController,
@@ -41,9 +44,38 @@ pub async fn send_to_player(app: &mut App, session: &mut Session, command: &MpvC
     }
 }
 
+/// ←→ のシーク。mpv へは相対で送り、表示だけ目標値へ先行させる。
+pub async fn seek_relative(
+    app: &mut App,
+    session: &mut Session,
+    delta: f64,
+    now: std::time::Instant,
+) {
+    send_to_player(app, session, &mpv::seek(delta.round() as i64)).await;
+    if let Some(base) = app.playback.seek_base() {
+        let target = clamp_target(base + delta, app.playback.duration);
+        app.playback.begin_seek(target, now);
+    }
+    // キー操作が来たらホバー表示は用済み。
+    app.seek_bar.clear_hover();
+}
+
+/// バーのクリック・ドラッグのシーク。送る値は必ずファイル内へ丸める。
+pub async fn seek_absolute(
+    app: &mut App,
+    session: &mut Session,
+    target: f64,
+    now: std::time::Instant,
+) {
+    let target = clamp_target(target, app.playback.duration);
+    send_to_player(app, session, &mpv::seek_absolute(target)).await;
+    app.playback.begin_seek(target, now);
+}
+
 pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<String>) {
     stop_playback(session).await;
     app.playback = Playback::default();
+    app.seek_bar = SeekBarState::default();
     app.video = None;
     // sink を手放した後も残骸は消す。SIGKILL 経路では mpv 自身が消せない。
     session.owe_clear = true;
@@ -97,6 +129,7 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
                 title: result.title.clone(),
                 ..Playback::default()
             };
+            app.seek_bar = SeekBarState::default();
             app.video = Some(video);
             app.mode = Mode::Playing;
             app.error = None;
