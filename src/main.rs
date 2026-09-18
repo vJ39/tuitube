@@ -1,6 +1,7 @@
 mod actions;
 mod app;
 mod category;
+mod clipboard;
 mod cookies;
 mod display;
 mod fetch;
@@ -20,7 +21,7 @@ mod thumbs;
 mod ui;
 mod video;
 
-use actions::{Session, apply_resize, end_playback, poll_player, schedule_resize, stop_playback};
+use actions::{Session, apply_resize, end_playback, on_tick, schedule_resize, stop_playback};
 use anyhow::Result;
 use app::{App, AppEvent, Mode};
 use category::Tabs;
@@ -119,7 +120,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     handle_event(&mut app, event, &tx, &mut session).await;
                 }
             }
-            _ = ticker.tick() => poll_player(&mut app, &mut session).await,
+            _ = ticker.tick() => on_tick(&mut app, &mut session, std::time::Instant::now()).await,
             _ = wait_until(session.resize_at) => {
                 session.resize_at = None;
                 apply_resize(&mut app, &mut session, &tx).await;
@@ -323,11 +324,11 @@ async fn handle_event(
             session.thumbs_task = None;
             app.thumbs.set_fetching(false);
             if let Some(notice) = notice {
-                app.notice = Some(notice);
+                app.set_notice(Some(notice));
             }
             if let Some(reason) = disable {
                 app.thumbs.disable(reason.clone());
-                app.notice = Some(reason);
+                app.set_notice(Some(reason));
             }
             app.thumbs.apply(images, target_px);
         }
@@ -341,17 +342,17 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
     app.cookies.observe(&report.outcome);
 
     if let Some(source) = &source {
-        app.notice = match &report.outcome {
+        app.set_notice(match &report.outcome {
             CookieOutcome::Degraded(_) => Some(cookies::describe(&report.outcome, source)),
             // 「cookie 無しで検索しました」は、実際に出し直せたときだけ言う。
             CookieOutcome::Unreadable(_) if report.fell_back => {
                 Some(cookies::describe(&report.outcome, source))
             }
             _ => None,
-        };
+        });
         // ログインが要るだけなら cookie 連携自体は生きている。結果は出さず理由だけ出す。
         if let (CookieOutcome::LoginRequired, Target::Feed(feed)) = (&report.outcome, target) {
-            app.error = Some(cookies::login_required_message(*feed, source));
+            app.set_error(Some(cookies::login_required_message(*feed, source)));
             app.mode = Mode::Input;
             return;
         }
@@ -361,12 +362,12 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
         Ok(results) => app.set_results(results, target),
         Err(e) => {
             // 初回のタイムアウトはキーチェーンのダイアログ待ちの可能性があるので、そちらを案内する。
-            app.error = match (&report.outcome, &source) {
+            app.set_error(match (&report.outcome, &source) {
                 (CookieOutcome::TimedOut, Some(source)) if armed => {
                     Some(cookies::describe(&report.outcome, source))
                 }
                 _ => Some(e),
-            };
+            });
             app.mode = Mode::Input;
         }
     }
@@ -827,7 +828,13 @@ mod tests {
         assert_eq!(count_images(&thumbs_bytes(&mut app)), 1);
 
         let mut session = Session::default();
-        actions::enter_playback(&mut app, &mut session, "song".to_string(), sink());
+        actions::enter_playback(
+            &mut app,
+            &mut session,
+            "song".to_string(),
+            "https://www.youtube.com/watch?v=id0".to_string(),
+            sink(),
+        );
         let out = present(&mut session, &app);
 
         assert!(out.starts_with(&clear_bytes()), "a=d が出ない");

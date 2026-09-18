@@ -1,11 +1,12 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    SEEK_STEP_SECS, Session, change_speed, cycle_display_mode, move_selection, reload_tab,
-    reset_speed, seek_absolute, seek_relative, send_to_player, start_playback, start_search,
-    stop_playback, switch_tab,
+    SEEK_STEP_SECS, Session, change_speed, copy_url_with, cycle_display_mode, move_selection,
+    reload_tab, reset_speed, seek_absolute, seek_relative, send_to_player, start_playback,
+    start_search, stop_playback, switch_tab,
 };
 use crate::app::{App, AppEvent, Mode};
+use crate::clipboard::{Clipboard, Pbcopy};
 use crate::grid::Dir;
 use crate::mpv::{self, MpvCommand};
 use crate::seekbar::{MouseAction, MouseInput};
@@ -47,7 +48,7 @@ fn handle_key_input(
         }
         KeyCode::Char(c) => {
             app.query.push(c);
-            app.error = None;
+            app.set_error(None);
         }
         KeyCode::Esc => {
             if app.results.is_empty() {
@@ -77,7 +78,7 @@ async fn handle_key_results(
         KeyCode::Enter => start_playback(app, tx, session).await,
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
-            app.error = None;
+            app.set_error(None);
         }
         KeyCode::Char('q') => app.should_quit = true,
         _ => {}
@@ -85,6 +86,16 @@ async fn handle_key_results(
 }
 
 async fn handle_key_playing(app: &mut App, key: KeyEvent, session: &mut Session) {
+    handle_key_playing_with(app, key, session, Pbcopy).await;
+}
+
+/// クリップボードの書き手を差し替えられる形。テストはここに偽物を渡して pbcopy を起動させない。
+async fn handle_key_playing_with<C: Clipboard>(
+    app: &mut App,
+    key: KeyEvent,
+    session: &mut Session,
+    clipboard: C,
+) {
     if let Some(delta) = seek_step(key.code) {
         seek_relative(app, session, delta, std::time::Instant::now()).await;
     }
@@ -100,6 +111,9 @@ async fn handle_key_playing(app: &mut App, key: KeyEvent, session: &mut Session)
     // 複数コマンドと App の状態更新を伴うので playing_command には入れない。
     if key.code == KeyCode::Char('w') {
         cycle_display_mode(app, session).await;
+    }
+    if key.code == KeyCode::Char('c') {
+        copy_url_with(app, clipboard, std::time::Instant::now()).await;
     }
     if key.code == KeyCode::Char('q') {
         app.should_quit = true;
@@ -176,6 +190,7 @@ fn playing_command(code: KeyCode) -> Option<MpvCommand> {
 mod tests {
     use super::*;
     use crate::app::Playback;
+    use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
     use crossterm::event::MouseButton;
@@ -480,6 +495,80 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('w')), &tx, &mut session).await;
         assert_eq!(app.display, crate::display::DisplayMode::Embedded);
         assert_eq!(app.query, "w", "入力モードでは文字として入る");
+    }
+
+    const URL: &str = "https://www.youtube.com/watch?v=abc";
+
+    fn playing_url_app() -> App {
+        App {
+            playback: Playback {
+                url: URL.to_string(),
+                time_pos: Some(0.0),
+                duration: Some(650.0),
+                ..Playback::default()
+            },
+            ..playing_app()
+        }
+    }
+
+    #[tokio::test]
+    async fn c_copies_the_url_while_playing() {
+        let mut session = Session::default();
+        let mut app = playing_url_app();
+        let clipboard = FakeClipboard::new(CopyResult::Ok);
+        handle_key_playing_with(
+            &mut app,
+            key(KeyCode::Char('c')),
+            &mut session,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert_eq!(clipboard.copied(), [URL]);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(crate::actions::COPIED_NOTICE),
+            "コピーできたことを伝える"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_other_playing_keys_do_not_copy() {
+        // c は既存のキーと重なっていない。
+        assert_eq!(playing_command(KeyCode::Char('c')), None);
+        assert_eq!(seek_step(KeyCode::Char('c')), None);
+        assert_eq!(speed_step(KeyCode::Char('c')), None);
+
+        let mut session = Session::default();
+        let mut app = playing_url_app();
+        let clipboard = FakeClipboard::new(CopyResult::Ok);
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('w'),
+            KeyCode::Char('['),
+            KeyCode::Char(']'),
+            KeyCode::Backspace,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Esc,
+        ] {
+            handle_key_playing_with(&mut app, key(code), &mut session, clipboard.clone()).await;
+        }
+        assert!(clipboard.copied().is_empty());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn c_is_typed_into_the_query_in_the_input_mode() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        handle_key(&mut app, key(KeyCode::Char('c')), &tx, &mut session).await;
+
+        assert_eq!(app.query, "c");
+        assert!(app.notice.is_none());
     }
 
     #[tokio::test]

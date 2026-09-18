@@ -1,6 +1,7 @@
 //! Session を動かすアクション。キー入力もイベント処理もここを通して player を触る。
 
 use crate::app::{App, AppEvent, Mode, Playback};
+use crate::clipboard::{Clipboard, MISSING_PBCOPY};
 use crate::cookies::Target;
 use crate::display::{self, DisplayMode, LaunchPlan};
 use crate::fetch::{Fetcher, RealCurl};
@@ -25,6 +26,8 @@ use tokio::time::Instant;
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
 /// ←→ 1 回あたりのシーク幅。
 pub const SEEK_STEP_SECS: f64 = 5.0;
+/// コピーできたことを伝える文言。
+pub const COPIED_NOTICE: &str = "URL をコピーしました";
 
 pub type Sending<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
@@ -74,7 +77,7 @@ pub async fn send_to_player(app: &mut App, session: &mut Session, command: &MpvC
     if let Some(p) = session.player.as_mut()
         && let Err(e) = p.sink.send(command).await
     {
-        app.error = Some(e);
+        app.set_error(Some(e));
     }
 }
 
@@ -90,14 +93,22 @@ pub async fn apply_property(
     }
 }
 
+/// 毎秒の手入れ。期限切れの知らせとエラーを片付けてから再生状況を問い合わせる。
+pub async fn on_tick(app: &mut App, session: &mut Session, now: std::time::Instant) {
+    app.expire_notice(now);
+    app.expire_error(now);
+    poll_player(app, session, now).await;
+}
+
 /// 毎秒のポーリング。一過性の失敗で再生状況が隠れ続けないよう、成功したらエラーを消す。
-pub async fn poll_player(app: &mut App, session: &mut Session) {
+/// ただし操作が失敗した理由は、押した本人が読む前に消えないよう期限まで残す。
+pub async fn poll_player(app: &mut App, session: &mut Session, now: std::time::Instant) {
     let Some(player) = session.player.as_mut() else {
         return;
     };
     match player.send_all(&mpv::poll_commands()).await {
-        Ok(()) => app.error = None,
-        Err(e) => app.error = Some(e),
+        Ok(()) => app.clear_polled_error(now),
+        Err(e) => app.set_error(Some(e)),
     }
 }
 
@@ -139,7 +150,7 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
     // mpv の a=d でサムネイルも消えているので、結果へ戻ったら貼り直す。
     app.thumbs.mark_dirty();
     if error.is_some() {
-        app.error = error;
+        app.set_error(error);
     }
     app.mode = if app.results.is_empty() {
         Mode::Input
@@ -207,14 +218,14 @@ fn spawn_search<R>(
         && app.cookies.for_search().is_none()
         && let Target::Feed(feed) = &target
     {
-        app.error = Some(app.cookies.refusal(*feed));
+        app.set_error(Some(app.cookies.refusal(*feed)));
         app.mode = Mode::Input;
         return;
     }
     let nonce = session.search_nonce;
     let limit = app.settings.search.limit;
     app.searching = true;
-    app.error = None;
+    app.set_error(None);
     let cookies = app.cookies.for_search().cloned();
     let tx = tx.clone();
     session.search_task = Some(tokio::spawn(async move {
@@ -255,7 +266,7 @@ pub fn switch_tab_with<R>(
         app.tabs.prev();
     }
     app.sync_from_tab();
-    app.error = None;
+    app.set_error(None);
     if app.tabs.state().loaded {
         return;
     }
@@ -350,7 +361,7 @@ fn cancel_search(app: &mut App, session: &mut Session) {
     }
     session.search_nonce += 1;
     app.searching = false;
-    app.notice = None;
+    app.set_notice(None);
 }
 
 /// 再生開始時の映像スロットと起動計画。mpv を起動せずに検証できるよう切り出してある。
@@ -367,15 +378,22 @@ fn playback_plan(app: &App) -> (VideoSink, LaunchPlan) {
 }
 
 /// 起動できた後の画面側の状態。mpv を起動せずに検証できるよう切り出してある。
-pub fn enter_playback(app: &mut App, session: &mut Session, title: String, video: VideoSink) {
+pub fn enter_playback(
+    app: &mut App,
+    session: &mut Session,
+    title: String,
+    url: String,
+    video: VideoSink,
+) {
     app.playback = Playback {
         title,
+        url,
         ..Playback::default()
     };
     app.seek_bar = SeekBarState::default();
     app.video = Some(video);
     app.mode = Mode::Playing;
-    app.error = None;
+    app.set_error(None);
     // 貼ってあるサムネイルは ratatui の差分描画では消えない。end_playback と対称に剥がす。
     session.owe_clear = true;
 }
@@ -388,9 +406,10 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     session.player_nonce += 1;
     let nonce = session.player_nonce;
     let (video, plan) = playback_plan(app);
-    match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone(), &plan).await {
+    let url = result.url();
+    match MpvController::launch(&url, nonce, tx.clone(), video.clone(), &plan).await {
         Ok(controller) => {
-            enter_playback(app, session, result.title.clone(), video);
+            enter_playback(app, session, result.title.clone(), url, video);
             session.player = Some(Player {
                 sink: Box::new(controller),
                 nonce,
@@ -398,7 +417,7 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
         }
         Err(e) => {
             app.video = None;
-            app.error = Some(e);
+            app.set_error(Some(e));
         }
     }
 }
@@ -423,7 +442,24 @@ async fn set_speed(app: &mut App, session: &mut Session, next: Speed) {
     match player.sink.send(&next.command()).await {
         // 送信前に発行されたポーリングが古い値を返しても、ここで送った値を保つ。
         Ok(()) => app.set_speed_sent(next, std::time::Instant::now()),
-        Err(e) => app.error = Some(e),
+        Err(e) => app.set_error(Some(e)),
+    }
+}
+
+/// 再生中の URL をクリップボードへ渡す。
+/// 書き手を差し替えられる形。テストはここに偽物を渡して pbcopy を起動させない。
+/// 成否どちらも期限つきで出す。素の app.error だと次のポーリングの成功が消してしまう。
+pub async fn copy_url_with<C: Clipboard>(app: &mut App, clipboard: C, now: std::time::Instant) {
+    let url = app.playback.url.clone();
+    if url.is_empty() {
+        return;
+    }
+    match clipboard.copy(url).await {
+        Ok(()) => app.set_temporary_notice(COPIED_NOTICE.to_string(), now),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            app.set_temporary_error(MISSING_PBCOPY.to_string(), now)
+        }
+        Err(e) => app.set_temporary_error(format!("URL をコピーできませんでした: {e}"), now),
     }
 }
 
@@ -457,7 +493,7 @@ pub async fn cycle_display_mode(app: &mut App, session: &mut Session) {
                 session.owe_clear = true;
             }
         }
-        Err(e) => app.error = Some(e),
+        Err(e) => app.set_error(Some(e)),
     }
 }
 
@@ -510,7 +546,7 @@ pub async fn apply_resize_with<F>(
         DisplayMode::Window => return,
     };
     if let Err(e) = sent {
-        app.error = Some(e);
+        app.set_error(Some(e));
     }
 }
 
@@ -524,6 +560,7 @@ pub async fn stop_playback(session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::cookies::{CookieSource, CookieState};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
@@ -1368,11 +1405,146 @@ mod tests {
         assert_ne!(session.search_nonce, running);
     }
 
+    const URL: &str = "https://www.youtube.com/watch?v=id0";
+
+    fn playing_url_app() -> App {
+        App {
+            playback: Playback {
+                url: URL.to_string(),
+                ..Playback::default()
+            },
+            ..playing_app()
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_url_hands_the_playing_url_to_the_clipboard() {
+        let mut app = playing_url_app();
+        let clipboard = FakeClipboard::new(CopyResult::Ok);
+        copy_url_with(&mut app, clipboard.clone(), std::time::Instant::now()).await;
+
+        assert_eq!(clipboard.copied(), [URL]);
+        assert_eq!(app.notice.as_deref(), Some(COPIED_NOTICE));
+        assert!(app.notice_until.is_some(), "しばらくしたら消える知らせ");
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_url_reports_a_missing_pbcopy() {
+        let mut app = playing_url_app();
+        copy_url_with(
+            &mut app,
+            FakeClipboard::new(CopyResult::Missing),
+            std::time::Instant::now(),
+        )
+        .await;
+
+        assert_eq!(app.error.as_deref(), Some(crate::clipboard::MISSING_PBCOPY));
+        assert!(app.error_until.is_some(), "しばらくしたら消えるエラー");
+        assert!(app.notice.is_none(), "失敗をコピー成功と見せない");
+    }
+
+    #[tokio::test]
+    async fn copy_url_reports_a_failed_copy() {
+        let mut app = playing_url_app();
+        copy_url_with(
+            &mut app,
+            FakeClipboard::new(CopyResult::Failed),
+            std::time::Instant::now(),
+        )
+        .await;
+
+        let error = app.error.expect("理由を出す");
+        assert!(error.contains("コピーできませんでした"), "{error}");
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn copy_url_without_a_url_starts_nothing() {
+        let mut app = playing_app();
+        let clipboard = FakeClipboard::new(CopyResult::Ok);
+        copy_url_with(&mut app, clipboard.clone(), std::time::Instant::now()).await;
+
+        assert!(clipboard.copied().is_empty());
+        assert!(app.notice.is_none());
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_tick_drops_a_temporary_notice_once_its_time_is_up() {
+        let t0 = std::time::Instant::now();
+        let mut app = playing_url_app();
+        let mut session = Session::default();
+        app.set_temporary_notice(COPIED_NOTICE.to_string(), t0);
+
+        on_tick(&mut app, &mut session, t0 + crate::app::NOTICE_TTL / 2).await;
+        assert!(app.notice.is_some(), "期限前は消さない");
+
+        on_tick(&mut app, &mut session, t0 + crate::app::NOTICE_TTL).await;
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_copy_failure_survives_the_polling_that_follows() {
+        let t0 = std::time::Instant::now();
+        let mut app = playing_url_app();
+        let mut session = Session::default();
+        // ポーリングは成功する。何もしなければ 1 秒後のティックがエラーを消してしまう。
+        record(&mut session, Ok(()));
+        copy_url_with(&mut app, FakeClipboard::new(CopyResult::Missing), t0).await;
+
+        on_tick(&mut app, &mut session, t0 + crate::app::NOTICE_TTL / 2).await;
+        assert_eq!(
+            app.error.as_deref(),
+            Some(crate::clipboard::MISSING_PBCOPY),
+            "読む前に消さない"
+        );
+
+        on_tick(&mut app, &mut session, t0 + crate::app::NOTICE_TTL).await;
+        assert!(app.error.is_none(), "期限が来たら消す");
+        assert!(app.error_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn polling_still_clears_an_error_of_its_own() {
+        let t0 = std::time::Instant::now();
+        let mut app = playing_url_app();
+        let mut session = Session::default();
+        record(&mut session, Err("パイプが閉じました".to_string()));
+        poll_player(&mut app, &mut session, t0).await;
+        assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
+
+        session.player = None;
+        record(&mut session, Ok(()));
+        poll_player(&mut app, &mut session, t0).await;
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn entering_playback_keeps_the_url_of_the_video() {
+        let mut app = grid_app(4);
+        let mut session = Session::default();
+        enter_playback(
+            &mut app,
+            &mut session,
+            "song".to_string(),
+            URL.to_string(),
+            sink(),
+        );
+        assert_eq!(app.playback.url, URL);
+    }
+
     #[test]
     fn entering_playback_owes_a_clear_for_the_thumbnails() {
         let mut app = grid_app(4);
         let mut session = Session::default();
-        enter_playback(&mut app, &mut session, "song".to_string(), sink());
+        enter_playback(
+            &mut app,
+            &mut session,
+            "song".to_string(),
+            URL.to_string(),
+            sink(),
+        );
 
         assert_eq!(app.mode, Mode::Playing);
         assert!(app.video.is_some());

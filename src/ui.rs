@@ -295,7 +295,7 @@ fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
         status,
     );
     frame.render_widget(
-        Paragraph::new(help_text(app.mode, app.display))
+        Paragraph::new(help_text(app.mode, app.display, help.width))
             .style(Style::default().fg(Color::DarkGray)),
         help,
     );
@@ -311,7 +311,7 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
         .min(input_area.right().saturating_sub(2))
 }
 
-fn help_text(mode: Mode, display: DisplayMode) -> String {
+fn help_text(mode: Mode, display: DisplayMode, width: u16) -> String {
     match mode {
         // 旧版はキーワードを4つ並べて83桁あり、80桁端末では末尾が切れていた。
         Mode::Input => {
@@ -320,11 +320,43 @@ fn help_text(mode: Mode, display: DisplayMode) -> String {
         Mode::Results => {
             "↑↓←→:選択  Enter:再生  Tab:カテゴリ  r:再取得  /またはEsc:検索へ  q:終了".to_string()
         }
-        Mode::Playing => format!(
-            "space:一時停止  ←→/クリック:シーク  ↑↓:音量  [ ]:速度±0.1  BS:等速  w:{}  Esc:停止  q:終了",
-            display.next().label()
-        ),
+        Mode::Playing => fit_hints(&playing_hints(display), width as usize),
     }
+}
+
+/// 再生中の案内。全部で 110 桁ほどあり 80 桁端末には入らないので、
+/// 落ちて困らないものを後ろに置く。先頭 7 つは最も幅を食う w:別ウィンドウでも 75 桁に収まる。
+fn playing_hints(display: DisplayMode) -> Vec<String> {
+    vec![
+        "space:一時停止".to_string(),
+        "←→:シーク".to_string(),
+        "↑↓:音量".to_string(),
+        "c:URLコピー".to_string(),
+        format!("w:{}", display.next().label()),
+        "Esc:停止".to_string(),
+        "q:終了".to_string(),
+        "[ ]:速度±0.1".to_string(),
+        "BS:等速".to_string(),
+        "クリック:シーク".to_string(),
+    ]
+}
+
+/// 幅に入るところまでを空白 1 つでつなぐ。help は折り返さないので、
+/// 途中で切れた案内を出すより落とす。
+fn fit_hints(hints: &[String], width: usize) -> String {
+    let mut line = String::new();
+    for hint in hints {
+        let next = if line.is_empty() {
+            hint.clone()
+        } else {
+            format!("{line} {hint}")
+        };
+        if grid::display_width(&next) > width {
+            break;
+        }
+        line = next;
+    }
+    line
 }
 
 #[cfg(test)]
@@ -384,16 +416,21 @@ mod tests {
         assert_eq!(cursor_x(area, "ラーメンラーメン"), 8);
     }
 
+    /// 80 桁端末のヘルプ。案内が落ちるかどうかはここで決まる。
+    fn help_80(mode: Mode, display: DisplayMode) -> String {
+        help_text(mode, display, 80)
+    }
+
     #[test]
     fn results_help_mentions_esc() {
-        assert!(help_text(Mode::Results, DisplayMode::Embedded).contains("Esc"));
+        assert!(help_80(Mode::Results, DisplayMode::Embedded).contains("Esc"));
     }
 
     #[test]
     fn help_text_names_the_next_display_mode() {
-        assert!(help_text(Mode::Playing, DisplayMode::Embedded).contains("w:テキスト"));
-        assert!(help_text(Mode::Playing, DisplayMode::Text).contains("w:別ウィンドウ"));
-        assert!(help_text(Mode::Playing, DisplayMode::Window).contains("w:埋め込み"));
+        assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("w:テキスト"));
+        assert!(help_80(Mode::Playing, DisplayMode::Text).contains("w:別ウィンドウ"));
+        assert!(help_80(Mode::Playing, DisplayMode::Window).contains("w:埋め込み"));
     }
 
     #[test]
@@ -414,7 +451,8 @@ mod tests {
 
     #[test]
     fn playing_help_mentions_the_speed_keys() {
-        let help = help_text(Mode::Playing, DisplayMode::Embedded);
+        // 80 桁では入らないので、広い端末での案内で見る。
+        let help = help_text(Mode::Playing, DisplayMode::Embedded, 200);
         assert!(help.contains("[ ]"), "{help}");
         assert!(help.contains("BS"), "{help}");
         assert!(help.contains("速度"), "{help}");
@@ -431,7 +469,7 @@ mod tests {
     #[test]
     fn input_help_mentions_feed_keywords() {
         // 4 つ並べると 83 桁で 80 桁端末に入らないため、":yt*" に畳んである。
-        let help = help_text(Mode::Input, DisplayMode::Embedded);
+        let help = help_80(Mode::Input, DisplayMode::Embedded);
         assert!(help.contains(":yt*"), "{help}");
         assert!(help.contains("Enter:検索"), "{help}");
         assert!(help.contains("Tab:カテゴリ"), "{help}");
@@ -440,7 +478,7 @@ mod tests {
 
     #[test]
     fn results_help_mentions_the_grid_and_tab_keys() {
-        let help = help_text(Mode::Results, DisplayMode::Embedded);
+        let help = help_80(Mode::Results, DisplayMode::Embedded);
         for key in ["↑↓←→", "Tab:カテゴリ", "r:再取得", "Enter:再生"] {
             assert!(help.contains(key), "{key} がない: {help}");
         }
@@ -536,7 +574,42 @@ mod tests {
     }
 
     #[test]
+    fn playing_help_keeps_the_main_keys_inside_80_columns() {
+        for display in [
+            DisplayMode::Embedded,
+            DisplayMode::Text,
+            DisplayMode::Window,
+        ] {
+            let help = help_80(Mode::Playing, display);
+            let width = grid::display_width(&help);
+            assert!(width <= 80, "{width} 桁: {help}");
+            // 切れた案内を出さない代わりに、押せないと困るキーは必ず入れる。
+            for key in [
+                "space:一時停止",
+                "c:URLコピー",
+                &format!("w:{}", display.next().label()),
+                "Esc:停止",
+                "q:終了",
+            ] {
+                assert!(help.contains(key), "{key} が落ちた: {help}");
+            }
+        }
+    }
+
+    #[test]
+    fn playing_help_drops_whole_hints_when_the_terminal_is_narrow() {
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, 200);
+        assert!(wide.contains("クリック:シーク"), "{wide}");
+
+        let narrow = help_text(Mode::Playing, DisplayMode::Embedded, 30);
+        assert_eq!(narrow, "space:一時停止 ←→:シーク");
+        assert_eq!(help_text(Mode::Playing, DisplayMode::Embedded, 0), "");
+    }
+
+    #[test]
     fn playing_help_mentions_the_mouse() {
-        assert!(help_text(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
+        // マウスの案内は幅が余ったときだけ出す。
+        assert!(help_text(Mode::Playing, DisplayMode::Embedded, 200).contains("クリック"));
+        assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
     }
 }

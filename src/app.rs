@@ -20,6 +20,8 @@ pub const SEEK_HOLD: Duration = Duration::from_secs(2);
 pub const SEEK_TOLERANCE_SECS: f64 = 3.0;
 /// 速度を送ってから確定値を待つ間、ポーリングの古い値を無視する時間。
 pub const SPEED_HOLD: Duration = Duration::from_secs(2);
+/// 期限つきの知らせを出しておく時間。
+pub const NOTICE_TTL: Duration = Duration::from_secs(3);
 
 pub enum AppEvent {
     Key(KeyEvent),
@@ -83,6 +85,8 @@ pub struct PendingSeek {
 #[derive(Debug, Default, Clone)]
 pub struct Playback {
     pub title: String,
+    /// 再生中の動画の URL。コピー用にここで持つ。
+    pub url: String,
     pub paused: Option<bool>,
     pub time_pos: Option<f64>,
     pub duration: Option<f64>,
@@ -129,8 +133,12 @@ pub struct App {
     pub selected: usize,
     pub searching: bool,
     pub error: Option<String>,
+    /// 操作が失敗した理由を消す時刻。ポーリングが上書きしてよいものは None。
+    pub error_until: Option<Instant>,
     /// 設定を読み替えたときなど、エラーではないが一度伝えたいこと。
     pub notice: Option<String>,
+    /// 知らせを消す時刻。出し続けるものは None。
+    pub notice_until: Option<Instant>,
     /// ブラウザ cookie 連携の状態。検索・再生・表示がここを見る。
     pub cookies: CookieState,
     pub playback: Playback,
@@ -164,7 +172,9 @@ impl Default for App {
             selected: 0,
             searching: false,
             error: None,
+            error_until: None,
             notice: None,
+            notice_until: None,
             cookies: CookieState::default(),
             playback: Playback::default(),
             settings: Settings::default(),
@@ -183,6 +193,51 @@ impl Default for App {
 }
 
 impl App {
+    /// 気づくまで出し続ける知らせ。
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
+        self.notice_until = None;
+    }
+
+    /// 操作に対する短い返事。expire_notice が期限後に消す。
+    pub fn set_temporary_notice(&mut self, notice: String, now: Instant) {
+        self.notice = Some(notice);
+        self.notice_until = Some(now + NOTICE_TTL);
+    }
+
+    pub fn expire_notice(&mut self, now: Instant) {
+        if self.notice_until.is_some_and(|until| now >= until) {
+            self.notice = None;
+            self.notice_until = None;
+        }
+    }
+
+    /// ポーリングが上書き・消去してよいエラー。
+    pub fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
+        self.error_until = None;
+    }
+
+    /// 操作が失敗した理由。読む間もなく消えないよう、知らせと同じだけ出しておく。
+    pub fn set_temporary_error(&mut self, error: String, now: Instant) {
+        self.error = Some(error);
+        self.error_until = Some(now + NOTICE_TTL);
+    }
+
+    pub fn expire_error(&mut self, now: Instant) {
+        if self.error_until.is_some_and(|until| now >= until) {
+            self.set_error(None);
+        }
+    }
+
+    /// ポーリングが成功したときの後片付け。期限内の操作エラーは残す。
+    pub fn clear_polled_error(&mut self, now: Instant) {
+        if self.error_until.is_some_and(|until| now < until) {
+            return;
+        }
+        self.set_error(None);
+    }
+
     pub fn select_next(&mut self) {
         if self.results.is_empty() {
             return;
@@ -765,6 +820,94 @@ mod tests {
         // エラーが出ている行には足さない。
         app.error = Some("boom".to_string());
         assert!(app.status_line().ends_with("エラー: boom"));
+    }
+
+    #[test]
+    fn playback_keeps_the_url_so_it_can_be_copied() {
+        assert!(Playback::default().url.is_empty());
+        let playback = Playback {
+            url: "https://www.youtube.com/watch?v=abc".to_string(),
+            ..Playback::default()
+        };
+        assert_eq!(playback.url, "https://www.youtube.com/watch?v=abc");
+    }
+
+    #[test]
+    fn a_temporary_notice_disappears_once_its_time_is_up() {
+        let t0 = Instant::now();
+        let mut app = App {
+            mode: Mode::Playing,
+            ..App::default()
+        };
+        app.set_temporary_notice("URL をコピーしました".to_string(), t0);
+        assert!(app.status_line().ends_with("URL をコピーしました"));
+
+        app.expire_notice(t0 + NOTICE_TTL - Duration::from_millis(1));
+        assert!(app.notice.is_some(), "期限前は消さない");
+
+        app.expire_notice(t0 + NOTICE_TTL);
+        assert!(app.notice.is_none());
+        assert!(app.notice_until.is_none());
+    }
+
+    #[test]
+    fn a_notice_without_a_deadline_stays_until_it_is_replaced() {
+        // 設定の読み替えや cookie の知らせは、気づくまで出し続ける。
+        let t0 = Instant::now();
+        let mut app = App::default();
+        app.set_notice(Some(
+            "TUITUBE_FPS_LIMIT=3O を数値として読めません".to_string(),
+        ));
+        app.expire_notice(t0 + NOTICE_TTL * 10);
+        assert!(app.notice.is_some());
+
+        // 期限つきの知らせを上書きしたら、その期限も持ち越さない。
+        app.set_temporary_notice("URL をコピーしました".to_string(), t0);
+        app.set_notice(Some("cookie を読めませんでした".to_string()));
+        assert!(app.notice_until.is_none());
+        app.expire_notice(t0 + NOTICE_TTL * 10);
+        assert_eq!(app.notice.as_deref(), Some("cookie を読めませんでした"));
+
+        app.set_notice(None);
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn an_operation_error_outlives_a_successful_poll_but_not_its_deadline() {
+        let t0 = Instant::now();
+        let mut app = App::default();
+        app.set_temporary_error("pbcopy が見つかりません".to_string(), t0);
+
+        app.clear_polled_error(t0 + NOTICE_TTL - Duration::from_millis(1));
+        assert!(app.error.is_some(), "ポーリングの成功では消さない");
+
+        app.clear_polled_error(t0 + NOTICE_TTL);
+        assert!(app.error.is_none());
+        assert!(app.error_until.is_none());
+    }
+
+    #[test]
+    fn a_polling_error_is_cleared_by_the_next_success() {
+        let t0 = Instant::now();
+        let mut app = App::default();
+        app.set_error(Some("パイプが閉じました".to_string()));
+        assert!(app.error_until.is_none(), "期限つきの残りを持ち越さない");
+
+        app.clear_polled_error(t0);
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn an_operation_error_is_dropped_by_the_tick_even_without_a_player() {
+        let t0 = Instant::now();
+        let mut app = App::default();
+        app.set_temporary_error("URL をコピーできませんでした".to_string(), t0);
+
+        app.expire_error(t0 + NOTICE_TTL - Duration::from_millis(1));
+        assert!(app.error.is_some());
+
+        app.expire_error(t0 + NOTICE_TTL);
+        assert!(app.error.is_none());
     }
 
     #[test]
