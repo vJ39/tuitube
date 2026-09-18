@@ -2,7 +2,8 @@
 
 use crate::mpv::{self, MpvCommand};
 use crate::settings::{MAX_FPS_CAP, Settings};
-use crate::video::{Geometry, MAX_FRAME_PIXELS};
+use crate::speed::Speed;
+use crate::video::{DecoderKind, Geometry, MAX_FRAME_PIXELS};
 use serde_json::json;
 
 /// fps 上限フィルタに付けるラベル。再生中に外したり戻したりするために名前で指す。
@@ -11,18 +12,23 @@ pub const CAP_LABEL: &str = "tuitube-cap";
 pub const DEFAULT_WINDOW_TITLE: &str = "tuitube - ${media-title}";
 /// kitty VO の名前。`current-vo` がこれなら埋め込みで出ている。
 const KITTY_VO: &str = "kitty";
+/// 文字ブロック VO の名前。
+const TCT_VO: &str = "tct";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DisplayMode {
     #[default]
     Embedded,
+    Text,
     Window,
 }
 
 impl DisplayMode {
-    pub fn toggled(self) -> Self {
+    /// w での循環。端末内 (Text) を経由するので、途中で GUI ウィンドウが開かない。
+    pub fn next(self) -> Self {
         match self {
-            Self::Embedded => Self::Window,
+            Self::Embedded => Self::Text,
+            Self::Text => Self::Window,
             Self::Window => Self::Embedded,
         }
     }
@@ -31,13 +37,24 @@ impl DisplayMode {
     pub fn from_current_vo(vo: Option<&str>) -> Option<Self> {
         match vo? {
             KITTY_VO => Some(Self::Embedded),
+            TCT_VO => Some(Self::Text),
             _ => Some(Self::Window),
+        }
+    }
+
+    /// 映像の読み取り方。別ウィンドウでは stdout に映像が来ない。
+    pub fn decoder_kind(self) -> Option<DecoderKind> {
+        match self {
+            Self::Embedded => Some(DecoderKind::Kitty),
+            Self::Text => Some(DecoderKind::Text),
+            Self::Window => None,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Embedded => "埋め込み",
+            Self::Text => "テキスト",
             Self::Window => "別ウィンドウ",
         }
     }
@@ -46,13 +63,14 @@ impl DisplayMode {
     pub fn key(self) -> &'static str {
         match self {
             Self::Embedded => "embedded",
+            Self::Text => "text",
             Self::Window => "window",
         }
     }
 
     /// 設定ファイルの値から。綴りが違えば None (呼び出し側が既定へ倒して notice を出す)。
     pub fn from_key(key: &str) -> Option<Self> {
-        [Self::Embedded, Self::Window]
+        [Self::Embedded, Self::Text, Self::Window]
             .into_iter()
             .find(|mode| mode.key() == key)
     }
@@ -205,6 +223,8 @@ pub struct LaunchPlan {
     pub geometry: Geometry,
     pub fps_cap: Option<FpsCap>,
     pub window: WindowOptions,
+    /// 直前の再生から持ち越した速度。等速なら引数に出さない。
+    pub speed: Speed,
     /// [mpv] extra_args と cookie 連携の追加引数。
     pub extra_args: Vec<String>,
 }
@@ -216,6 +236,7 @@ impl LaunchPlan {
             geometry,
             fps_cap: settings.fps_cap,
             window: settings.window.clone(),
+            speed: Speed::NORMAL,
             extra_args: settings.extra_args.clone(),
         }
     }
@@ -231,45 +252,78 @@ impl LaunchPlan {
                     args.push(cap.launch_arg());
                 }
             }
+            DisplayMode::Text => {
+                args.push(format!("--vo={TCT_VO}"));
+                args.extend(self.geometry.tct_args());
+                if let Some(cap) = self.fps_cap {
+                    args.push(cap.launch_arg());
+                }
+            }
             // 上限フィルタは GPU VO には効く意味がないので付けない。
             DisplayMode::Window => args.extend(self.window.args()),
         }
+        // 速度は VO と独立。表示モードによらず同じ引数で渡す。
+        args.extend(self.speed.launch_arg());
         args.extend_from_slice(&self.extra_args);
         args
     }
 }
 
-/// 埋め込み → 別ウィンドウ。fps 上限を外し、vo を変える。
-pub fn to_window_commands(cap: Option<FpsCap>, window: &WindowOptions) -> Vec<MpvCommand> {
+/// from → to の切替コマンド列。VO は生成時にしか設定を読まないので、順序を入れ替えない。
+/// mode = "window" で起動したときは起動引数に VO オプションが無いため、
+/// 寸法だけでなく位置・alt-screen・config-clear もここで送る。
+pub fn switch_commands(
+    from: DisplayMode,
+    to: DisplayMode,
+    geometry: Geometry,
+    cap: Option<FpsCap>,
+    window: &WindowOptions,
+) -> Vec<MpvCommand> {
     let mut commands = Vec::new();
-    if cap.is_some() {
-        commands.push(FpsCap::remove_command());
+    match to {
+        DisplayMode::Window => {
+            if cap.is_some() {
+                commands.push(FpsCap::remove_command());
+            }
+            commands.push(mpv::set_property("vo", json!(window.vo_value())));
+        }
+        DisplayMode::Embedded => {
+            commands.extend(
+                geometry
+                    .kitty_options()
+                    .into_iter()
+                    .map(|(key, value)| mpv::set_kitty_option(key, value)),
+            );
+            commands.extend(restored_cap(from, cap));
+            commands.push(mpv::set_property("vo", json!(KITTY_VO)));
+        }
+        DisplayMode::Text => {
+            commands.extend(
+                geometry
+                    .tct_options()
+                    .into_iter()
+                    .map(|(key, value)| mpv::set_tct_option(key, value)),
+            );
+            commands.extend(restored_cap(from, cap));
+            commands.push(mpv::set_property("vo", json!(TCT_VO)));
+        }
     }
-    commands.push(mpv::set_property("vo", json!(window.vo_value())));
     commands
 }
 
-/// 別ウィンドウ → 埋め込み。kitty VO の設定を送り、fps 上限を足し、vo を kitty に。
-/// VO は生成時にしか設定を読まないので、順序を入れ替えない。
-/// mode = "window" で起動したときは起動引数に --vo-kitty-* が無いため、
-/// 寸法だけでなく位置・alt-screen・config-clear もここで送る。
-pub fn to_embedded_commands(geometry: Geometry, cap: Option<FpsCap>) -> Vec<MpvCommand> {
-    let mut commands: Vec<MpvCommand> = geometry
-        .kitty_options()
-        .into_iter()
-        .map(|(key, value)| mpv::set_kitty_option(key, value))
-        .collect();
-    if let Some(cap) = cap {
-        commands.push(cap.add_command());
-    }
-    commands.push(mpv::set_property("vo", json!(KITTY_VO)));
-    commands
+/// 上限フィルタを外すのは別ウィンドウへ行くときだけなので、足し直すのも戻るときだけ。
+fn restored_cap(from: DisplayMode, cap: Option<FpsCap>) -> Option<MpvCommand> {
+    (from == DisplayMode::Window)
+        .then_some(cap)
+        .flatten()
+        .map(FpsCap::add_command)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::Settings;
+    use crate::speed::Speed;
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
     use ratatui::layout::Rect;
 
@@ -340,6 +394,10 @@ mod tests {
             DisplayMode::from_current_vo(Some("kitty")),
             Some(DisplayMode::Embedded)
         );
+        assert_eq!(
+            DisplayMode::from_current_vo(Some("tct")),
+            Some(DisplayMode::Text)
+        );
         for vo in ["gpu-next", "gpu"] {
             assert_eq!(
                 DisplayMode::from_current_vo(Some(vo)),
@@ -349,8 +407,95 @@ mod tests {
         }
         assert_eq!(DisplayMode::from_current_vo(None), None);
         assert_eq!(DisplayMode::default(), DisplayMode::Embedded);
-        assert_eq!(DisplayMode::Embedded.toggled(), DisplayMode::Window);
-        assert_eq!(DisplayMode::Window.toggled(), DisplayMode::Embedded);
+    }
+
+    #[test]
+    fn display_mode_cycles_embedded_text_window() {
+        assert_eq!(DisplayMode::Embedded.next(), DisplayMode::Text);
+        assert_eq!(DisplayMode::Text.next(), DisplayMode::Window);
+        assert_eq!(DisplayMode::Window.next(), DisplayMode::Embedded);
+    }
+
+    #[test]
+    fn display_mode_keys_and_labels_cover_text() {
+        assert_eq!(DisplayMode::from_key("text"), Some(DisplayMode::Text));
+        assert_eq!(DisplayMode::Text.key(), "text");
+        assert_eq!(DisplayMode::Text.label(), "テキスト");
+        // 大文字始まりは別の綴り。
+        assert_eq!(DisplayMode::from_key("Text"), None);
+    }
+
+    #[test]
+    fn decoder_kind_is_none_only_for_the_window() {
+        assert_eq!(
+            DisplayMode::Embedded.decoder_kind(),
+            Some(DecoderKind::Kitty)
+        );
+        assert_eq!(DisplayMode::Text.decoder_kind(), Some(DecoderKind::Text));
+        assert_eq!(DisplayMode::Window.decoder_kind(), None);
+    }
+
+    #[test]
+    fn text_launch_args_use_tct_with_the_cell_size_and_the_fps_cap() {
+        let plan = LaunchPlan {
+            mode: DisplayMode::Text,
+            geometry: geometry(80, 22),
+            fps_cap: Some(cap(15)),
+            window: WindowOptions::default(),
+            speed: Speed::NORMAL,
+            extra_args: Vec::new(),
+        };
+        let args = plan.args();
+
+        assert!(args.contains(&"--vo=tct".to_string()), "{args:?}");
+        assert!(args.contains(&"--vo-tct-width=80".to_string()), "{args:?}");
+        assert!(args.contains(&"--vo-tct-height=22".to_string()), "{args:?}");
+        assert!(args.contains(&cap(15).launch_arg()), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.starts_with("--vo-kitty-")),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a.starts_with("--title")), "{args:?}");
+    }
+
+    #[test]
+    fn launch_args_carry_the_speed_only_when_it_is_not_normal() {
+        let extra = vec!["--hwdec=no".to_string()];
+        let plan = LaunchPlan {
+            mode: DisplayMode::Embedded,
+            geometry: geometry(80, 22),
+            fps_cap: Some(cap(15)),
+            window: WindowOptions::default(),
+            speed: Speed::from_tenths(15).expect("1.5x"),
+            extra_args: extra.clone(),
+        };
+        let args = plan.args();
+        let at = args
+            .iter()
+            .position(|a| a == "--speed=1.5")
+            .unwrap_or_else(|| panic!("--speed がない: {args:?}"));
+        // 利用者の指定 (extra_args) が後から上書きできる位置に置く。
+        assert_eq!(args[at + 1..], extra[..]);
+
+        let normal = LaunchPlan {
+            speed: Speed::NORMAL,
+            ..plan
+        };
+        assert!(
+            !normal.args().iter().any(|a| a.starts_with("--speed")),
+            "{:?}",
+            normal.args()
+        );
+    }
+
+    #[test]
+    fn plan_starts_at_normal_speed() {
+        let plan = LaunchPlan::new(
+            DisplayMode::Embedded,
+            geometry(80, 22),
+            &Settings::default(),
+        );
+        assert_eq!(plan.speed, Speed::NORMAL);
     }
 
     #[test]
@@ -360,6 +505,7 @@ mod tests {
             geometry: geometry(80, 22),
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
+            speed: Speed::NORMAL,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -380,6 +526,7 @@ mod tests {
             geometry: geometry(80, 22),
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
+            speed: Speed::NORMAL,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -441,6 +588,7 @@ mod tests {
             geometry: geometry(80, 22),
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
+            speed: Speed::NORMAL,
             extra_args: extra.clone(),
         };
         let args = plan.args();
@@ -457,49 +605,53 @@ mod tests {
         assert_eq!(plan.extra_args, settings.extra_args);
     }
 
-    #[test]
-    fn to_window_commands_remove_the_cap_before_switching_the_vo() {
-        let lines: Vec<String> = to_window_commands(Some(cap(15)), &WindowOptions::default())
+    fn switch(from: DisplayMode, to: DisplayMode, cap: Option<FpsCap>) -> Vec<String> {
+        switch_commands(from, to, geometry(80, 22), cap, &WindowOptions::default())
             .iter()
             .map(|c| c.to_line())
-            .collect();
-        assert_eq!(
-            lines,
-            [
-                "{\"command\":[\"vf\",\"remove\",\"@tuitube-cap\"]}\n",
-                // 空文字は mpv の自動選択に戻す指定。
-                "{\"command\":[\"set_property\",\"vo\",\"\"]}\n",
-            ]
-        );
+            .collect()
+    }
 
-        let without_cap: Vec<String> = to_window_commands(None, &WindowOptions::default())
-            .iter()
-            .map(|c| c.to_line())
-            .collect();
-        assert_eq!(
-            without_cap,
-            ["{\"command\":[\"set_property\",\"vo\",\"\"]}\n"]
-        );
+    #[test]
+    fn switch_to_the_window_removes_the_cap_from_either_terminal_mode() {
+        for from in [DisplayMode::Embedded, DisplayMode::Text] {
+            assert_eq!(
+                switch(from, DisplayMode::Window, Some(cap(15))),
+                [
+                    "{\"command\":[\"vf\",\"remove\",\"@tuitube-cap\"]}\n",
+                    // 空文字は mpv の自動選択に戻す指定。
+                    "{\"command\":[\"set_property\",\"vo\",\"\"]}\n",
+                ],
+                "{from:?}"
+            );
+            assert_eq!(
+                switch(from, DisplayMode::Window, None),
+                ["{\"command\":[\"set_property\",\"vo\",\"\"]}\n"],
+                "{from:?}"
+            );
+        }
 
         let fixed = WindowOptions {
             vo: Some("gpu".to_string()),
             ..WindowOptions::default()
         };
-        let lines: Vec<String> = to_window_commands(None, &fixed)
-            .iter()
-            .map(|c| c.to_line())
-            .collect();
+        let lines: Vec<String> = switch_commands(
+            DisplayMode::Embedded,
+            DisplayMode::Window,
+            geometry(80, 22),
+            None,
+            &fixed,
+        )
+        .iter()
+        .map(|c| c.to_line())
+        .collect();
         assert_eq!(lines, ["{\"command\":[\"set_property\",\"vo\",\"gpu\"]}\n"]);
     }
 
     #[test]
-    fn to_embedded_commands_send_geometry_then_cap_then_vo() {
-        let lines: Vec<String> = to_embedded_commands(geometry(80, 22), Some(cap(15)))
-            .iter()
-            .map(|c| c.to_line())
-            .collect();
+    fn switch_to_embedded_from_the_window_matches_the_current_sequence() {
         assert_eq!(
-            lines,
+            switch(DisplayMode::Window, DisplayMode::Embedded, Some(cap(15))),
             [
                 // 設定は VO の生成前に入っていなければ読まれない。
                 "{\"command\":[\"set_property\",\"vo-kitty-cols\",80]}\n",
@@ -516,26 +668,72 @@ mod tests {
             ]
         );
         // vo の変更が VO を作り直すので、映像トラックの入れ直しは要らない。
-        assert!(!lines.iter().any(|line| line.contains("\"vid\"")));
-
-        let without_cap = to_embedded_commands(geometry(80, 22), None);
-        assert_eq!(without_cap.len(), 9);
+        assert!(
+            !switch(DisplayMode::Window, DisplayMode::Embedded, Some(cap(15)))
+                .iter()
+                .any(|line| line.contains("\"vid\""))
+        );
+        assert_eq!(
+            switch(DisplayMode::Window, DisplayMode::Embedded, None).len(),
+            9
+        );
     }
 
     #[test]
-    fn to_embedded_commands_cover_every_option_of_an_embedded_launch() {
+    fn switch_to_embedded_covers_every_option_of_an_embedded_launch() {
         // 別ウィンドウ起動から w で戻したときも、埋め込み起動と同じ構成にする。
-        let geometry = geometry(80, 22);
-        let sent: Vec<String> = to_embedded_commands(geometry, None)
-            .iter()
-            .map(|c| c.to_line())
-            .collect();
-        for (key, _) in geometry.kitty_options() {
+        let sent = switch(DisplayMode::Window, DisplayMode::Embedded, None);
+        for (key, _) in geometry(80, 22).kitty_options() {
             assert!(
                 sent.iter()
                     .any(|line| line.contains(&format!("vo-kitty-{key}"))),
                 "{key} を送っていない: {sent:?}"
             );
         }
+    }
+
+    #[test]
+    fn switch_to_embedded_from_text_sends_the_kitty_options_and_keeps_the_cap() {
+        let lines = switch(DisplayMode::Text, DisplayMode::Embedded, Some(cap(15)));
+        // 上限フィルタは外していないので足し直さない。
+        assert!(
+            !lines.iter().any(|line| line.contains("\"vf\"")),
+            "{lines:?}"
+        );
+        assert_eq!(lines.len(), 9);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("{\"command\":[\"set_property\",\"vo\",\"kitty\"]}\n")
+        );
+    }
+
+    #[test]
+    fn switch_to_text_from_embedded_sends_tct_size_then_vo_without_touching_the_cap() {
+        assert_eq!(
+            switch(DisplayMode::Embedded, DisplayMode::Text, Some(cap(15))),
+            [
+                "{\"command\":[\"set_property\",\"vo-tct-width\",80]}\n",
+                "{\"command\":[\"set_property\",\"vo-tct-height\",22]}\n",
+                "{\"command\":[\"set_property\",\"vo\",\"tct\"]}\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn switch_to_text_from_the_window_adds_the_cap_back() {
+        assert_eq!(
+            switch(DisplayMode::Window, DisplayMode::Text, Some(cap(15))),
+            [
+                "{\"command\":[\"set_property\",\"vo-tct-width\",80]}\n",
+                "{\"command\":[\"set_property\",\"vo-tct-height\",22]}\n",
+                "{\"command\":[\"vf\",\"add\",\"@tuitube-cap:lavfi=[select=floor((t-prev_selected_t)*15+0.001)]\"]}\n",
+                "{\"command\":[\"set_property\",\"vo\",\"tct\"]}\n",
+            ]
+        );
+        // 上限を設けていなければ足すものは無い。
+        assert_eq!(
+            switch(DisplayMode::Window, DisplayMode::Text, None).len(),
+            3
+        );
     }
 }

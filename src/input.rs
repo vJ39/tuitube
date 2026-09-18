@@ -1,8 +1,8 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    SEEK_STEP_SECS, Session, seek_absolute, seek_relative, send_to_player, start_playback,
-    start_search, stop_playback, toggle_display_mode,
+    SEEK_STEP_SECS, Session, change_speed, cycle_display_mode, reset_speed, seek_absolute,
+    seek_relative, send_to_player, start_playback, start_search, stop_playback,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::mpv::{self, MpvCommand};
@@ -79,12 +79,18 @@ async fn handle_key_playing(app: &mut App, key: KeyEvent, session: &mut Session)
     if let Some(delta) = seek_step(key.code) {
         seek_relative(app, session, delta, std::time::Instant::now()).await;
     }
+    if let Some(steps) = speed_step(key.code) {
+        change_speed(app, session, steps).await;
+    }
+    if key.code == KeyCode::Backspace {
+        reset_speed(app, session).await;
+    }
     if let Some(command) = playing_command(key.code) {
         send_to_player(app, session, &command).await;
     }
     // 複数コマンドと App の状態更新を伴うので playing_command には入れない。
     if key.code == KeyCode::Char('w') {
-        toggle_display_mode(app, session).await;
+        cycle_display_mode(app, session).await;
     }
     if key.code == KeyCode::Char('q') {
         app.should_quit = true;
@@ -133,6 +139,15 @@ fn seek_step(code: KeyCode) -> Option<f64> {
     match code {
         KeyCode::Left => Some(-SEEK_STEP_SECS),
         KeyCode::Right => Some(SEEK_STEP_SECS),
+        _ => None,
+    }
+}
+
+/// 速度の刻み。mpv 既定の `[` `]` と同じ位置に置く (mpv は × 0.9 / × 1.1 で刻みだけ違う)。
+fn speed_step(code: KeyCode) -> Option<i8> {
+    match code {
+        KeyCode::Char('[') => Some(-1),
+        KeyCode::Char(']') => Some(1),
         _ => None,
     }
 }
@@ -319,6 +334,100 @@ mod tests {
     fn w_is_not_a_plain_mpv_command() {
         // 表示モードの切替は複数コマンドなので、シークと同じく別経路。
         assert_eq!(playing_command(KeyCode::Char('w')), None);
+    }
+
+    #[test]
+    fn bracket_keys_step_the_speed_and_are_not_plain_mpv_commands() {
+        assert_eq!(speed_step(KeyCode::Char('[')), Some(-1));
+        assert_eq!(speed_step(KeyCode::Char(']')), Some(1));
+        assert_eq!(speed_step(KeyCode::Char('x')), None);
+        assert_eq!(speed_step(KeyCode::Backspace), None);
+        // 送信の要否を tuitube 側で決めるので、対応表には載せない。
+        assert_eq!(playing_command(KeyCode::Char('[')), None);
+        assert_eq!(playing_command(KeyCode::Char(']')), None);
+        assert_eq!(playing_command(KeyCode::Backspace), None);
+    }
+
+    #[tokio::test]
+    async fn speed_keys_change_only_while_playing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char(']')), &tx, &mut session).await;
+        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
+
+        // 入力モードでは検索語の文字として入る。
+        let mut app = App::default();
+        handle_key(&mut app, key(KeyCode::Char(']')), &tx, &mut session).await;
+        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
+        assert_eq!(app.query, "]");
+    }
+
+    /// 送った内容だけを溜める偽の player。外部プロセスへは届かない。
+    struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl crate::actions::PlayerSink for Recorder {
+        fn send<'a>(&'a mut self, command: &'a MpvCommand) -> crate::actions::Sending<'a> {
+            let sent = self.0.clone();
+            Box::pin(async move {
+                sent.lock().expect("溜め込み先").push(command.to_line());
+                Ok(())
+            })
+        }
+    }
+
+    fn record(session: &mut Session) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.player = Some(crate::actions::Player {
+            sink: Box::new(Recorder(sent.clone())),
+            nonce: 1,
+        });
+        sent
+    }
+
+    #[tokio::test]
+    async fn bracket_keys_send_the_speed_while_playing() {
+        let mut session = Session::default();
+        let sent = record(&mut session);
+        let mut app = playing_app();
+
+        handle_key_playing(&mut app, key(KeyCode::Char(']')), &mut session).await;
+        assert_eq!(
+            app.speed,
+            crate::speed::Speed::from_tenths(11).expect("1.1x")
+        );
+        handle_key_playing(&mut app, key(KeyCode::Char('[')), &mut session).await;
+        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
+
+        assert_eq!(
+            *sent.lock().expect("溜め込み先"),
+            [
+                "{\"command\":[\"set_property\",\"speed\",1.1]}\n",
+                "{\"command\":[\"set_property\",\"speed\",1.0]}\n",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn backspace_resets_the_speed_while_playing() {
+        let mut session = Session::default();
+        let sent = record(&mut session);
+        let mut app = App {
+            speed: crate::speed::Speed::from_tenths(15).expect("1.5x"),
+            ..playing_app()
+        };
+        handle_key_playing(&mut app, key(KeyCode::Backspace), &mut session).await;
+
+        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
+        assert_eq!(
+            *sent.lock().expect("溜め込み先"),
+            ["{\"command\":[\"set_property\",\"speed\",1.0]}\n"]
+        );
     }
 
     #[tokio::test]

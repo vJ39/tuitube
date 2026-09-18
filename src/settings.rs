@@ -1,5 +1,6 @@
 //! 設定ファイル (TOML) のパス決定・読み込み・検証・テンプレート生成・保存。
 
+use crate::cookies::{self, CookieSource};
 use crate::display::{DisplayMode, FocusOn, FpsCap, Quality, WindowOptions};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -27,6 +28,7 @@ pub struct RawConfig {
     pub playback: Option<RawPlayback>,
     pub window: Option<RawWindow>,
     pub mpv: Option<RawMpv>,
+    pub cookies: Option<RawCookies>,
 }
 
 /// 選択肢のキーは文字列で受ける。serde の enum で受けるとファイル全体が
@@ -60,6 +62,20 @@ pub struct RawMpv {
     pub extra_args: Option<Vec<String>>,
 }
 
+/// yt-dlp へ渡すブラウザ指定だけを持つ。cookie の値そのものは保存しない。
+/// フィールドを足すと validate の網羅分解が止まるので、そこで是非を判断する。
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawCookies {
+    pub browser: Option<String>,
+}
+
+/// 環境変数による上書き。未設定は None。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EnvOverrides<'a> {
+    pub fps_limit: Option<&'a str>,
+    pub cookies: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DisplaySettings {
     pub mode: DisplayMode,
@@ -83,6 +99,8 @@ pub struct Settings {
     pub fps_cap: Option<FpsCap>,
     pub window: WindowOptions,
     pub extra_args: Vec<String>,
+    /// None は cookie 連携 Off。
+    pub cookies: Option<CookieSource>,
 }
 
 impl Default for Settings {
@@ -92,6 +110,7 @@ impl Default for Settings {
             fps_cap: FpsCap::new(DEFAULT_FPS_CAP),
             window: WindowOptions::default(),
             extra_args: Vec::new(),
+            cookies: None,
         }
     }
 }
@@ -122,7 +141,7 @@ pub fn parse(text: &str) -> Result<RawConfig, String> {
 }
 
 /// 検証と丸め。壊れた値で再生できなくなる方が困るので、起動は止めず notice を積む。
-pub fn validate(raw: RawConfig, env_fps_limit: Option<&str>) -> (Settings, Vec<String>) {
+pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
     let mut notices = Vec::new();
 
     let display = raw.display.unwrap_or_default();
@@ -149,11 +168,16 @@ pub fn validate(raw: RawConfig, env_fps_limit: Option<&str>) -> (Settings, Vec<S
     };
 
     let mut fps_cap = validate_fps_cap(raw.playback.unwrap_or_default().fps_cap, &mut notices);
-    let (env_limit, env_notice) = parse_fps_limit_env(env_fps_limit);
+    let (env_limit, env_notice) = parse_fps_limit_env(env.fps_limit);
     if let Some(limit) = env_limit {
         fps_cap = limit.and_then(FpsCap::new);
     }
     notices.extend(env_notice);
+
+    let mut cookies = validate_cookies(raw.cookies.unwrap_or_default(), &mut notices);
+    if let Some(from_env) = parse_cookies_env(env.cookies) {
+        cookies = from_env;
+    }
 
     let window = validate_window(raw.window.unwrap_or_default(), &mut notices);
     let extra_args = raw.mpv.unwrap_or_default().extra_args.unwrap_or_default();
@@ -175,6 +199,7 @@ pub fn validate(raw: RawConfig, env_fps_limit: Option<&str>) -> (Settings, Vec<S
             fps_cap,
             window,
             extra_args,
+            cookies,
         },
         notices,
     )
@@ -266,6 +291,31 @@ fn validate_window(window: RawWindow, notices: &mut Vec<String>) -> WindowOption
     checked
 }
 
+/// ブラウザ指定の検証。対応ブラウザの一覧照合はせず、綴り違いは yt-dlp に任せる。
+fn validate_cookies(raw: RawCookies, notices: &mut Vec<String>) -> Option<CookieSource> {
+    // 網羅分解。cookie の値に当たるフィールドを足すとここで止まる。
+    let RawCookies { browser } = raw;
+    let browser = browser?;
+    let source = CookieSource::from_spec(Some(&browser));
+    if source.is_none() {
+        notices.push("[cookies] browser が空です。指定なしとして扱います".to_string());
+    }
+    source
+}
+
+/// 環境変数 TUITUBE_COOKIES_FROM_BROWSER の解釈。
+/// None = 上書きしない、Some(None) = 連携 Off、Some(Some(_)) = その指定。
+pub fn parse_cookies_env(raw: Option<&str>) -> Option<Option<CookieSource>> {
+    let trimmed = raw.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    Some(CookieSource::from_spec(Some(trimmed)))
+}
+
 /// 環境変数 TUITUBE_FPS_LIMIT の解釈。
 /// Some(Some(n)) = その値、Some(None) = 制限なし、None = 上書きしない。
 pub fn parse_fps_limit_env(raw: Option<&str>) -> (Option<Option<u32>>, Option<String>) {
@@ -306,7 +356,8 @@ pub fn render(settings: &Settings) -> String {
     );
 
     out.push_str("[display]\n");
-    out.push_str("# 再生開始時の表示。\"embedded\" = TUI 内に埋め込み、\"window\" = mpv の別ウィンドウ。再生中は w で切り替え。\n");
+    out.push_str("# 再生開始時の表示。\"embedded\" = TUI 内に埋め込み (Kitty graphics protocol)、\"text\" = 文字ブロック(Kitty 非対応端末向け)、\n");
+    out.push_str("# \"window\" = mpv の別ウィンドウ。再生中は w で順に切り替え。\n");
     out.push_str(&format!("mode = \"{}\"\n", display.mode.key()));
     out.push_str("# 埋め込み表示の細かさ。\"low\" / \"medium\" / \"high\" / \"native\"。\n");
     out.push_str(
@@ -322,7 +373,7 @@ pub fn render(settings: &Settings) -> String {
     }
 
     out.push_str("\n[playback]\n");
-    out.push_str("# 埋め込み表示の fps 上限。端末へ送るフレーム数を抑える。0 で制限なし。別ウィンドウには適用しない。\n");
+    out.push_str("# 埋め込み・テキスト表示の fps 上限。端末へ送るフレーム数を抑える。0 で制限なし。別ウィンドウには適用しない。\n");
     out.push_str(&format!(
         "fps_cap = {}\n",
         settings.fps_cap.map(FpsCap::get).unwrap_or(0)
@@ -351,6 +402,19 @@ pub fn render(settings: &Settings) -> String {
         None => out.push_str("# focus_on = \"never\"\n"),
     }
     out.push_str(&string_line("title", window.title.as_deref(), "tuitube"));
+
+    out.push_str("\n[cookies]\n");
+    out.push_str("# YouTube のログイン連携。yt-dlp の --cookies-from-browser に渡すブラウザ指定 (BROWSER[+KEYRING][:PROFILE][::CONTAINER])。\n");
+    out.push_str("# 例: \"chrome\" / \"safari\" / \"firefox\" / \"chrome:Profile 1\"。ここに入るのはブラウザ名だけで、cookie の値は保存しない。\n");
+    out.push_str(&format!(
+        "# 環境変数 {} があればそちらが優先 (\"none\" で一時的に連携を切る)。\n",
+        cookies::ENV_VAR
+    ));
+    out.push_str(&string_line(
+        "browser",
+        settings.cookies.as_ref().map(CookieSource::spec),
+        "chrome",
+    ));
 
     out.push_str("\n[mpv]\n");
     out.push_str("# mpv にそのまま渡す追加引数。\n");
@@ -388,9 +452,9 @@ fn join(notices: Vec<String>) -> Option<String> {
     (!notices.is_empty()).then(|| notices.join(" / "))
 }
 
-pub fn load_from(path: Option<&Path>, env_fps_limit: Option<&str>) -> Loaded {
+pub fn load_from(path: Option<&Path>, env: EnvOverrides) -> Loaded {
     let Some(path) = path else {
-        let (settings, notices) = validate(RawConfig::default(), env_fps_limit);
+        let (settings, notices) = validate(RawConfig::default(), env);
         return Loaded {
             settings,
             notice: join(notices),
@@ -399,7 +463,7 @@ pub fn load_from(path: Option<&Path>, env_fps_limit: Option<&str>) -> Loaded {
     match fs::read_to_string(path) {
         Ok(text) => match parse(&text) {
             Ok(raw) => {
-                let (settings, notices) = validate(raw, env_fps_limit);
+                let (settings, notices) = validate(raw, env);
                 Loaded {
                     settings,
                     notice: join(notices),
@@ -407,7 +471,7 @@ pub fn load_from(path: Option<&Path>, env_fps_limit: Option<&str>) -> Loaded {
             }
             // 半端に効いた状態は原因を追いにくいので、全体を既定値に倒す。
             Err(e) => fallback(
-                env_fps_limit,
+                env,
                 format!(
                     "{} を読めません: {}。既定値で動きます",
                     path.display(),
@@ -415,16 +479,16 @@ pub fn load_from(path: Option<&Path>, env_fps_limit: Option<&str>) -> Loaded {
                 ),
             ),
         },
-        Err(e) if e.kind() == ErrorKind::NotFound => create_template(path, env_fps_limit),
+        Err(e) if e.kind() == ErrorKind::NotFound => create_template(path, env),
         Err(e) => fallback(
-            env_fps_limit,
+            env,
             format!("{} を開けません: {e}。既定値で動きます", path.display()),
         ),
     }
 }
 
-fn fallback(env_fps_limit: Option<&str>, reason: String) -> Loaded {
-    let (settings, mut notices) = validate(RawConfig::default(), env_fps_limit);
+fn fallback(env: EnvOverrides, reason: String) -> Loaded {
+    let (settings, mut notices) = validate(RawConfig::default(), env);
     notices.insert(0, reason);
     Loaded {
         settings,
@@ -433,8 +497,8 @@ fn fallback(env_fps_limit: Option<&str>, reason: String) -> Loaded {
 }
 
 /// 生成に失敗しても起動は止めず、理由だけ伝える。
-fn create_template(path: &Path, env_fps_limit: Option<&str>) -> Loaded {
-    let (settings, mut notices) = validate(RawConfig::default(), env_fps_limit);
+fn create_template(path: &Path, env: EnvOverrides) -> Loaded {
+    let (settings, mut notices) = validate(RawConfig::default(), env);
     notices.insert(
         0,
         match save_to(path, &Settings::default()) {
@@ -470,12 +534,20 @@ pub fn load() -> Loaded {
     let home = std::env::var_os("HOME");
     let path = config_path(xdg.as_deref(), home.as_deref());
     let env_fps_limit = std::env::var(FPS_LIMIT_VAR).ok();
-    load_from(path.as_deref(), env_fps_limit.as_deref())
+    let env_cookies = std::env::var(cookies::ENV_VAR).ok();
+    load_from(
+        path.as_deref(),
+        EnvOverrides {
+            fps_limit: env_fps_limit.as_deref(),
+            cookies: env_cookies.as_deref(),
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::CookieSource;
     use crate::display::{DisplayMode, FocusOn, FpsCap, Quality, WindowOptions};
     use std::ffi::OsStr;
     use std::fs;
@@ -489,11 +561,129 @@ mod tests {
     }
 
     fn settings_of(text: &str) -> Settings {
-        validate(parse(text).expect("読めるはず"), None).0
+        validate(parse(text).expect("読めるはず"), EnvOverrides::default()).0
     }
 
     fn notices_of(text: &str) -> Vec<String> {
-        validate(parse(text).expect("読めるはず"), None).1
+        validate(parse(text).expect("読めるはず"), EnvOverrides::default()).1
+    }
+
+    fn spec(value: &str) -> Option<CookieSource> {
+        CookieSource::from_spec(Some(value))
+    }
+
+    #[test]
+    fn cookies_browser_is_read_into_a_cookie_source() {
+        let text = "[cookies]\nbrowser = \"chrome:Profile 1\"\n";
+        assert_eq!(settings_of(text).cookies, spec("chrome:Profile 1"));
+        assert!(notices_of(text).is_empty());
+    }
+
+    #[test]
+    fn a_blank_cookies_browser_is_ignored_with_a_notice() {
+        for value in ["", "  "] {
+            let text = format!("[cookies]\nbrowser = \"{value}\"\n");
+            assert_eq!(settings_of(&text).cookies, None, "{text}");
+            let notices = notices_of(&text);
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(notices[0].contains("[cookies] browser"), "{notices:?}");
+        }
+
+        // 綴りの合っている他のキーを巻き添えにしない。
+        let text = "[display]\nmode = \"window\"\n\n[cookies]\nbrowser = \"\"\n";
+        assert_eq!(settings_of(text).display.mode, DisplayMode::Window);
+        assert_eq!(settings_of(text).cookies, None);
+    }
+
+    #[test]
+    fn an_absent_cookies_section_means_no_cookies() {
+        assert_eq!(settings_of("").cookies, None);
+        assert!(notices_of("").is_empty());
+        assert_eq!(Settings::default().cookies, None);
+    }
+
+    #[test]
+    fn the_cookies_environment_variable_overrides_the_file() {
+        let file = parse("[cookies]\nbrowser = \"chrome\"\n").expect("読めるはず");
+        let with = |cookies| {
+            validate(
+                file.clone(),
+                EnvOverrides {
+                    cookies,
+                    ..EnvOverrides::default()
+                },
+            )
+            .0
+            .cookies
+        };
+        assert_eq!(with(Some("safari")), spec("safari"));
+        // 未設定・空はファイルの値をそのまま使う。
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(with(raw), spec("chrome"), "{raw:?}");
+        }
+        // none はファイルの値を無視して連携を切る。
+        for raw in ["none", "NONE"] {
+            assert_eq!(with(Some(raw)), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_cookies_env_has_three_outcomes() {
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(parse_cookies_env(raw), None, "{raw:?}");
+        }
+        for raw in ["none", "NONE", " none "] {
+            assert_eq!(parse_cookies_env(Some(raw)), Some(None), "{raw}");
+        }
+        assert_eq!(parse_cookies_env(Some(" firefox ")), Some(spec("firefox")));
+    }
+
+    #[test]
+    fn render_writes_the_cookies_section_and_only_the_browser_spec() {
+        let text = render(&Settings::default());
+        assert!(text.contains("[cookies]"), "{text}");
+        // 指定なしのときは書き方の例をコメントで出す。
+        assert!(text.contains("# browser = \"chrome\""), "{text}");
+
+        let settings = Settings {
+            cookies: spec("chrome:Profile 1"),
+            ..Settings::default()
+        };
+        let text = render(&settings);
+        assert!(text.contains("browser = \"chrome:Profile 1\""), "{text}");
+        // [cookies] セクションに入るのは browser だけ。
+        let section = text
+            .split("[cookies]")
+            .nth(1)
+            .expect("セクションがある")
+            .split("\n[")
+            .next()
+            .expect("次のセクションまで");
+        let keys: Vec<&str> = section
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#') && line.contains('='))
+            .collect();
+        assert_eq!(keys, ["browser = \"chrome:Profile 1\""], "{section}");
+    }
+
+    #[test]
+    fn render_says_that_cookie_values_are_not_stored() {
+        let text = render(&Settings::default());
+        assert!(text.contains("cookie の値は保存しない"), "{text}");
+        assert!(text.contains(crate::cookies::ENV_VAR), "{text}");
+    }
+
+    #[test]
+    fn load_from_without_a_path_still_applies_the_cookies_variable() {
+        let loaded = load_from(
+            None,
+            EnvOverrides {
+                cookies: Some("chrome"),
+                ..EnvOverrides::default()
+            },
+        );
+        assert_eq!(loaded.settings.cookies, spec("chrome"));
+        assert!(loaded.notice.is_none());
     }
 
     #[test]
@@ -537,6 +727,30 @@ mod tests {
     fn a_toml_syntax_error_is_reported_with_the_line() {
         let error = parse("mode = ").expect_err("構文エラー");
         assert!(error.contains("line 1"), "{error}");
+    }
+
+    #[test]
+    fn display_mode_text_is_parsed_and_rendered() {
+        assert_eq!(
+            settings_of("[display]\nmode = \"text\"\n").display.mode,
+            DisplayMode::Text
+        );
+        assert!(notices_of("[display]\nmode = \"text\"\n").is_empty());
+
+        // 往復で保たれる。
+        let settings = Settings {
+            display: DisplaySettings {
+                mode: DisplayMode::Text,
+                ..DisplaySettings::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(settings_of(&render(&settings)), settings);
+        // テンプレートのコメントに 3 つ目の選択肢が出る。
+        assert!(
+            render(&Settings::default()).contains("\"text\""),
+            "{settings:?}"
+        );
     }
 
     #[test]
@@ -615,13 +829,20 @@ mod tests {
     #[test]
     fn the_environment_variable_overrides_the_file() {
         let file = parse("[playback]\nfps_cap = 30\n").expect("読めるはず");
-        assert_eq!(validate(file.clone(), Some("unlimited")).0.fps_cap, None);
+        let env = |fps_limit| EnvOverrides {
+            fps_limit,
+            ..EnvOverrides::default()
+        };
         assert_eq!(
-            validate(file.clone(), Some("10")).0.fps_cap,
+            validate(file.clone(), env(Some("unlimited"))).0.fps_cap,
+            None
+        );
+        assert_eq!(
+            validate(file.clone(), env(Some("10"))).0.fps_cap,
             FpsCap::new(10)
         );
         // 読めない指定でファイルの値を巻き添えにしない。
-        let (settings, notices) = validate(file, Some("3O"));
+        let (settings, notices) = validate(file, env(Some("3O")));
         assert_eq!(settings.fps_cap, FpsCap::new(30));
         assert!(notices.join(" / ").contains("3O"), "{notices:?}");
     }
@@ -710,6 +931,7 @@ mod tests {
                 title: Some("窓".to_string()),
             },
             extra_args: vec!["--hwdec=videotoolbox-copy".to_string()],
+            cookies: spec("chrome:Profile 1"),
         };
         assert_eq!(settings_of(&render(&custom)), custom);
     }
@@ -725,7 +947,7 @@ mod tests {
     fn load_from_a_missing_path_creates_the_template_and_says_so() {
         let dir = temp_dir("missing");
         let path = dir.join("nested/config.toml");
-        let loaded = load_from(Some(&path), None);
+        let loaded = load_from(Some(&path), EnvOverrides::default());
 
         assert_eq!(loaded.settings, Settings::default());
         assert!(path.exists(), "親ディレクトリごと作る");
@@ -745,7 +967,7 @@ mod tests {
         // 構文エラーはキー単位で切り分けられないので、全体を既定値に倒す。
         let broken = "[display]\nmode = \n";
         fs::write(&path, broken).expect("書ける");
-        let loaded = load_from(Some(&path), None);
+        let loaded = load_from(Some(&path), EnvOverrides::default());
 
         assert_eq!(loaded.settings, Settings::default());
         let notice = loaded.notice.expect("読めなかった旨を出す");
@@ -757,7 +979,13 @@ mod tests {
 
     #[test]
     fn load_from_without_a_path_still_applies_the_environment_variable() {
-        let loaded = load_from(None, Some("0"));
+        let loaded = load_from(
+            None,
+            EnvOverrides {
+                fps_limit: Some("0"),
+                ..EnvOverrides::default()
+            },
+        );
         assert_eq!(loaded.settings.fps_cap, None);
         assert!(loaded.notice.is_none());
     }

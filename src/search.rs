@@ -188,7 +188,7 @@ mod tests {
         r#"{"id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
 
     fn source(spec: &str) -> CookieSource {
-        CookieSource::from_env_value(Some(spec)).expect("spec")
+        CookieSource::from_spec(Some(spec)).expect("spec")
     }
 
     enum Step {

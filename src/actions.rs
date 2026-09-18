@@ -7,7 +7,8 @@ use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::mpv::{self, MpvCommand, MpvController};
 use crate::search::{self, RealYtDlp, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
-use crate::video::VideoSink;
+use crate::speed::Speed;
+use crate::video::{DecoderKind, VideoSink};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -20,7 +21,7 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
 /// ←→ 1 回あたりのシーク幅。
 pub const SEEK_STEP_SECS: f64 = 5.0;
 
-type Sending<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type Sending<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// mpv への送信口。テストは送った内容を溜める偽物に差し替える。
 pub trait PlayerSink: Send {
@@ -67,6 +68,18 @@ pub async fn send_to_player(app: &mut App, session: &mut Session, command: &MpvC
         && let Err(e) = p.sink.send(command).await
     {
         app.error = Some(e);
+    }
+}
+
+/// ポーリングの応答を取り込む。mpv へ送り返すものがあれば続けて送る。
+pub async fn apply_property(
+    app: &mut App,
+    session: &mut Session,
+    id: u64,
+    data: Option<serde_json::Value>,
+) {
+    if let Some(command) = app.apply_property(id, data) {
+        send_to_player(app, session, &command).await;
     }
 }
 
@@ -181,6 +194,19 @@ fn cancel_search(app: &mut App, session: &mut Session) {
     app.notice = None;
 }
 
+/// 再生開始時の映像スロットと起動計画。mpv を起動せずに検証できるよう切り出してある。
+fn playback_plan(app: &App) -> (VideoSink, LaunchPlan) {
+    // 別ウィンドウで始めても、端末内へ戻ったときのために kitty で用意しておく。
+    let kind = app.display.decoder_kind().unwrap_or(DecoderKind::Kitty);
+    let video = VideoSink::with_kind(kind, video_geometry(app.settings.display.max_pixels()));
+    let mut plan = LaunchPlan::new(app.display, video.geometry(), &app.settings);
+    plan.speed = app.speed;
+    // 検索で cookie が効くと確かめた後だけ再生にも渡す (再生側では劣化を検知できない)。
+    plan.extra_args
+        .extend(app.cookies.for_playback().map(|source| source.mpv_arg()));
+    (video, plan)
+}
+
 pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
     let Some(result) = app.selected_result().cloned() else {
         return;
@@ -188,11 +214,7 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     stop_playback(session).await;
     session.player_nonce += 1;
     let nonce = session.player_nonce;
-    let video = VideoSink::new(video_geometry(app.settings.display.max_pixels()));
-    let mut plan = LaunchPlan::new(app.display, video.geometry(), &app.settings);
-    // 検索で cookie が効くと確かめた後だけ再生にも渡す (再生側では劣化を検知できない)。
-    plan.extra_args
-        .extend(app.cookies.for_playback().map(|source| source.mpv_arg()));
+    let (video, plan) = playback_plan(app);
     match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone(), &plan).await {
         Ok(controller) => {
             app.playback = Playback {
@@ -215,33 +237,57 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     }
 }
 
-/// 埋め込み ⇔ 別ウィンドウ。mpv は再起動せず VO を差し替えるので再生は途切れない。
-pub async fn toggle_display_mode(app: &mut App, session: &mut Session) {
-    if session.player.is_none() {
+/// 速度を steps × 0.1 動かす。境界では止まる。
+pub async fn change_speed(app: &mut App, session: &mut Session, steps: i8) {
+    set_speed(app, session, app.speed.stepped(steps)).await;
+}
+
+pub async fn reset_speed(app: &mut App, session: &mut Session) {
+    set_speed(app, session, Speed::NORMAL).await;
+}
+
+/// 値が変わらないときは送らない (境界で押し続けても mpv を叩かない)。
+async fn set_speed(app: &mut App, session: &mut Session, next: Speed) {
+    if next == app.speed {
         return;
     }
-    let next = app.display.toggled();
-    let commands = match next {
-        DisplayMode::Window => {
-            display::to_window_commands(app.settings.fps_cap, &app.settings.window)
-        }
-        DisplayMode::Embedded => {
-            // 別ウィンドウ中の端末リサイズは mpv へ送っていないので、戻るときに現寸法で送り直す。
-            let geometry = video_geometry(app.settings.display.max_pixels());
-            if let Some(video) = &app.video {
-                video.resize(geometry);
-            }
-            display::to_embedded_commands(geometry, app.settings.fps_cap)
-        }
+    let Some(player) = session.player.as_mut() else {
+        return;
     };
+    match player.sink.send(&next.command()).await {
+        // 送信前に発行されたポーリングが古い値を返しても、ここで送った値を保つ。
+        Ok(()) => app.set_speed_sent(next, std::time::Instant::now()),
+        Err(e) => app.error = Some(e),
+    }
+}
+
+/// 埋め込み → テキスト → 別ウィンドウ → 埋め込み。
+/// mpv は再起動せず VO を差し替えるので再生は途切れない。
+pub async fn cycle_display_mode(app: &mut App, session: &mut Session) {
+    let from = app.display;
+    let to = from.next();
+    // 別ウィンドウ中の端末リサイズは mpv へ送っていないので、端末内へ戻るときに現寸法で送り直す。
+    let geometry = video_geometry(app.settings.display.max_pixels());
+    let commands = display::switch_commands(
+        from,
+        to,
+        geometry,
+        app.settings.fps_cap,
+        &app.settings.window,
+    );
     let Some(player) = session.player.as_mut() else {
         return;
     };
     match player.send_all(&commands).await {
         Ok(()) => {
-            app.display = next;
+            // 送れてからデコーダを替える。失敗したときに app.display と食い違わせない。
+            // 新しい VO の先頭バイトが旧デコーダへ入ることはあるが、reset が捨てる。
+            if let (Some(kind), Some(video)) = (to.decoder_kind(), &app.video) {
+                video.reset(kind, geometry);
+            }
+            app.display = to;
             // kitty VO の後始末が stdout に出ない経路でも画像を残さない。
-            if next == DisplayMode::Window {
+            if from == DisplayMode::Embedded {
                 session.owe_clear = true;
             }
         }
@@ -268,13 +314,16 @@ pub async fn apply_resize(app: &mut App, session: &mut Session) {
         return;
     }
     video.resize(geometry);
-    // 別ウィンドウ中は描き直すものが無い。戻るときに現寸法を送る。
-    if app.display != DisplayMode::Embedded {
+    let Some(p) = session.player.as_mut() else {
         return;
-    }
-    if let Some(p) = session.player.as_mut()
-        && let Err(e) = p.send_all(&mpv::resize_video(geometry)).await
-    {
+    };
+    let sent = match app.display {
+        DisplayMode::Embedded => p.send_all(&mpv::resize_video(geometry)).await,
+        DisplayMode::Text => p.send_all(&mpv::resize_text_video(geometry)).await,
+        // 別ウィンドウ中は描き直すものが無い。戻るときに現寸法を送る。
+        DisplayMode::Window => return,
+    };
+    if let Err(e) = sent {
         app.error = Some(e);
     }
 }
@@ -293,6 +342,7 @@ mod tests {
     use crate::display::Quality;
     use crate::search::SearchResult;
     use crate::settings::{DisplaySettings, Settings};
+    use crate::speed::Speed;
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
     use ratatui::layout::Rect;
     use std::process::Output;
@@ -505,7 +555,7 @@ mod tests {
         let mut app = App {
             query: ":ythis".to_string(),
             cookies: CookieState::Suspended {
-                source: CookieSource::from_env_value(Some("chrome")).expect("spec"),
+                source: CookieSource::from_spec(Some("chrome")).expect("spec"),
                 reason: "cookie を読めませんでした".to_string(),
             },
             ..App::default()
@@ -578,16 +628,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggling_without_a_player_changes_nothing() {
+    async fn cycling_without_a_player_changes_nothing() {
+        let video = sink();
         let mut app = App {
             mode: Mode::Playing,
-            video: Some(sink()),
+            video: Some(video.clone()),
             ..App::default()
         };
         let mut session = Session::default();
-        toggle_display_mode(&mut app, &mut session).await;
+        cycle_display_mode(&mut app, &mut session).await;
 
         assert_eq!(app.display, DisplayMode::Embedded);
+        assert_eq!(video.kind(), DecoderKind::Kitty);
         assert!(app.error.is_none());
         assert!(!session.owe_clear);
     }
@@ -642,11 +694,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_to_window_sends_remove_then_vo_and_owes_a_clear() {
-        let mut app = playing_app();
+    async fn cycle_from_embedded_to_text_resets_the_sink_and_owes_a_clear() {
+        let video = sink();
+        let mut app = App {
+            video: Some(video.clone()),
+            ..playing_app()
+        };
         let mut session = Session::default();
         let sent = record(&mut session, Ok(()));
-        toggle_display_mode(&mut app, &mut session).await;
+        cycle_display_mode(&mut app, &mut session).await;
+
+        let geometry = video_geometry(app.settings.display.max_pixels());
+        assert_eq!(
+            lines(&sent),
+            display::switch_commands(
+                DisplayMode::Embedded,
+                DisplayMode::Text,
+                geometry,
+                app.settings.fps_cap,
+                &app.settings.window,
+            )
+            .iter()
+            .map(|c| c.to_line())
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(app.display, DisplayMode::Text);
+        assert_eq!(video.kind(), DecoderKind::Text);
+        // 端末に残った kitty の画像は tuitube が消す。
+        assert!(session.owe_clear);
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cycle_from_text_to_the_window_removes_the_cap_and_owes_no_clear() {
+        let video = sink();
+        video.reset(DecoderKind::Text, video.geometry());
+        let mut app = App {
+            display: DisplayMode::Text,
+            video: Some(video.clone()),
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        cycle_display_mode(&mut app, &mut session).await;
 
         assert_eq!(
             lines(&sent),
@@ -656,12 +746,14 @@ mod tests {
             ]
         );
         assert_eq!(app.display, DisplayMode::Window);
-        assert!(session.owe_clear);
-        assert!(app.error.is_none());
+        // 別ウィンドウでは映像が stdout に来ないので、デコーダは触らない。
+        assert_eq!(video.kind(), DecoderKind::Text);
+        // 文字ブロックは ratatui が上書きするので消す画像は無い。
+        assert!(!session.owe_clear);
     }
 
     #[tokio::test]
-    async fn toggle_back_to_embedded_resizes_the_sink_and_sends_geometry_cap_vo() {
+    async fn cycle_from_the_window_to_embedded_matches_the_current_behaviour() {
         let video = sink();
         let mut app = App {
             display: DisplayMode::Window,
@@ -670,32 +762,98 @@ mod tests {
         };
         let mut session = Session::default();
         let sent = record(&mut session, Ok(()));
-        toggle_display_mode(&mut app, &mut session).await;
+        cycle_display_mode(&mut app, &mut session).await;
 
         let expected = video_geometry(app.settings.display.max_pixels());
         assert_eq!(video.geometry(), expected);
         assert_eq!(
             lines(&sent),
-            display::to_embedded_commands(expected, app.settings.fps_cap)
-                .iter()
-                .map(|c| c.to_line())
-                .collect::<Vec<_>>()
+            display::switch_commands(
+                DisplayMode::Window,
+                DisplayMode::Embedded,
+                expected,
+                app.settings.fps_cap,
+                &app.settings.window,
+            )
+            .iter()
+            .map(|c| c.to_line())
+            .collect::<Vec<_>>()
         );
         assert_eq!(app.display, DisplayMode::Embedded);
+        assert_eq!(video.kind(), DecoderKind::Kitty);
         // 埋め込みへ戻すときは kitty VO 自身が後始末を出す。
         assert!(!session.owe_clear);
     }
 
     #[tokio::test]
-    async fn toggle_keeps_the_mode_when_sending_fails() {
+    async fn cycle_keeps_the_mode_when_sending_fails() {
         let mut app = playing_app();
         let mut session = Session::default();
         let _sent = record(&mut session, Err("パイプが閉じました".to_string()));
-        toggle_display_mode(&mut app, &mut session).await;
+        cycle_display_mode(&mut app, &mut session).await;
 
         assert_eq!(app.display, DisplayMode::Embedded);
         assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
         assert!(!session.owe_clear);
+    }
+
+    #[tokio::test]
+    async fn cycle_keeps_the_decoder_when_sending_fails() {
+        // デコーダだけ先に替えると、表示は埋め込みのままなのに映像が来なくなる。
+        let video = sink();
+        let mut app = App {
+            video: Some(video.clone()),
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        let _sent = record(&mut session, Err("パイプが閉じました".to_string()));
+        cycle_display_mode(&mut app, &mut session).await;
+
+        assert_eq!(app.display, DisplayMode::Embedded);
+        assert_eq!(video.kind(), DecoderKind::Kitty);
+        assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
+    }
+
+    #[tokio::test]
+    async fn resize_in_text_mode_sends_the_tct_resize_sequence() {
+        let mut app = App {
+            display: DisplayMode::Text,
+            video: Some(sink()),
+            ..playing_app()
+        };
+        let mut session = Session {
+            pending_resize: Some((100, 40)),
+            ..Session::default()
+        };
+        let sent = record(&mut session, Ok(()));
+        apply_resize(&mut app, &mut session).await;
+
+        let geometry = geometry_for(100, 40, cell_size(), MAX_FRAME_PIXELS);
+        assert_eq!(
+            lines(&sent),
+            mpv::resize_text_video(geometry)
+                .iter()
+                .map(|c| c.to_line())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn start_playback_picks_the_decoder_from_the_display_mode() {
+        for (display, kind) in [
+            (DisplayMode::Embedded, DecoderKind::Kitty),
+            (DisplayMode::Text, DecoderKind::Text),
+            // 別ウィンドウから端末内へ戻れるよう kitty で用意しておく。
+            (DisplayMode::Window, DecoderKind::Kitty),
+        ] {
+            let app = App {
+                display,
+                ..App::default()
+            };
+            let (video, plan) = playback_plan(&app);
+            assert_eq!(video.kind(), kind, "{display:?}");
+            assert_eq!(plan.mode, display);
+        }
     }
 
     #[tokio::test]
@@ -713,6 +871,174 @@ mod tests {
         apply_resize(&mut app, &mut session).await;
 
         assert!(lines(&sent).is_empty());
+    }
+
+    fn faster() -> Speed {
+        Speed::from_tenths(15).expect("1.5x")
+    }
+
+    #[tokio::test]
+    async fn change_speed_sends_set_property_and_updates_the_app() {
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        change_speed(&mut app, &mut session, 1).await;
+
+        assert_eq!(
+            lines(&sent),
+            ["{\"command\":[\"set_property\",\"speed\",1.1]}\n"]
+        );
+        assert_eq!(app.speed, Speed::from_tenths(11).expect("1.1x"));
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn change_speed_at_the_bound_sends_nothing() {
+        let mut app = App {
+            speed: Speed::MAX,
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        change_speed(&mut app, &mut session, 1).await;
+
+        assert!(lines(&sent).is_empty());
+        assert_eq!(app.speed, Speed::MAX);
+
+        let mut app = App {
+            speed: Speed::MIN,
+            ..playing_app()
+        };
+        change_speed(&mut app, &mut session, -1).await;
+        assert!(lines(&sent).is_empty());
+        assert_eq!(app.speed, Speed::MIN);
+    }
+
+    #[tokio::test]
+    async fn reset_speed_returns_to_normal_and_is_idempotent() {
+        let mut app = App {
+            speed: faster(),
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        reset_speed(&mut app, &mut session).await;
+
+        assert_eq!(
+            lines(&sent),
+            ["{\"command\":[\"set_property\",\"speed\",1.0]}\n"]
+        );
+        assert_eq!(app.speed, Speed::NORMAL);
+
+        // 既に等速なら送らない。
+        reset_speed(&mut app, &mut session).await;
+        assert_eq!(lines(&sent).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn change_speed_keeps_the_value_when_sending_fails() {
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Err("パイプが閉じました".to_string()));
+        change_speed(&mut app, &mut session, 1).await;
+
+        assert_eq!(app.speed, Speed::NORMAL);
+        assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
+    }
+
+    #[tokio::test]
+    async fn change_speed_without_a_player_changes_nothing() {
+        let mut app = playing_app();
+        let mut session = Session::default();
+        change_speed(&mut app, &mut session, 1).await;
+
+        assert_eq!(app.speed, Speed::NORMAL);
+        assert!(app.speed_sent_at.is_none());
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_arrives_after_a_key_press_does_not_roll_the_speed_back() {
+        // ticker が 1.0 を問い合わせた直後に ] を押すと、応答は 1.0 のまま届く。
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        change_speed(&mut app, &mut session, 1).await;
+        assert_eq!(app.speed, Speed::from_tenths(11).expect("1.1x"));
+
+        apply_property(
+            &mut app,
+            &mut session,
+            mpv::REQ_SPEED,
+            Some(serde_json::json!(1.0)),
+        )
+        .await;
+
+        // 巻き戻さない。巻き戻すと次の ] が 1.1 を再送するだけになり、押下が 1 回消える。
+        assert_eq!(app.speed, Speed::from_tenths(11).expect("1.1x"));
+        change_speed(&mut app, &mut session, 1).await;
+        assert_eq!(app.speed, Speed::from_tenths(12).expect("1.2x"));
+        assert_eq!(
+            lines(&sent),
+            [
+                "{\"command\":[\"set_property\",\"speed\",1.1]}\n",
+                "{\"command\":[\"set_property\",\"speed\",1.2]}\n",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_speed_outside_the_range_is_sent_back_to_mpv() {
+        // mpv ウィンドウ側の ] で 8.0 まで上がった状態。表示だけ 4.0x にすると実再生と食い違う。
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        apply_property(
+            &mut app,
+            &mut session,
+            mpv::REQ_SPEED,
+            Some(serde_json::json!(8.0)),
+        )
+        .await;
+
+        assert_eq!(app.speed, Speed::MAX);
+        assert_eq!(
+            lines(&sent),
+            ["{\"command\":[\"set_property\",\"speed\",4.0]}\n"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_speed_inside_the_range_is_taken_as_is_without_sending_anything() {
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        apply_property(
+            &mut app,
+            &mut session,
+            mpv::REQ_SPEED,
+            Some(serde_json::json!(2.75)),
+        )
+        .await;
+
+        assert_eq!(app.speed, Speed::from_tenths(28).expect("2.8x"));
+        assert!(lines(&sent).is_empty());
+    }
+
+    #[test]
+    fn start_playback_passes_the_current_speed_to_the_plan() {
+        let app = App {
+            speed: faster(),
+            ..playing_app()
+        };
+        let (_video, plan) = playback_plan(&app);
+        assert_eq!(plan.speed, faster());
+        assert!(plan.args().contains(&"--speed=1.5".to_string()));
+
+        // 既定は等速で、起動引数に出さない。
+        let (_video, plan) = playback_plan(&App::default());
+        assert_eq!(plan.speed, Speed::NORMAL);
+        assert!(!plan.args().iter().any(|a| a.starts_with("--speed")));
     }
 
     #[tokio::test]

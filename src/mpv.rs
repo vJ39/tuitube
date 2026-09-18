@@ -23,6 +23,8 @@ pub const REQ_PAUSE: u64 = 3;
 pub const REQ_VOLUME: u64 = 4;
 /// 実際に使われている VO。5 は container-fps に使っていたので再利用しない。
 pub const REQ_CURRENT_VO: u64 = 6;
+/// 再生速度。mpv ウィンドウ側で変えられた値もこれで取り込む。
+pub const REQ_SPEED: u64 = 7;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -110,6 +112,7 @@ pub fn poll_commands() -> Vec<MpvCommand> {
         ("pause", REQ_PAUSE),
         ("volume", REQ_VOLUME),
         ("current-vo", REQ_CURRENT_VO),
+        ("speed", REQ_SPEED),
     ]
     .iter()
     .map(|(name, id)| get_property(name, *id))
@@ -119,6 +122,24 @@ pub fn poll_commands() -> Vec<MpvCommand> {
 /// kitty VO のオプションは、起動引数 (--vo-kitty-cols) とプロパティ名 (vo-kitty-cols) が同じ綴り。
 pub fn set_kitty_option(key: &str, value: Value) -> MpvCommand {
     set_property(&format!("vo-kitty-{key}"), value)
+}
+
+/// tct VO も起動引数 (--vo-tct-width) とプロパティ名 (vo-tct-width) が同じ綴り。
+pub fn set_tct_option(key: &str, value: Value) -> MpvCommand {
+    set_property(&format!("vo-tct-{key}"), value)
+}
+
+/// 文字ブロック版の寸法変更。kitty と同じく VO を作り直させる。
+pub fn resize_text_video(geometry: Geometry) -> [MpvCommand; 4] {
+    let [width, height] = geometry
+        .tct_options()
+        .map(|(key, value)| set_tct_option(key, value));
+    [
+        width,
+        height,
+        set_property("vid", json!("no")),
+        set_property("vid", json!("auto")),
+    ]
 }
 
 /// VO のオプションは生成時にしか読まれないので、書き換えるだけでは反映されない (実測)。
@@ -618,6 +639,24 @@ mod tests {
     }
 
     #[test]
+    fn resize_text_video_sets_tct_size_then_reinitializes_the_video() {
+        let lines: Vec<String> = resize_text_video(test_geometry(80, 22))
+            .iter()
+            .map(|c| c.to_line())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "{\"command\":[\"set_property\",\"vo-tct-width\",80]}\n",
+                "{\"command\":[\"set_property\",\"vo-tct-height\",22]}\n",
+                // 寸法だけ変えても VO は作り直されないので、映像トラックを入れ直す。
+                "{\"command\":[\"set_property\",\"vid\",\"no\"]}\n",
+                "{\"command\":[\"set_property\",\"vid\",\"auto\"]}\n",
+            ]
+        );
+    }
+
+    #[test]
     fn get_property_carries_request_id() {
         assert_eq!(
             get_property("time-pos", REQ_TIME_POS).to_line(),
@@ -728,6 +767,7 @@ mod tests {
             geometry: test_geometry(80, 22),
             fps_cap: FpsCap::new(15),
             window: WindowOptions::default(),
+            speed: crate::speed::Speed::NORMAL,
             extra_args: extra.to_vec(),
         };
         let args = launch_args(
@@ -761,7 +801,18 @@ mod tests {
         // 判定を持ち越すプロパティは無くなったので、毎回同じ列になる。
         let again: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
         assert_eq!(lines, again);
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
+    }
+
+    #[test]
+    fn poll_asks_for_speed_every_time() {
+        let lines: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
+        assert!(
+            lines.contains(
+                &"{\"command\":[\"get_property\",\"speed\"],\"request_id\":7}\n".to_string()
+            ),
+            "{lines:?}"
+        );
     }
 
     #[test]

@@ -1,4 +1,6 @@
 use crate::kitty::{ApcParser, FrameAssembler, FrameEvent, GraphicsCommand, ST, VideoFrame};
+use crate::tct::TextScreen;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,6 +83,21 @@ impl Geometry {
         self.kitty_options()
             .iter()
             .map(|(key, value)| format!("--vo-kitty-{key}={}", option_arg(value)))
+            .collect()
+    }
+
+    /// tct VO に渡す設定。文字ブロックなので寸法は文字数だけ (ピクセル予算は効かない)。
+    pub fn tct_options(&self) -> [(&'static str, Value); 2] {
+        [
+            ("width", json!(self.area.width.max(1))),
+            ("height", json!(self.area.height.max(1))),
+        ]
+    }
+
+    pub fn tct_args(&self) -> Vec<String> {
+        self.tct_options()
+            .iter()
+            .map(|(key, value)| format!("--vo-tct-{key}={}", option_arg(value)))
             .collect()
     }
 }
@@ -198,10 +215,54 @@ pub fn encode_clear(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b_Ga=d,q=2;\x1b\\");
 }
 
+/// 文字ブロックの格子。映像領域のセル数そのもの。
+fn text_size(geometry: Geometry) -> (u16, u16) {
+    (geometry.area.width.max(1), geometry.area.height.max(1))
+}
+
+/// 映像の読み取り方。表示モードから決まる (別ウィンドウでは映像が stdout に来ないので無い)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderKind {
+    Kitty,
+    Text,
+}
+
+/// 読み取りタスクは 1 本の stdout を流し続けるので、VO を切り替えるときは
+/// タスクでなくこの中身を入れ替える。
+enum Decoder {
+    Kitty {
+        parser: ApcParser,
+        assembler: FrameAssembler,
+    },
+    /// 仮想端末はセルグリッドを丸ごと持つので、Kitty 側と大きさを揃えるため box に入れる。
+    Text(Box<TextScreen>),
+}
+
+impl Decoder {
+    fn new(kind: DecoderKind, geometry: Geometry) -> Self {
+        match kind {
+            DecoderKind::Kitty => Self::Kitty {
+                parser: ApcParser::default(),
+                assembler: FrameAssembler::new(geometry.pixels()),
+            },
+            DecoderKind::Text => {
+                let (cols, rows) = text_size(geometry);
+                Self::Text(Box::new(TextScreen::new(cols, rows)))
+            }
+        }
+    }
+
+    fn kind(&self) -> DecoderKind {
+        match self {
+            Self::Kitty { .. } => DecoderKind::Kitty,
+            Self::Text(_) => DecoderKind::Text,
+        }
+    }
+}
+
 struct Sink {
     geometry: Geometry,
-    parser: ApcParser,
-    assembler: FrameAssembler,
+    decoder: Decoder,
     pending: Pending,
     /// feed のたびに確保し直さないための置き場。
     commands: Vec<GraphicsCommand>,
@@ -214,12 +275,19 @@ pub struct VideoSink {
 }
 
 impl VideoSink {
+    #[allow(
+        dead_code,
+        reason = "kitty 既定の入口。production は表示モードから with_kind で作る"
+    )]
     pub fn new(geometry: Geometry) -> Self {
+        Self::with_kind(DecoderKind::Kitty, geometry)
+    }
+
+    pub fn with_kind(kind: DecoderKind, geometry: Geometry) -> Self {
         Self {
             sink: Arc::new(Mutex::new(Sink {
                 geometry,
-                parser: ApcParser::default(),
-                assembler: FrameAssembler::new(geometry.pixels()),
+                decoder: Decoder::new(kind, geometry),
                 pending: Pending::default(),
                 commands: Vec::new(),
             })),
@@ -231,16 +299,24 @@ impl VideoSink {
         self.lock().geometry
     }
 
+    pub fn kind(&self) -> DecoderKind {
+        self.lock().decoder.kind()
+    }
+
     /// 表示すべき更新 (Frame または Clear) が新たに生じたら true。
     pub fn feed(&self, bytes: &[u8]) -> bool {
         let mut sink = self.lock();
         let Sink {
-            parser,
-            assembler,
+            decoder,
             pending,
             commands,
             ..
         } = &mut *sink;
+        let (parser, assembler) = match decoder {
+            Decoder::Kitty { parser, assembler } => (parser, assembler),
+            // 完成したフレームは TextScreen が持ち、描画は render_text が読む。
+            Decoder::Text(screen) => return screen.feed(bytes),
+        };
         commands.clear();
         parser.feed(bytes, commands);
         let mut updated = false;
@@ -262,6 +338,13 @@ impl VideoSink {
         updated
     }
 
+    /// Text のときだけ描く。埋め込みの画像はメインループが APC で重ねる。
+    pub fn render_text(&self, area: Rect, buf: &mut Buffer) {
+        if let Decoder::Text(screen) = &self.lock().decoder {
+            screen.render(area, buf);
+        }
+    }
+
     /// 保留中の更新を取り出す。取り出すと空になる。
     pub fn take(&self) -> Option<Pending> {
         let mut sink = self.lock();
@@ -271,17 +354,31 @@ impl VideoSink {
         Some(std::mem::take(&mut sink.pending))
     }
 
-    /// 寸法変更。保留中フレームを捨て、clear を保留にする。
+    /// 寸法変更。デコーダの種類は変えない。
     pub fn resize(&self, geometry: Geometry) {
+        self.reset(self.kind(), geometry);
+    }
+
+    /// デコーダを作り直す。組み立て途中のものを残すと旧寸法のまま完成して 1 枚だけずれて出るので、
+    /// 読み取り中のバイト列ごと捨てる。
+    pub fn reset(&self, kind: DecoderKind, geometry: Geometry) {
         let mut sink = self.lock();
         sink.geometry = geometry;
-        // 組み立て途中のものを残すと旧 s/v のまま完成して 1 枚だけずれて出るので、
-        // 読み取り中のバイト列ごと捨てる。次の a=T から新しい寸法で組み直す。
-        sink.parser = ApcParser::default();
-        // 予算は画質設定と端末寸法で変わるので、上限も新しい寸法で取り直す。
-        sink.assembler = FrameAssembler::new(geometry.pixels());
-        sink.pending.clear = true;
+        match &mut sink.decoder {
+            // 作り直すと「1 枚目が来るまで生画面を描く」状態に戻り、
+            // VO の作り直し中に届く旧寸法のフレームが出てしまう。
+            Decoder::Text(screen) if kind == DecoderKind::Text => {
+                let (cols, rows) = text_size(geometry);
+                screen.resize(cols, rows);
+            }
+            // 予算は画質設定と端末寸法で変わるので、上限も新しい寸法で取り直す。
+            _ => sink.decoder = Decoder::new(kind, geometry),
+        }
         sink.pending.frame = None;
+        // 端末に残っている kitty の画像は tuitube が消す。文字ブロックは ratatui が上書きする。
+        if kind == DecoderKind::Kitty {
+            sink.pending.clear = true;
+        }
     }
 
     /// 未処理の再描画要求が無いときだけ true。30fps の feed で通知を溜めないための畳み込み。
@@ -303,6 +400,7 @@ impl VideoSink {
 mod tests {
     use super::*;
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
+    use ratatui::buffer::Buffer;
 
     const CELL: CellSize = CellSize {
         width_px: 8,
@@ -644,6 +742,130 @@ mod tests {
         let pending = sink.take().expect("新しいフレームがあるはず");
         let frame = pending.frame.expect("フレームがあるはず");
         assert_eq!((frame.width_px, frame.height_px), (160, 96));
+    }
+
+    fn decoder_size(sink: &VideoSink) -> (u16, u16) {
+        match &sink.lock().decoder {
+            Decoder::Text(screen) => screen.size(),
+            Decoder::Kitty { .. } => panic!("Text のはず"),
+        }
+    }
+
+    fn rendered(sink: &VideoSink, area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        sink.render_text(area, &mut buf);
+        buf
+    }
+
+    #[test]
+    fn geometry_tct_options_are_the_cell_size_of_the_area() {
+        let geometry = geometry(80, 22);
+        assert_eq!(
+            geometry.tct_options(),
+            [("width", json!(80)), ("height", json!(22))]
+        );
+        assert_eq!(
+            geometry.tct_args(),
+            ["--vo-tct-width=80", "--vo-tct-height=22"]
+        );
+
+        // 文字数はピクセル予算で変わらない。
+        let small = Geometry::new(Rect::new(0, 0, 80, 22), CELL, 100_000);
+        assert_eq!(small.tct_args(), geometry.tct_args());
+    }
+
+    #[test]
+    fn a_text_sink_feeds_frames_to_the_text_screen_and_has_no_kitty_pending() {
+        let sink = VideoSink::with_kind(DecoderKind::Text, geometry(80, 22));
+        assert_eq!(sink.kind(), DecoderKind::Text);
+        assert!(sink.feed(&crate::tct::fixtures::frame()));
+        // kitty の経路は使わない。
+        assert!(sink.take().is_none());
+
+        let buf = rendered(&sink, Rect::new(0, 0, 4, 2));
+        assert_eq!(buf[(0, 0)].symbol(), "▄");
+        assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn a_kitty_sink_does_not_render_text() {
+        let sink = VideoSink::new(geometry(80, 22));
+        assert_eq!(sink.kind(), DecoderKind::Kitty);
+        assert!(sink.feed(&frame(320, 176, b"DATA")));
+
+        let buf = rendered(&sink, Rect::new(0, 0, 4, 2));
+        assert_eq!(buf, Buffer::empty(Rect::new(0, 0, 4, 2)));
+        assert!(sink.take().and_then(|p| p.frame).is_some());
+    }
+
+    #[test]
+    fn reset_to_text_drops_the_kitty_state_and_owes_no_clear_from_the_text_side() {
+        let sink = VideoSink::new(geometry(80, 22));
+        assert!(sink.feed(KITTY_RECONFIG));
+        // 組み立て途中のフレームを残したまま切り替える。
+        assert!(!sink.feed(b"\x1b_Ga=T,f=24,s=320,v=176,C=1,q=2,m=1;AAAA\x1b\\"));
+        sink.reset(DecoderKind::Text, geometry(80, 22));
+        assert_eq!(sink.kind(), DecoderKind::Text);
+
+        // 残りのチャンクが後から届いても kitty のフレームは完成しない。
+        assert!(!sink.feed(b"\x1b_Gm=0;BBBB\x1b\\"));
+        let pending = sink.take().expect("kitty 側の clear が残っている");
+        assert!(pending.clear);
+        assert!(pending.frame.is_none());
+        // Text 側は clear を積まない。
+        assert!(sink.take().is_none());
+    }
+
+    #[test]
+    fn reset_to_kitty_from_text_starts_a_fresh_parser_and_owes_a_clear() {
+        let sink = VideoSink::with_kind(DecoderKind::Text, geometry(80, 22));
+        assert!(sink.feed(&crate::tct::fixtures::frame()));
+        sink.reset(DecoderKind::Kitty, geometry(80, 22));
+        assert_eq!(sink.kind(), DecoderKind::Kitty);
+
+        let pending = sink.take().expect("clear が保留のはず");
+        assert!(pending.clear);
+        assert!(pending.frame.is_none());
+        let buf = rendered(&sink, Rect::new(0, 0, 4, 2));
+        assert_eq!(buf, Buffer::empty(Rect::new(0, 0, 4, 2)));
+    }
+
+    #[test]
+    fn resize_keeps_the_decoder_kind() {
+        let sink = VideoSink::with_kind(DecoderKind::Text, geometry(80, 22));
+        let next = geometry(100, 30);
+        sink.resize(next);
+
+        assert_eq!(sink.kind(), DecoderKind::Text);
+        assert_eq!(sink.geometry(), next);
+        assert_eq!(decoder_size(&sink), (next.area.width, next.area.height));
+    }
+
+    #[test]
+    fn resizing_text_does_not_fall_back_to_drawing_a_half_written_frame() {
+        let sink = VideoSink::with_kind(DecoderKind::Text, geometry(8, 3));
+        assert!(sink.feed(&crate::tct::fixtures::frame()));
+        sink.resize(geometry(8, 2));
+
+        // mpv が VO を作り直している間に届く書きかけのフレームは描かない。
+        assert!(!sink.feed(b"\x1b[?2026h\x1b[0;0fZZ"));
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "........", ratatui::style::Style::default());
+        sink.render_text(area, &mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), ".");
+    }
+
+    #[test]
+    fn text_leftovers_do_not_disturb_the_kitty_decoder() {
+        let sink = VideoSink::new(geometry(80, 22));
+        // tct の後始末は CSI だけなので ApcParser が捨てる。
+        assert!(!sink.feed(b"\x1b[?25h\x1b[?1003l\x1b[?1049l"));
+        assert!(sink.take().is_none());
+
+        assert!(sink.feed(&frame(320, 176, b"DATA")));
+        let frame = sink.take().and_then(|p| p.frame).expect("フレームがある");
+        assert_eq!((frame.width_px, frame.height_px), (320, 176));
     }
 
     #[test]

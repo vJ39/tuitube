@@ -8,7 +8,9 @@ use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 /// 別ウィンドウ再生中に映像領域へ出す案内。
-const WINDOW_PLACEHOLDER: &str = "別ウィンドウで再生中  w: 埋め込みに戻す";
+fn window_placeholder(display: DisplayMode) -> String {
+    format!("別ウィンドウで再生中  w: {}へ", display.next().label())
+}
 
 /// 再生中は [映像, シークバー, ステータス, ヘルプ] の4段。映像に残り全体を渡す。
 fn playing_areas(area: Rect) -> [Rect; 4] {
@@ -101,18 +103,26 @@ fn draw_search(frame: &mut Frame, app: &App) {
     }
 }
 
-/// 埋め込み中の映像領域には何も描かない。画像は draw の後にメインループが APC で重ねる。
+/// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
 fn draw_playing(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    if app.display == DisplayMode::Window {
-        draw_window_placeholder(frame, video_area(area));
+    let video = video_area(area);
+    match app.display {
+        DisplayMode::Window => draw_window_placeholder(frame, video, app.display),
+        DisplayMode::Text => {
+            if let Some(sink) = &app.video {
+                sink.render_text(video, frame.buffer_mut());
+            }
+        }
+        // 埋め込みの画像は draw の後にメインループが APC で重ねる。
+        DisplayMode::Embedded => {}
     }
     draw_seek_bar(frame, app, area);
     draw_footer(frame, app, status_area(area), help_area(area));
 }
 
 /// 別ウィンドウ中は映像が来ないので、どこで再生しているかを映像領域に出す。
-fn draw_window_placeholder(frame: &mut Frame, area: Rect) {
+fn draw_window_placeholder(frame: &mut Frame, area: Rect, display: DisplayMode) {
     if area.height == 0 {
         return;
     }
@@ -122,7 +132,7 @@ fn draw_window_placeholder(frame: &mut Frame, area: Rect) {
         ..area
     };
     frame.render_widget(
-        Paragraph::new(WINDOW_PLACEHOLDER)
+        Paragraph::new(window_placeholder(display))
             .style(Style::default().fg(Color::DarkGray))
             .centered(),
         row,
@@ -181,20 +191,17 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
         .min(input_area.right().saturating_sub(2))
 }
 
-fn help_text(mode: Mode, display: DisplayMode) -> &'static str {
+fn help_text(mode: Mode, display: DisplayMode) -> String {
     match mode {
         Mode::Input => {
             "Enter:検索  :ytrec/:ythis/:ytsubs/:ytwatchlater:ログイン連動の一覧  Esc:結果へ/終了"
+                .to_string()
         }
-        Mode::Results => "↑↓:選択  Enter:再生  /またはEsc:検索入力へ  q:終了",
-        Mode::Playing => match display {
-            DisplayMode::Embedded => {
-                "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  w:別ウィンドウ  Esc:停止  q:終了"
-            }
-            DisplayMode::Window => {
-                "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  w:埋め込みへ  Esc:停止  q:終了"
-            }
-        },
+        Mode::Results => "↑↓:選択  Enter:再生  /またはEsc:検索入力へ  q:終了".to_string(),
+        Mode::Playing => format!(
+            "space:一時停止  ←→/クリック:シーク  ↑↓:音量  [ ]:速度±0.1  BS:等速  w:{}  Esc:停止  q:終了",
+            display.next().label()
+        ),
     }
 }
 
@@ -251,9 +258,34 @@ mod tests {
     }
 
     #[test]
-    fn help_text_names_the_other_display_mode() {
-        assert!(help_text(Mode::Playing, DisplayMode::Embedded).contains("w:別ウィンドウ"));
-        assert!(help_text(Mode::Playing, DisplayMode::Window).contains("w:埋め込みへ"));
+    fn help_text_names_the_next_display_mode() {
+        assert!(help_text(Mode::Playing, DisplayMode::Embedded).contains("w:テキスト"));
+        assert!(help_text(Mode::Playing, DisplayMode::Text).contains("w:別ウィンドウ"));
+        assert!(help_text(Mode::Playing, DisplayMode::Window).contains("w:埋め込み"));
+    }
+
+    #[test]
+    fn window_placeholder_names_the_next_mode() {
+        assert_eq!(
+            window_placeholder(DisplayMode::Window),
+            "別ウィンドウで再生中  w: 埋め込みへ"
+        );
+    }
+
+    #[test]
+    fn video_area_layout_is_unchanged_by_the_text_mode() {
+        // 文字ブロックは映像と同じ矩形に描くので、割り付けはモードで変わらない。
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
+        assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
+    }
+
+    #[test]
+    fn playing_help_mentions_the_speed_keys() {
+        let help = help_text(Mode::Playing, DisplayMode::Embedded);
+        assert!(help.contains("[ ]"), "{help}");
+        assert!(help.contains("BS"), "{help}");
+        assert!(help.contains("速度"), "{help}");
     }
 
     #[test]

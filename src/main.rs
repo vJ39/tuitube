@@ -9,6 +9,8 @@ mod mpv;
 mod search;
 mod seekbar;
 mod settings;
+mod speed;
+mod tct;
 mod ui;
 mod video;
 
@@ -75,10 +77,10 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let loaded = settings::load();
     let mut app = App {
         display: loaded.settings.display.mode,
+        // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
+        cookies: CookieState::from_source(loaded.settings.cookies.clone()),
         settings: loaded.settings,
         notice: loaded.notice,
-        // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
-        cookies: CookieState::from_env(),
         ..App::default()
     };
     let mut session = Session::default();
@@ -208,7 +210,7 @@ async fn handle_event(
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
-                app.apply_property(id, data);
+                actions::apply_property(app, session, id, data).await;
             }
         }
         AppEvent::VideoFrame { nonce } => {
@@ -405,7 +407,7 @@ mod tests {
     }
 
     fn source() -> CookieSource {
-        CookieSource::from_env_value(Some("chrome")).expect("spec")
+        CookieSource::from_spec(Some("chrome")).expect("spec")
     }
 
     fn search_done(

@@ -1,8 +1,10 @@
 use crate::cookies::{CookieState, Target};
 use crate::display::DisplayMode;
+use crate::mpv::MpvCommand;
 use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::Settings;
+use crate::speed::{Polled, Speed};
 use crate::video::VideoSink;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
@@ -13,6 +15,8 @@ use std::time::{Duration, Instant};
 pub const SEEK_HOLD: Duration = Duration::from_secs(2);
 /// 相対シークは keyframes で着地がずれるので、この幅までは目標どおり着いたとみなす。
 pub const SEEK_TOLERANCE_SECS: f64 = 3.0;
+/// 速度を送ってから確定値を待つ間、ポーリングの古い値を無視する時間。
+pub const SPEED_HOLD: Duration = Duration::from_secs(2);
 
 pub enum AppEvent {
     Key(KeyEvent),
@@ -120,6 +124,10 @@ pub struct App {
     pub settings: Settings,
     /// 要求中の表示モード。実際にどちらで出ているかは playback.current_vo。
     pub display: DisplayMode,
+    /// 再生速度。動画をまたいで持ち越すので Playback でなく App が持つ。
+    pub speed: Speed,
+    /// 速度を送った時刻。ここから SPEED_HOLD の間は、食い違うポーリング値を捨てる。
+    pub speed_sent_at: Option<Instant>,
     /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
     pub video: Option<VideoSink>,
     /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
@@ -142,6 +150,8 @@ impl Default for App {
             playback: Playback::default(),
             settings: Settings::default(),
             display: DisplayMode::default(),
+            speed: Speed::NORMAL,
+            speed_sent_at: None,
             video: None,
             screen: Rect::default(),
             seek_bar: SeekBarState::default(),
@@ -180,7 +190,8 @@ impl App {
         }
     }
 
-    pub fn apply_property(&mut self, id: u64, data: Option<Value>) {
+    /// ポーリングの応答を取り込む。mpv へ送り返すものがあれば返す。
+    pub fn apply_property(&mut self, id: u64, data: Option<Value>) -> Option<MpvCommand> {
         match id {
             crate::mpv::REQ_TIME_POS => self
                 .playback
@@ -192,8 +203,40 @@ impl App {
                 self.playback.current_vo =
                     data.as_ref().and_then(|v| v.as_str()).map(str::to_string);
             }
+            // 取れないときは触らない。mpv 側の値だけが正とは限らない。
+            crate::mpv::REQ_SPEED => {
+                if let Some(value) = data.and_then(|v| v.as_f64()) {
+                    return self.reconcile_speed(Polled::from_f64(value), Instant::now());
+                }
+            }
             _ => {}
         }
+        None
+    }
+
+    /// 自分で決めた速度を控える。mpv が確定するまでのポーリング値はこれで弾く。
+    pub fn set_speed_sent(&mut self, speed: Speed, now: Instant) {
+        self.speed = speed;
+        self.speed_sent_at = Some(now);
+    }
+
+    /// ポーリングの速度を取り込む。保持時間中の古い値は捨てる。
+    /// mpv 側が範囲外なら、丸めた値を送り返して表示と実際の再生を揃える。
+    fn reconcile_speed(&mut self, polled: Polled, now: Instant) -> Option<MpvCommand> {
+        // 送信前に発行された get_property の応答は、後から古い値を寄越す。
+        if let Some(sent_at) = self.speed_sent_at {
+            let within_hold = now.saturating_duration_since(sent_at) < SPEED_HOLD;
+            if within_hold && polled.speed != self.speed {
+                return None;
+            }
+        }
+        if polled.clamped {
+            self.set_speed_sent(polled.speed, now);
+            return Some(polled.speed.command());
+        }
+        self.speed_sent_at = None;
+        self.speed = polled.speed;
+        None
     }
 
     /// 分岐は網羅する。モードを増やしたときの書き分け漏れをコンパイラに拾わせる。
@@ -237,15 +280,15 @@ impl App {
 
     /// 要求と mpv の実際が食い違う間は切替中と出す。切替は数秒かかることがある。
     pub fn display_label(&self) -> String {
+        let fps = self
+            .settings
+            .fps_cap
+            .map(|cap| format!(" {}fps", cap.get()))
+            .unwrap_or_default();
         let detail = match self.display {
-            DisplayMode::Embedded => {
-                let fps = self
-                    .settings
-                    .fps_cap
-                    .map(|cap| format!(" {}fps", cap.get()))
-                    .unwrap_or_default();
-                format!("{fps} {}", self.settings.display.quality.label())
-            }
+            DisplayMode::Embedded => format!("{fps} {}", self.settings.display.quality.label()),
+            // 画質はピクセル予算なので、文字ブロックでは効かない。
+            DisplayMode::Text => fps,
             DisplayMode::Window => String::new(),
         };
         let actual = DisplayMode::from_current_vo(self.playback.current_vo.as_deref());
@@ -268,10 +311,11 @@ impl App {
             .map(|v| format!("  vol {v:.0}"))
             .unwrap_or_default();
         format!(
-            "{state}  {}  {} / {}{volume}  {}",
+            "{state}  {}  {} / {}{volume}  {}  {}",
             self.playback.title,
             format_time(self.playback.time_pos),
             format_time(self.playback.duration),
+            self.speed.label(),
             self.display_label()
         )
     }
@@ -294,6 +338,7 @@ pub fn format_time(seconds: Option<f64>) -> String {
 mod tests {
     use super::*;
     use crate::cookies::{CookieSource, Feed};
+    use crate::speed::Speed;
     use serde_json::json;
 
     fn search_target() -> Target {
@@ -301,7 +346,7 @@ mod tests {
     }
 
     fn source() -> CookieSource {
-        CookieSource::from_env_value(Some("chrome")).expect("spec")
+        CookieSource::from_spec(Some("chrome")).expect("spec")
     }
 
     fn result(id: &str) -> SearchResult {
@@ -310,6 +355,18 @@ mod tests {
             title: format!("title {id}"),
             duration: None,
             uploader: None,
+        }
+    }
+
+    /// 送り返しが要らない取り込み。返り値まで込みで確かめる。
+    fn poll(app: &mut App, id: u64, data: Option<Value>) {
+        assert_eq!(app.apply_property(id, data), None, "送り返しは出ない");
+    }
+
+    fn polled(speed: Speed) -> crate::speed::Polled {
+        crate::speed::Polled {
+            speed,
+            clamped: false,
         }
     }
 
@@ -430,17 +487,116 @@ mod tests {
     #[test]
     fn applies_polled_properties() {
         let mut app = App::default();
-        app.apply_property(crate::mpv::REQ_TIME_POS, Some(json!(12.0)));
-        app.apply_property(crate::mpv::REQ_DURATION, Some(json!(300.0)));
-        app.apply_property(crate::mpv::REQ_PAUSE, Some(json!(true)));
-        app.apply_property(crate::mpv::REQ_VOLUME, Some(json!(80.0)));
+        poll(&mut app, crate::mpv::REQ_TIME_POS, Some(json!(12.0)));
+        poll(&mut app, crate::mpv::REQ_DURATION, Some(json!(300.0)));
+        poll(&mut app, crate::mpv::REQ_PAUSE, Some(json!(true)));
+        poll(&mut app, crate::mpv::REQ_VOLUME, Some(json!(80.0)));
         assert_eq!(app.playback.time_pos, Some(12.0));
         assert_eq!(app.playback.duration, Some(300.0));
         assert_eq!(app.playback.paused, Some(true));
         assert_eq!(app.playback.volume, Some(80.0));
 
-        app.apply_property(crate::mpv::REQ_TIME_POS, None);
+        poll(&mut app, crate::mpv::REQ_TIME_POS, None);
         assert_eq!(app.playback.time_pos, None);
+    }
+
+    #[test]
+    fn speed_is_applied_from_the_poll_and_rounded() {
+        let mut app = App::default();
+        assert_eq!(app.speed, Speed::NORMAL);
+
+        // mpv ウィンドウ側の × 1.1 は 0.1 刻みに乗らない値で返る。
+        poll(&mut app, crate::mpv::REQ_SPEED, Some(json!(2.75)));
+        assert_eq!(app.speed, Speed::from_tenths(28).expect("2.8x"));
+
+        // 値が取れないときは触らない。
+        poll(&mut app, crate::mpv::REQ_SPEED, None);
+        assert_eq!(app.speed, Speed::from_tenths(28).expect("2.8x"));
+    }
+
+    #[test]
+    fn a_speed_outside_the_range_is_sent_back_so_the_display_matches_the_playback() {
+        // mpv ウィンドウ側で 8.0 にされた状態。表示を 4.0x にするだけでは実再生が 8 倍のまま。
+        let mut app = App::default();
+        assert_eq!(
+            app.apply_property(crate::mpv::REQ_SPEED, Some(json!(8.0))),
+            Some(Speed::MAX.command())
+        );
+        assert_eq!(app.speed, Speed::MAX);
+
+        // 送り返した値が mpv から返ってくれば、それ以上は送らない。
+        poll(&mut app, crate::mpv::REQ_SPEED, Some(json!(4.0)));
+        assert_eq!(app.speed, Speed::MAX);
+    }
+
+    #[test]
+    fn a_stale_speed_poll_within_the_hold_does_not_roll_back_the_local_value() {
+        // 1.2x で問い合わせ → 応答が届く前に ] を処理 → 1.2 が後から届く、という順番。
+        let t0 = Instant::now();
+        let mut app = App::default();
+        app.set_speed_sent(Speed::from_tenths(13).expect("1.3x"), t0);
+
+        assert_eq!(
+            app.reconcile_speed(
+                polled(Speed::from_tenths(12).expect("1.2x")),
+                t0 + Duration::from_millis(500)
+            ),
+            None
+        );
+        assert_eq!(app.speed, Speed::from_tenths(13).expect("1.3x"));
+
+        // mpv が確定値を返したら保持は終わる。
+        assert_eq!(
+            app.reconcile_speed(
+                polled(Speed::from_tenths(13).expect("1.3x")),
+                t0 + Duration::from_millis(900),
+            ),
+            None
+        );
+        assert_eq!(app.speed, Speed::from_tenths(13).expect("1.3x"));
+        assert!(app.speed_sent_at.is_none());
+    }
+
+    #[test]
+    fn a_speed_changed_in_the_mpv_window_wins_after_the_hold_expires() {
+        let t0 = Instant::now();
+        let mut app = App::default();
+        app.set_speed_sent(Speed::from_tenths(13).expect("1.3x"), t0);
+
+        assert_eq!(
+            app.reconcile_speed(
+                polled(Speed::from_tenths(20).expect("2.0x")),
+                t0 + SPEED_HOLD
+            ),
+            None
+        );
+        assert_eq!(app.speed, Speed::from_tenths(20).expect("2.0x"));
+        assert!(app.speed_sent_at.is_none());
+    }
+
+    #[test]
+    fn the_status_line_shows_the_speed_after_the_volume() {
+        let mut app = App {
+            mode: Mode::Playing,
+            speed: Speed::from_tenths(15).expect("1.5x"),
+            playback: Playback {
+                title: "song".to_string(),
+                paused: Some(false),
+                volume: Some(70.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        let line = app.status_line();
+        assert!(line.contains("vol 70  1.5x  ["), "{line}");
+
+        // 等速でも出す。戻ったことが分かるため。
+        app.speed = Speed::NORMAL;
+        assert!(
+            app.status_line().contains("vol 70  1.0x  ["),
+            "{}",
+            app.status_line()
+        );
     }
 
     #[test]
@@ -449,9 +605,9 @@ mod tests {
             mode: Mode::Playing,
             ..App::default()
         };
-        app.apply_property(crate::mpv::REQ_PAUSE, Some(json!(true)));
+        poll(&mut app, crate::mpv::REQ_PAUSE, Some(json!(true)));
         assert!(app.status_line().starts_with("PAUSED"));
-        app.apply_property(crate::mpv::REQ_PAUSE, None);
+        poll(&mut app, crate::mpv::REQ_PAUSE, None);
         assert_eq!(app.playback.paused, None);
         assert!(!app.status_line().starts_with("PLAYING"));
     }
@@ -489,10 +645,14 @@ mod tests {
     #[test]
     fn current_vo_is_applied_from_the_poll() {
         let mut app = App::default();
-        app.apply_property(crate::mpv::REQ_CURRENT_VO, Some(json!("gpu-next")));
+        poll(
+            &mut app,
+            crate::mpv::REQ_CURRENT_VO,
+            Some(json!("gpu-next")),
+        );
         assert_eq!(app.playback.current_vo.as_deref(), Some("gpu-next"));
         // kitty VO では取れないプロパティもあるので、値が消えることも通常の経過。
-        app.apply_property(crate::mpv::REQ_CURRENT_VO, None);
+        poll(&mut app, crate::mpv::REQ_CURRENT_VO, None);
         assert_eq!(app.playback.current_vo, None);
     }
 

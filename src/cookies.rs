@@ -13,15 +13,12 @@ pub struct CookieSource {
 }
 
 impl CookieSource {
-    pub fn from_env_value(value: Option<&str>) -> Option<Self> {
+    /// 設定ファイルの [cookies] browser も環境変数も、同じ spec 文字列を渡す。
+    pub fn from_spec(value: Option<&str>) -> Option<Self> {
         let spec = value.unwrap_or_default().trim();
         (!spec.is_empty()).then(|| Self {
             spec: spec.to_string(),
         })
-    }
-
-    pub fn from_env() -> Option<Self> {
-        Self::from_env_value(std::env::var(ENV_VAR).ok().as_deref())
     }
 
     pub fn spec(&self) -> &str {
@@ -195,8 +192,8 @@ pub enum CookieState {
 }
 
 impl CookieState {
-    pub fn from_env() -> Self {
-        match CookieSource::from_env() {
+    pub fn from_source(source: Option<CookieSource>) -> Self {
+        match source {
             Some(source) => Self::Armed(source),
             None => Self::Off,
         }
@@ -262,7 +259,7 @@ impl CookieState {
                 feed.label()
             ),
             _ => format!(
-                "{} には cookie 連携が必要です。{ENV_VAR} を設定してください",
+                "{} には cookie 連携が必要です。設定ファイルの [cookies] browser か環境変数 {ENV_VAR} を設定してください",
                 feed.label()
             ),
         }
@@ -352,20 +349,37 @@ mod tests {
     use super::*;
 
     fn source(spec: &str) -> CookieSource {
-        CookieSource::from_env_value(Some(spec)).expect("spec")
+        CookieSource::from_spec(Some(spec)).expect("spec")
     }
 
     #[test]
-    fn from_env_value_trims_and_rejects_blank() {
-        assert_eq!(CookieSource::from_env_value(None), None);
-        assert_eq!(CookieSource::from_env_value(Some("")), None);
-        assert_eq!(CookieSource::from_env_value(Some("  ")), None);
+    fn from_spec_trims_and_rejects_blank() {
+        assert_eq!(CookieSource::from_spec(None), None);
+        assert_eq!(CookieSource::from_spec(Some("")), None);
+        assert_eq!(CookieSource::from_spec(Some("  ")), None);
         assert_eq!(
-            CookieSource::from_env_value(Some(" chrome:Profile 1 "))
+            CookieSource::from_spec(Some(" chrome:Profile 1 "))
                 .expect("値がある")
                 .spec(),
             "chrome:Profile 1"
         );
+    }
+
+    #[test]
+    fn from_source_arms_when_present_and_is_off_otherwise() {
+        let src = source("chrome");
+        assert_eq!(
+            CookieState::from_source(Some(src.clone())),
+            CookieState::Armed(src)
+        );
+        assert_eq!(CookieState::from_source(None), CookieState::Off);
+    }
+
+    #[test]
+    fn refusal_names_the_config_key_and_the_environment_variable() {
+        let off = CookieState::Off.refusal(Feed::History);
+        assert!(off.contains("[cookies] browser"), "{off}");
+        assert!(off.contains(ENV_VAR), "{off}");
     }
 
     #[test]
