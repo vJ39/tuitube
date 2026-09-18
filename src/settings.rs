@@ -1,7 +1,7 @@
 //! 設定ファイル (TOML) のパス決定・読み込み・検証・テンプレート生成・保存。
 
 use crate::category::{Category, default_categories};
-use crate::cookies::{self, CookieSource};
+use crate::cookies::{self, CookieSource, Feed};
 use crate::display::{DisplayMode, FocusOn, FpsCap, Quality, WindowOptions};
 use crate::grid::LayoutMode;
 use crate::subtitles::{SubLang, SubtitleSettings};
@@ -121,6 +121,44 @@ pub struct EnvOverrides<'a> {
     pub cookies: Option<&'a str>,
 }
 
+/// 環境変数が上書きした項目と、上書きされる前にファイルが持っていた値。
+/// 保存時はこの値を書き戻して、一時的な上書きを設定ファイルへ残さない。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct EnvOverridden {
+    pub fps_cap: Option<Option<FpsCap>>,
+    pub cookies: Option<Option<CookieSource>>,
+}
+
+impl EnvOverridden {
+    pub fn is_empty(&self) -> bool {
+        self.fps_cap.is_none() && self.cookies.is_none()
+    }
+
+    /// 上書き中の項目を設定ファイルのキー名で並べる。保存したときの知らせに使う。
+    pub fn keys(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.fps_cap.is_some() {
+            keys.push("fps_cap");
+        }
+        if self.cookies.is_some() {
+            keys.push("cookies.browser");
+        }
+        keys
+    }
+
+    /// 保存用の設定。上書きされた項目だけファイル側の値へ戻す。
+    pub fn restore(&self, settings: &Settings) -> Settings {
+        let mut out = settings.clone();
+        if let Some(fps_cap) = self.fps_cap {
+            out.fps_cap = fps_cap;
+        }
+        if let Some(cookies) = self.cookies.clone() {
+            out.cookies = cookies;
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DisplaySettings {
     pub mode: DisplayMode,
@@ -220,7 +258,17 @@ impl Default for Settings {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loaded {
     pub settings: Settings,
+    /// 環境変数が上書きした項目。保存で焼き付けないために持ち回る。
+    pub overridden: EnvOverridden,
     pub notice: Option<String>,
+}
+
+/// 検証結果。settings は丸めた後の値、overridden は環境変数が触った項目。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Validated {
+    pub settings: Settings,
+    pub overridden: EnvOverridden,
+    pub notices: Vec<String>,
 }
 
 /// `$XDG_CONFIG_HOME/tuitube/config.toml` か `$HOME/.config/tuitube/config.toml`。
@@ -242,8 +290,9 @@ pub fn parse(text: &str) -> Result<RawConfig, String> {
 }
 
 /// 検証と丸め。壊れた値で再生できなくなる方が困るので、起動は止めず notice を積む。
-pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
+pub fn validate(raw: RawConfig, env: EnvOverrides) -> Validated {
     let mut notices = Vec::new();
+    let mut overridden = EnvOverridden::default();
 
     let display = raw.display.unwrap_or_default();
     let display = DisplaySettings {
@@ -271,6 +320,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
     let mut fps_cap = validate_fps_cap(raw.playback.unwrap_or_default().fps_cap, &mut notices);
     let (env_limit, env_notice) = parse_fps_limit_env(env.fps_limit);
     if let Some(limit) = env_limit {
+        overridden.fps_cap = Some(fps_cap);
         fps_cap = limit.and_then(FpsCap::new);
     }
     notices.extend(env_notice);
@@ -279,6 +329,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
 
     let mut cookies = validate_cookies(raw.cookies.unwrap_or_default(), &mut notices);
     if let Some(from_env) = parse_cookies_env(env.cookies) {
+        overridden.cookies = Some(cookies.clone());
         cookies = from_env;
     }
 
@@ -300,8 +351,8 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
     let thumbnails = validate_thumbnails(raw.thumbnails.unwrap_or_default(), &mut notices);
     let categories = validate_categories(raw.categories, &mut notices);
 
-    (
-        Settings {
+    Validated {
+        settings: Settings {
             display,
             fps_cap,
             subtitles,
@@ -312,8 +363,9 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
             thumbnails,
             categories,
         },
+        overridden,
         notices,
-    )
+    }
 }
 
 /// lang は言語コードのカンマ区切りだけ。--slang は yt-dlp の記法 (all・正規表現) を読めない。
@@ -434,7 +486,27 @@ fn validate_categories(raw: Option<Vec<RawCategory>>, notices: &mut Vec<String>)
         notices.push("[[categories]] が空です。既定のカテゴリを出します".to_string());
         return default_categories();
     }
+    for category in &categories {
+        // ":yt" 始まりはフィードのつもりの綴りとみなす。そのまま検索語として
+        // 渡すと 0 件で返るだけで、間違いに気づけない。
+        if category.query.starts_with(":yt") && Feed::parse(&category.query).is_none() {
+            notices.push(format!(
+                "[[categories]] query=\"{}\" は一覧のキーワードではありません ({})。検索語として扱います",
+                category.query,
+                feed_keywords()
+            ));
+        }
+    }
     categories
+}
+
+/// 設定ファイルの案内に出すフィードのキーワード一覧。
+fn feed_keywords() -> String {
+    Feed::ALL
+        .iter()
+        .map(|feed| format!("{} = {}", feed.keyword(), feed.label()))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// 選択肢のキーを読む。綴りが違うときはそのキーだけ落として notice を出し、
@@ -710,8 +782,14 @@ pub fn render(settings: &Settings) -> String {
 
     out.push_str("\n# カテゴリタブ。書いた場合は既定の一覧を丸ごと置き換える。\n");
     out.push_str("# 先頭の「すべて」タブは常に自動で付くので書かない。\n");
+    out.push_str(&format!(
+        "# query が次のキーワードならログイン連動の一覧のタブになる: {}\n",
+        feed_keywords()
+    ));
+    out.push_str("# 既定の一覧にはこの 4 つも入っているので、書き換えるときは残す分も並べる。\n");
     if settings.categories == default_categories() {
         out.push_str("# [[categories]]\n# label = \"音楽\"\n# query = \"音楽\"\n");
+        out.push_str("# [[categories]]\n# label = \"おすすめ\"\n# query = \":ytrec\"\n");
     } else {
         for category in &settings.categories {
             out.push_str("\n[[categories]]\n");
@@ -745,21 +823,11 @@ fn join(notices: Vec<String>) -> Option<String> {
 
 pub fn load_from(path: Option<&Path>, env: EnvOverrides) -> Loaded {
     let Some(path) = path else {
-        let (settings, notices) = validate(RawConfig::default(), env);
-        return Loaded {
-            settings,
-            notice: join(notices),
-        };
+        return loaded(validate(RawConfig::default(), env));
     };
     match fs::read_to_string(path) {
         Ok(text) => match parse(&text) {
-            Ok(raw) => {
-                let (settings, notices) = validate(raw, env);
-                Loaded {
-                    settings,
-                    notice: join(notices),
-                }
-            }
+            Ok(raw) => loaded(validate(raw, env)),
             // 半端に効いた状態は原因を追いにくいので、全体を既定値に倒す。
             Err(e) => fallback(
                 env,
@@ -778,29 +846,31 @@ pub fn load_from(path: Option<&Path>, env: EnvOverrides) -> Loaded {
     }
 }
 
-fn fallback(env: EnvOverrides, reason: String) -> Loaded {
-    let (settings, mut notices) = validate(RawConfig::default(), env);
-    notices.insert(0, reason);
+fn loaded(validated: Validated) -> Loaded {
     Loaded {
-        settings,
-        notice: join(notices),
+        settings: validated.settings,
+        overridden: validated.overridden,
+        notice: join(validated.notices),
     }
+}
+
+fn fallback(env: EnvOverrides, reason: String) -> Loaded {
+    let mut validated = validate(RawConfig::default(), env);
+    validated.notices.insert(0, reason);
+    loaded(validated)
 }
 
 /// 生成に失敗しても起動は止めず、理由だけ伝える。
 fn create_template(path: &Path, env: EnvOverrides) -> Loaded {
-    let (settings, mut notices) = validate(RawConfig::default(), env);
-    notices.insert(
+    let mut validated = validate(RawConfig::default(), env);
+    validated.notices.insert(
         0,
         match save_to(path, &Settings::default()) {
             Ok(()) => format!("{} を作成しました", path.display()),
             Err(e) => format!("{} を作成できません: {e}", path.display()),
         },
     );
-    Loaded {
-        settings,
-        notice: join(notices),
-    }
+    loaded(validated)
 }
 
 fn write_new(path: &Path, text: &str) -> Result<(), String> {
@@ -853,11 +923,11 @@ mod tests {
     }
 
     fn settings_of(text: &str) -> Settings {
-        validate(parse(text).expect("読めるはず"), EnvOverrides::default()).0
+        validate(parse(text).expect("読めるはず"), EnvOverrides::default()).settings
     }
 
     fn notices_of(text: &str) -> Vec<String> {
-        validate(parse(text).expect("読めるはず"), EnvOverrides::default()).1
+        validate(parse(text).expect("読めるはず"), EnvOverrides::default()).notices
     }
 
     fn spec(value: &str) -> Option<CookieSource> {
@@ -905,7 +975,7 @@ mod tests {
                     ..EnvOverrides::default()
                 },
             )
-            .0
+            .settings
             .cookies
         };
         assert_eq!(with(Some("safari")), spec("safari"));
@@ -1126,17 +1196,109 @@ mod tests {
             ..EnvOverrides::default()
         };
         assert_eq!(
-            validate(file.clone(), env(Some("unlimited"))).0.fps_cap,
+            validate(file.clone(), env(Some("unlimited")))
+                .settings
+                .fps_cap,
             None
         );
         assert_eq!(
-            validate(file.clone(), env(Some("10"))).0.fps_cap,
+            validate(file.clone(), env(Some("10"))).settings.fps_cap,
             FpsCap::new(10)
         );
         // 読めない指定でファイルの値を巻き添えにしない。
-        let (settings, notices) = validate(file, env(Some("3O")));
-        assert_eq!(settings.fps_cap, FpsCap::new(30));
-        assert!(notices.join(" / ").contains("3O"), "{notices:?}");
+        let validated = validate(file, env(Some("3O")));
+        assert_eq!(validated.settings.fps_cap, FpsCap::new(30));
+        assert!(
+            validated.notices.join(" / ").contains("3O"),
+            "{:?}",
+            validated.notices
+        );
+    }
+
+    #[test]
+    fn the_file_value_is_kept_for_whatever_the_environment_overrode() {
+        // 環境変数は一時的な指定なので、保存でファイルへ焼き付けない。
+        let file = parse("[playback]\nfps_cap = 30\n\n[cookies]\nbrowser = \"chrome\"\n")
+            .expect("読めるはず");
+        let validated = validate(
+            file,
+            EnvOverrides {
+                fps_limit: Some("60"),
+                cookies: Some("none"),
+            },
+        );
+        assert_eq!(validated.settings.fps_cap, FpsCap::new(60), "実行中は 60");
+        assert_eq!(validated.settings.cookies, None, "実行中は連携なし");
+
+        let overridden = validated.overridden;
+        assert_eq!(overridden.keys(), ["fps_cap", "cookies.browser"]);
+        let to_save = overridden.restore(&validated.settings);
+        assert_eq!(to_save.fps_cap, FpsCap::new(30), "ファイルの値へ戻す");
+        assert_eq!(to_save.cookies, spec("chrome"));
+    }
+
+    #[test]
+    fn a_saved_file_keeps_the_lines_the_variables_are_holding() {
+        // 読み込み → 編集 → 保存まで通しで見る。環境変数の指定がファイルに残らない。
+        let dir = temp_dir("env-round-trip");
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "[playback]\nfps_cap = 30\n\n[cookies]\nbrowser = \"chrome\"\n",
+        )
+        .expect("書ける");
+
+        let loaded = load_from(
+            Some(&path),
+            EnvOverrides {
+                fps_limit: Some("60"),
+                cookies: Some("none"),
+            },
+        );
+        let mut edited = loaded.settings.clone();
+        edited.search.limit = 25;
+        save_to(&path, &loaded.overridden.restore(&edited)).expect("保存できる");
+
+        let written = fs::read_to_string(&path).expect("読める");
+        let reread = validate(
+            parse(&written).expect("読めるはず"),
+            EnvOverrides::default(),
+        );
+        assert_eq!(reread.settings.fps_cap, FpsCap::new(30), "{written}");
+        assert_eq!(reread.settings.cookies, spec("chrome"), "{written}");
+        assert_eq!(reread.settings.search.limit, 25, "編集は保存されている");
+    }
+
+    #[test]
+    fn nothing_is_marked_overridden_without_the_variables() {
+        let validated = validate(
+            parse("[playback]\nfps_cap = 30\n").expect("読めるはず"),
+            EnvOverrides::default(),
+        );
+        assert!(validated.overridden.is_empty());
+        assert!(validated.overridden.keys().is_empty());
+        // 何も上書きされていなければ、保存する値は今の設定のまま。
+        assert_eq!(
+            validated.overridden.restore(&validated.settings),
+            validated.settings
+        );
+    }
+
+    #[test]
+    fn an_edited_value_still_reaches_the_file_beside_an_overridden_one() {
+        // 上書きされているのは fps_cap だけ。他の行の編集は保存される。
+        let validated = validate(
+            parse("[playback]\nfps_cap = 30\n").expect("読めるはず"),
+            EnvOverrides {
+                fps_limit: Some("60"),
+                ..EnvOverrides::default()
+            },
+        );
+        let mut edited = validated.settings.clone();
+        edited.search.limit = 25;
+        let to_save = validated.overridden.restore(&edited);
+        assert_eq!(to_save.search.limit, 25);
+        assert_eq!(to_save.fps_cap, FpsCap::new(30));
     }
 
     #[test]
@@ -1373,6 +1535,27 @@ mod tests {
     }
 
     #[test]
+    fn a_misspelled_feed_keyword_gets_a_notice_with_the_right_ones() {
+        // ":ytwatch_later" は Feed::parse に一致せず、検索語として 0 件で返るだけになる。
+        let text = "[[categories]]\nlabel = \"後で見る\"\nquery = \":ytwatch_later\"\n";
+        assert_eq!(
+            settings_of(text).categories,
+            [Category::new("後で見る", ":ytwatch_later")]
+        );
+        let notice = notices_of(text).join(" / ");
+        assert!(notice.contains(":ytwatch_later"), "{notice}");
+        for feed in Feed::ALL {
+            assert!(notice.contains(feed.keyword()), "{notice}");
+        }
+
+        // 正しいキーワードと、ただの検索語には出さない。
+        for query in [":ytrec", ":ythistory", "将棋"] {
+            let text = format!("[[categories]]\nlabel = \"x\"\nquery = \"{query}\"\n");
+            assert!(notices_of(&text).is_empty(), "{query}");
+        }
+    }
+
+    #[test]
     fn an_empty_category_list_falls_back_to_the_defaults_with_a_notice() {
         let text = "categories = []\n";
         assert_eq!(settings_of(text).categories, default_categories());
@@ -1415,6 +1598,10 @@ mod tests {
             text.contains("[search]") && text.contains("[thumbnails]"),
             "{text}"
         );
+        // 覚えていないと打てないフィードのキーワードも、書き戻せるよう並べる。
+        for feed in Feed::ALL {
+            assert!(text.contains(feed.keyword()), "{}: {text}", feed.keyword());
+        }
     }
 
     #[test]

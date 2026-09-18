@@ -59,8 +59,41 @@ fn layout_for(screen: Rect, duration: Option<f64>) -> SeekBarLayout {
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::Playing => draw_playing(frame, app),
+        Mode::Settings => draw_settings(frame, app),
         Mode::Input | Mode::Results => draw_search(frame, app),
     }
+}
+
+/// 設定画面は [タイトル, 項目, ステータス, ヘルプ] の4段。項目に残り全体を渡す。
+pub fn settings_areas(area: Rect) -> [Rect; 4] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area)
+}
+
+const SETTINGS_TITLE: &str = "設定 (s で保存。Esc は編集を捨てて戻る)";
+
+fn draw_settings(frame: &mut Frame, app: &App) {
+    let areas = settings_areas(frame.area());
+    frame.render_widget(
+        Paragraph::new(SETTINGS_TITLE).style(Style::default().add_modifier(Modifier::BOLD)),
+        areas[0],
+    );
+
+    let items: Vec<ListItem> = app.settings_rows().into_iter().map(ListItem::new).collect();
+    let count = items.len();
+    let list = List::new(items)
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(Some(app.settings_selected.min(count.saturating_sub(1))));
+    frame.render_stateful_widget(list, areas[1], &mut state);
+
+    draw_footer(frame, app, areas[2], areas[3]);
 }
 
 /// 検索画面は [入力, タブ, 結果, ステータス, ヘルプ] の5段。結果に残り全体を渡す。
@@ -132,13 +165,104 @@ fn draw_search(frame: &mut Frame, app: &App) {
     }
 }
 
+const TAB_GAP: &str = " │ ";
+const TAB_MORE_LEFT: &str = "< ";
+const TAB_MORE_RIGHT: &str = " >";
+
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    let selected = app.tabs.selected();
+    let labels = app.tabs.labels();
+    let width = area.width as usize;
+    let range = visible_tabs(&labels, app.tabs.selected(), width, app.tabs.window());
+    app.tabs.remember_window(range.start);
+    let spans = tab_spans(&labels, app.tabs.selected(), width, range);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// `labels[start..end]` を並べたときの行の幅。両端のマーカーぶんも数える。
+fn tab_row_width(labels: &[&str], start: usize, end: usize) -> usize {
+    let mut width: usize = labels[start..end]
+        .iter()
+        .map(|label| grid::display_width(label))
+        .sum();
+    width += grid::display_width(TAB_GAP) * (end - start).saturating_sub(1);
+    if start > 0 {
+        width += grid::display_width(TAB_MORE_LEFT);
+    }
+    if end < labels.len() {
+        width += grid::display_width(TAB_MORE_RIGHT);
+    }
+    width
+}
+
+/// `start` から右へ詰めたときに入る最後のタブの次。幅が足りなくても 1 つは返す
+/// (選択中のタブは切ってでも出す)。
+fn tab_window_end(labels: &[&str], start: usize, width: usize) -> usize {
+    let mut end = start + 1;
+    while end < labels.len() && tab_row_width(labels, start, end + 1) <= width {
+        end += 1;
+    }
+    end
+}
+
+/// 幅に入るぶんだけを切り出す窓。前回の窓 `start` から最小限だけ動かすので、
+/// 隣のタブへ移っただけでタブ行全体がずれることがない。
+fn visible_tabs(
+    labels: &[&str],
+    selected: usize,
+    width: usize,
+    start: usize,
+) -> std::ops::Range<usize> {
+    if labels.is_empty() {
+        return 0..0;
+    }
+    let selected = selected.min(labels.len() - 1);
+    // 選択が窓より左にあるなら、そこまで戻す。
+    let mut start = start.min(selected);
+    // 選択が窓の右から出ているなら、入るまで 1 つずつ送る。
+    while tab_window_end(labels, start, width) <= selected {
+        start += 1;
+    }
+    // 端末が広がったぶんは左へ戻す。右端のタブを失わない間だけ動かす。
+    while start > 0
+        && tab_window_end(labels, start - 1, width) == tab_window_end(labels, start, width)
+    {
+        start -= 1;
+    }
+    start..tab_window_end(labels, start, width)
+}
+
+fn tab_spans(
+    labels: &[&str],
+    selected: usize,
+    width: usize,
+    range: std::ops::Range<usize>,
+) -> Vec<Span<'static>> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut budget = width;
     let mut spans = Vec::new();
-    for (index, label) in app.tabs.labels().into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+    // マーカーだけで行を埋めない。1 桁も残らないなら出さない。
+    if range.start > 0 && grid::display_width(TAB_MORE_LEFT) < budget {
+        budget -= grid::display_width(TAB_MORE_LEFT);
+        spans.push(Span::styled(TAB_MORE_LEFT, dim));
+    }
+    let tail = range.end < labels.len() && grid::display_width(TAB_MORE_RIGHT) < budget;
+    if tail {
+        budget -= grid::display_width(TAB_MORE_RIGHT);
+    }
+    for index in range.clone() {
+        if index > range.start {
+            if budget <= grid::display_width(TAB_GAP) {
+                break;
+            }
+            budget -= grid::display_width(TAB_GAP);
+            spans.push(Span::styled(TAB_GAP, dim));
         }
+        // 窓は選択中のタブを必ず残すので、端末より広いラベルが来るのはそれ 1 つのときだけ。
+        let label = grid::truncate(labels[index], budget);
+        budget -= grid::display_width(&label);
         let style = if index == selected {
             Style::default()
                 .fg(Color::Cyan)
@@ -146,9 +270,12 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Style::default().fg(Color::Gray)
         };
-        spans.push(Span::styled(label.to_string(), style));
+        spans.push(Span::styled(label, style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    if tail {
+        spans.push(Span::styled(TAB_MORE_RIGHT, dim));
+    }
+    spans
 }
 
 /// 可視範囲と総数。スクロールしても今どこを見ているか分かるようにする。
@@ -291,7 +418,7 @@ fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
         Style::default().fg(Color::Cyan)
     };
     frame.render_widget(
-        Paragraph::new(app.status_line()).style(status_style),
+        Paragraph::new(status_text(app, status.width as usize)).style(status_style),
         status,
     );
     frame.render_widget(
@@ -299,6 +426,12 @@ fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
             .style(Style::default().fg(Color::DarkGray)),
         help,
     );
+}
+
+/// ステータス行は 1 行で折り返さないので、入らないぶんは "…" にする。
+/// 黙って切れると、切れたのか元から短いのかが読み手に分からない。
+fn status_text(app: &App, width: usize) -> String {
+    grid::truncate(&app.status_line(), width)
 }
 
 /// 全角文字はセル幅2で描画されるため、文字数ではなく表示幅で桁を数える。
@@ -312,16 +445,49 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
 }
 
 fn help_text(mode: Mode, display: DisplayMode, width: u16) -> String {
-    match mode {
-        // 旧版はキーワードを4つ並べて83桁あり、80桁端末では末尾が切れていた。
-        Mode::Input => {
-            "Enter:検索  Tab:カテゴリ  :yt*:ログイン連動の一覧  Esc:結果へ/終了".to_string()
-        }
-        Mode::Results => {
-            "↑↓←→:選択  Enter:再生  Tab:カテゴリ  r:再取得  /またはEsc:検索へ  q:終了".to_string()
-        }
-        Mode::Playing => fit_hints(&playing_hints(display), width as usize),
-    }
+    let hints = match mode {
+        Mode::Input => input_hints(),
+        Mode::Results => results_hints(),
+        Mode::Playing => playing_hints(display),
+        Mode::Settings => settings_hints(),
+    };
+    fit_hints(&hints, width as usize)
+}
+
+/// 検索入力の案内。全部で 79 桁ほどで 80 桁端末に収まる。
+/// 入力欄では S も検索語なので、設定は Ctrl+S で開く。
+fn input_hints() -> Vec<String> {
+    vec![
+        "Enter:検索".to_string(),
+        "Tab:カテゴリ".to_string(),
+        ":yt*:ログイン連動の一覧".to_string(),
+        "Esc:結果へ/終了".to_string(),
+        "Ctrl+S:設定".to_string(),
+    ]
+}
+
+/// 結果一覧の案内。全部で 80 桁ちょうどで 80 桁端末に収まる。
+fn results_hints() -> Vec<String> {
+    vec![
+        "↑↓←→:選択".to_string(),
+        "Enter:再生".to_string(),
+        "Tab:カテゴリ".to_string(),
+        "r:再取得".to_string(),
+        "/またはEsc:検索へ".to_string(),
+        "q:終了".to_string(),
+        "S:設定".to_string(),
+    ]
+}
+
+/// 設定画面の案内。全部で 58 桁ほどで 80 桁端末に収まる。
+fn settings_hints() -> Vec<String> {
+    vec![
+        "↑↓:選択".to_string(),
+        "←→:値変更".to_string(),
+        "Enter/Space:切替".to_string(),
+        "s:保存".to_string(),
+        "Esc:破棄して戻る".to_string(),
+    ]
 }
 
 /// 再生中の案内。全部で 110 桁ほどあり 80 桁端末には入らないので、
@@ -364,6 +530,7 @@ fn fit_hints(hints: &[String], width: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::Playback;
+    use crate::category::Tabs;
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
 
@@ -487,6 +654,33 @@ mod tests {
     }
 
     #[test]
+    fn the_status_row_marks_where_it_was_cut() {
+        let app = App {
+            error: Some("あ".repeat(100)),
+            ..App::default()
+        };
+        let line = status_text(&app, 80);
+        // 全角は 2 桁なので、端に 1 桁余ることがある。
+        assert!((79..=80).contains(&grid::display_width(&line)), "{line}");
+        assert!(line.ends_with('…'), "{line}");
+    }
+
+    #[test]
+    fn the_cookie_refusal_is_shown_whole_on_an_80_column_terminal() {
+        // cookie 未設定でフィードのタブを選ぶと出る行。切れると設定先が読めない。
+        for feed in crate::cookies::Feed::ALL {
+            let app = App {
+                error: Some(crate::cookies::CookieState::Off.refusal(feed)),
+                ..App::default()
+            };
+            let line = status_text(&app, 80);
+            assert!(line.contains(feed.label()), "{line}");
+            assert!(line.contains("[cookies] browser"), "{line}");
+            assert!(!line.contains('…'), "{line}");
+        }
+    }
+
+    #[test]
     fn search_areas_do_not_overlap_and_cover_the_screen() {
         let area = Rect::new(0, 0, 80, 24);
         let areas = search_areas(area);
@@ -496,6 +690,133 @@ mod tests {
             assert_eq!(pair[0].width, area.width);
         }
         assert_eq!(areas[4].bottom(), area.bottom());
+    }
+
+    /// spans をつないだ行。幅と中身をまとめて見る。窓は先頭から開いた状態で始める。
+    fn tab_row(labels: &[&str], selected: usize, width: usize) -> String {
+        tab_row_from(labels, selected, width, 0).0
+    }
+
+    /// 前回の窓を渡す版。行と、次に持ち越す窓の開始位置を返す。
+    fn tab_row_from(
+        labels: &[&str],
+        selected: usize,
+        width: usize,
+        start: usize,
+    ) -> (String, usize) {
+        let range = visible_tabs(labels, selected, width, start);
+        let next = range.start;
+        let row = tab_spans(labels, selected, width, range)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        (row, next)
+    }
+
+    #[test]
+    fn a_wide_terminal_shows_every_tab_without_markers() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        let row = tab_row(&labels, 0, 200);
+        for label in &labels {
+            assert!(row.contains(label), "{label} が落ちた: {row}");
+        }
+        assert!(!row.contains('<') && !row.contains('>'), "{row}");
+    }
+
+    #[test]
+    fn the_tab_row_keeps_the_selected_tab_visible_inside_80_columns() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        for selected in 0..labels.len() {
+            let row = tab_row(&labels, selected, 80);
+            assert!(grid::display_width(&row) <= 80, "{selected}: {row}");
+            assert!(
+                row.contains(labels[selected]),
+                "選択中の {} が出ていない: {row}",
+                labels[selected]
+            );
+        }
+    }
+
+    #[test]
+    fn the_tab_row_marks_the_side_that_is_scrolled_out() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        // 先頭を選んでいるので右側だけが隠れる。
+        let head = tab_row(&labels, 0, 80);
+        assert!(head.ends_with('>'), "{head}");
+        assert!(!head.starts_with('<'), "{head}");
+
+        // 末尾を選ぶと窓が送られ、左側が隠れる。
+        let tail = tab_row(&labels, labels.len() - 1, 80);
+        assert!(tail.starts_with('<'), "{tail}");
+        assert!(!tail.ends_with('>'), "{tail}");
+        assert!(!tail.contains("音楽"), "窓の外は出さない: {tail}");
+    }
+
+    #[test]
+    fn moving_to_the_next_tab_keeps_the_row_still_while_it_fits() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        // 80 桁では 5 番目 (アニメ) と 6 番目 (スポーツ) が同じ窓に入る。
+        let (row, start) = tab_row_from(&labels, 4, 80, 0);
+        let (next, _) = tab_row_from(&labels, 5, 80, start);
+        assert_eq!(row, next, "1 つ隣に移っただけでタブ行が動いている");
+    }
+
+    #[test]
+    fn the_tab_row_scrolls_only_when_the_selection_leaves_the_window() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        let last = labels.len() - 1;
+        let mut range = visible_tabs(&labels, 0, 80, 0);
+        // Tab で一周し、BackTab で戻る。
+        for selected in (1..=last).chain((0..last).rev()) {
+            let next = visible_tabs(&labels, selected, 80, range.start);
+            assert!(next.contains(&selected), "{selected} が窓の外: {next:?}");
+            if next.start != range.start {
+                assert!(
+                    !range.contains(&selected),
+                    "窓の中にいるのに動かした: {range:?} -> {next:?}"
+                );
+            }
+            range = next;
+        }
+    }
+
+    #[test]
+    fn widening_the_terminal_brings_the_left_side_back() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        let last = labels.len() - 1;
+        let (_, start) = tab_row_from(&labels, last, 80, 0);
+        assert!(start > 0, "80 桁では左が隠れる");
+
+        let (row, start) = tab_row_from(&labels, last, 200, start);
+        assert_eq!(start, 0, "広げたら窓も戻す");
+        assert!(row.starts_with("すべて"), "{row}");
+    }
+
+    #[test]
+    fn the_tab_row_never_overflows_even_on_a_tiny_terminal() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        for width in 0..60 {
+            for selected in 0..labels.len() {
+                let row = tab_row(&labels, selected, width);
+                assert!(
+                    grid::display_width(&row) <= width,
+                    "{width} 桁 / {selected}: {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_tab_needs_no_window() {
+        assert_eq!(tab_row(&["すべて"], 0, 80), "すべて");
+        assert_eq!(tab_row(&[], 0, 80), "");
     }
 
     #[test]
@@ -616,6 +937,108 @@ mod tests {
         let narrow = help_80(Mode::Playing, DisplayMode::Text);
         assert!(grid::display_width(&narrow) <= 80, "{narrow}");
         assert!(!narrow.contains("s:字"), "{narrow}");
+    }
+
+    /// TestBackend に 1 フレーム描いて、画面の文字だけを行ごとに取り出す。
+    fn rendered(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("端末");
+        terminal.draw(|frame| draw(frame, app)).expect("描ける");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                let mut line = String::new();
+                // 全角文字は 2 セルを占め、後ろのセルは埋め草なので読み飛ばす。
+                let mut skip = 0;
+                for x in 0..buffer.area.width {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let symbol = buffer[(x, y)].symbol();
+                    skip = grid::display_width(symbol).saturating_sub(1);
+                    line.push_str(symbol);
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn settings_rows_do_not_overlap_and_cover_the_screen() {
+        let area = Rect::new(0, 0, 80, 24);
+        let areas = settings_areas(area);
+        assert_eq!(areas[0], Rect::new(0, 0, 80, 1), "タイトルは 1 行");
+        assert_eq!(areas[1], Rect::new(0, 1, 80, 21), "項目に残り全部");
+        assert_eq!(areas[2], Rect::new(0, 22, 80, 1));
+        assert_eq!(areas[3], Rect::new(0, 23, 80, 1));
+        for pair in areas.windows(2) {
+            assert_eq!(pair[0].bottom(), pair[1].y, "{pair:?}");
+            assert_eq!(pair[0].width, area.width);
+        }
+    }
+
+    #[test]
+    fn settings_areas_survive_a_terminal_too_short_for_every_row() {
+        for height in 0..6 {
+            let area = Rect::new(0, 0, 40, height);
+            for rect in settings_areas(area) {
+                assert!(rect.bottom() <= area.bottom(), "{rect:?} / {area:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn settings_help_lists_the_keys_inside_80_columns() {
+        let help = help_80(Mode::Settings, DisplayMode::Embedded);
+        for key in [
+            "↑↓:選択",
+            "←→:値変更",
+            "Enter/Space:切替",
+            "s:保存",
+            // 閉じるだけでなく編集を捨てることが分かる文言にする。
+            "Esc:破棄して戻る",
+        ] {
+            assert!(help.contains(key), "{key} が落ちた: {help}");
+        }
+        assert!(grid::display_width(&help) <= 80, "{help}");
+        // 狭い端末では途中で切らず丸ごと落とす。
+        assert_eq!(help_text(Mode::Settings, DisplayMode::Embedded, 0), "");
+    }
+
+    #[test]
+    fn the_settings_screen_draws_every_row_and_marks_the_selection() {
+        let mut app = App {
+            mode: Mode::Settings,
+            ..App::default()
+        };
+        app.settings_selected = 2;
+        let screen = rendered(&app, 80, 24);
+
+        for row in app.settings_rows() {
+            assert!(screen.contains(&row), "{row} がない:\n{screen}");
+        }
+        assert!(
+            screen.contains("> fps_cap"),
+            "選択中の行に印が出る:\n{screen}"
+        );
+        assert!(screen.contains("設定"), "タイトルが出る:\n{screen}");
+        assert!(screen.contains("s:保存"), "ヘルプが出る:\n{screen}");
+    }
+
+    #[test]
+    fn the_settings_screen_does_not_draw_the_search_boxes() {
+        // 検索画面の上に重ねず、設定だけの画面にする。
+        let app = App {
+            mode: Mode::Settings,
+            query: "ラーメン".to_string(),
+            ..App::default()
+        };
+        let screen = rendered(&app, 80, 24);
+        assert!(!screen.contains("ラーメン"), "{screen}");
+        assert!(!screen.contains("結果"), "{screen}");
     }
 
     #[test]

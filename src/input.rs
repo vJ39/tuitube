@@ -1,8 +1,9 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    SEEK_STEP_SECS, Session, change_speed, copy_url_with, cycle_display_mode, move_selection,
-    reload_tab, reset_speed, seek_absolute, seek_relative, send_to_player, start_playback,
+    SEEK_STEP_SECS, Session, adjust_settings_value, change_speed, close_settings, copy_url_with,
+    cycle_display_mode, move_selection, move_settings_selection, open_settings, reload_tab,
+    reset_speed, save_settings, seek_absolute, seek_relative, send_to_player, start_playback,
     start_search, stop_playback, switch_tab, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
@@ -30,6 +31,7 @@ pub async fn handle_key(
         Mode::Input => handle_key_input(app, key, tx, session),
         Mode::Results => handle_key_results(app, key, tx, session).await,
         Mode::Playing => handle_key_playing(app, key, session).await,
+        Mode::Settings => handle_key_settings(app, key),
     }
 }
 
@@ -46,6 +48,10 @@ fn handle_key_input(
         KeyCode::Backspace => {
             app.query.pop();
         }
+        // 入力欄では大文字の S も検索語なので、設定は Ctrl+S で開く。
+        KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
+        // 他の Ctrl 付きは検索語に入れない。制御文字が混ざると検索が通らない。
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char(c) => {
             app.query.push(c);
             app.set_error(None);
@@ -76,12 +82,53 @@ async fn handle_key_results(
         KeyCode::BackTab => switch_tab(app, tx, session, false),
         KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Enter => start_playback(app, tx, session).await,
+        // 結果一覧では文字を打たないので、S 単独でも開ける。
+        KeyCode::Char('S') => open_settings(app, session),
+        KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
             app.set_error(None);
         }
         KeyCode::Char('q') => app.should_quit = true,
         _ => {}
+    }
+}
+
+/// 設定画面を開くキー。Ctrl+S はどちらの検索画面でも使える。
+fn is_settings_key(c: char, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'s')
+}
+
+/// 設定画面の操作。保存以外は app.settings をその場で書き換えるだけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsAction {
+    Move(i32),
+    Adjust(i32),
+    Save,
+    Close,
+}
+
+/// 設定画面のキーと操作の対応表。
+fn settings_action(code: KeyCode) -> Option<SettingsAction> {
+    match code {
+        KeyCode::Up => Some(SettingsAction::Move(-1)),
+        KeyCode::Down => Some(SettingsAction::Move(1)),
+        KeyCode::Left => Some(SettingsAction::Adjust(-1)),
+        // Enter / Space は bool の切替に要る。選択肢や数値では → と同じ扱い。
+        KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => Some(SettingsAction::Adjust(1)),
+        KeyCode::Char('s') => Some(SettingsAction::Save),
+        KeyCode::Esc | KeyCode::Char('q') => Some(SettingsAction::Close),
+        _ => None,
+    }
+}
+
+fn handle_key_settings(app: &mut App, key: KeyEvent) {
+    match settings_action(key.code) {
+        Some(SettingsAction::Move(delta)) => move_settings_selection(app, delta),
+        Some(SettingsAction::Adjust(delta)) => adjust_settings_value(app, delta),
+        Some(SettingsAction::Save) => save_settings(app, std::time::Instant::now()),
+        Some(SettingsAction::Close) => close_settings(app),
+        None => {}
     }
 }
 
@@ -193,6 +240,7 @@ fn playing_command(code: KeyCode) -> Option<MpvCommand> {
 mod tests {
     use super::*;
     use crate::app::Playback;
+    use crate::category::{Category, Tabs};
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::display::DisplayMode;
     use crate::search::SearchResult;
@@ -312,6 +360,30 @@ mod tests {
         handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session);
         assert!(!app.should_quit);
         assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[tokio::test]
+    async fn a_refused_feed_tab_does_not_turn_esc_into_a_quit() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            tabs: Tabs::with_categories(vec![Category::new("おすすめ", ":ytrec")]),
+            ..App::default()
+        };
+
+        // cookie 無しなので断られ、そのタブの結果は空のまま。yt-dlp は起動しない。
+        handle_key(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
+        assert!(!take_search(&mut session));
+        assert!(app.results.is_empty());
+        assert!(app.error.is_some());
+        assert_eq!(app.mode, Mode::Results, "断りでモードを変えない");
+
+        // ヘルプ通りに Esc を押したら検索欄へ戻るだけ。ここで終了しない。
+        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+        assert!(!app.should_quit, "タブを送っただけでアプリが落ちる");
+        assert_eq!(app.mode, Mode::Input);
     }
 
     #[test]
@@ -881,6 +953,199 @@ mod tests {
         handle_key_results(&mut app, key(KeyCode::Char('r')), &tx, &mut session).await;
         assert!(!app.tabs.state().loaded);
         assert!(take_search(&mut session));
+    }
+
+    /// Ctrl を押しながらのキー。
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_opens_the_settings_from_both_search_screens() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        let mut app = App::default();
+        handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Settings);
+        assert!(app.query.is_empty(), "検索語には入れない");
+
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+        handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Settings);
+    }
+
+    #[tokio::test]
+    async fn capital_s_is_a_search_character_but_opens_the_settings_from_the_results() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        // 入力欄では検索語の一部。"SEKIRO" のような語を打てなくなるため拾わない。
+        let mut app = App::default();
+        for c in "SEKIRO".chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)), &tx, &mut session).await;
+        }
+        assert_eq!(app.query, "SEKIRO");
+        assert_eq!(app.mode, Mode::Input);
+
+        // 結果一覧では文字を打たないので、そのまま設定を開く。
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char('S')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Settings);
+    }
+
+    #[tokio::test]
+    async fn other_control_combinations_do_not_reach_the_query() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        for code in [KeyCode::Char('a'), KeyCode::Char('u'), KeyCode::Char('w')] {
+            handle_key(&mut app, ctrl(code), &tx, &mut session).await;
+        }
+        assert!(app.query.is_empty(), "制御文字は検索語に入れない");
+        assert_eq!(app.mode, Mode::Input);
+    }
+
+    #[tokio::test]
+    async fn capital_s_is_ignored_while_playing() {
+        let mut session = Session::default();
+        let sent = record(&mut session);
+        let mut app = playing_app();
+
+        handle_key_playing(&mut app, key(KeyCode::Char('S')), &mut session).await;
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(sent.lock().expect("溜め込み先").is_empty());
+        assert!(app.subtitles.wanted(), "小文字 s の字幕とは別のキー");
+    }
+
+    #[test]
+    fn the_settings_keys_map_to_their_actions() {
+        assert_eq!(settings_action(KeyCode::Up), Some(SettingsAction::Move(-1)));
+        assert_eq!(
+            settings_action(KeyCode::Down),
+            Some(SettingsAction::Move(1))
+        );
+        assert_eq!(
+            settings_action(KeyCode::Left),
+            Some(SettingsAction::Adjust(-1))
+        );
+        assert_eq!(
+            settings_action(KeyCode::Right),
+            Some(SettingsAction::Adjust(1))
+        );
+        assert_eq!(
+            settings_action(KeyCode::Enter),
+            Some(SettingsAction::Adjust(1))
+        );
+        assert_eq!(
+            settings_action(KeyCode::Char(' ')),
+            Some(SettingsAction::Adjust(1))
+        );
+        assert_eq!(
+            settings_action(KeyCode::Char('s')),
+            Some(SettingsAction::Save)
+        );
+        assert_eq!(settings_action(KeyCode::Esc), Some(SettingsAction::Close));
+        assert_eq!(
+            settings_action(KeyCode::Char('q')),
+            Some(SettingsAction::Close)
+        );
+        // 開くのに使う S では保存しない。
+        assert_eq!(settings_action(KeyCode::Char('S')), None);
+        assert_eq!(settings_action(KeyCode::Tab), None);
+        assert_eq!(settings_action(KeyCode::Char('x')), None);
+    }
+
+    #[tokio::test]
+    async fn the_settings_keys_move_the_selection_and_change_the_value() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
+
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.settings_selected, 1);
+        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
+        assert_eq!(
+            app.settings.display.quality,
+            crate::display::Quality::default().next()
+        );
+        // ← は前の値へ戻す。
+        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        assert_eq!(
+            app.settings.display.quality,
+            crate::display::Quality::default()
+        );
+
+        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+        assert_eq!(app.settings.display.mode, DisplayMode::default().next());
+
+        // 設定画面では文字は検索語にならない。
+        handle_key(&mut app, key(KeyCode::Char('x')), &tx, &mut session).await;
+        assert!(app.query.is_empty());
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Input, "保存せず閉じる");
+        assert_eq!(
+            app.settings,
+            crate::settings::Settings::default(),
+            "閉じたら編集前へ戻す"
+        );
+    }
+
+    #[tokio::test]
+    async fn q_closes_the_settings_instead_of_quitting_the_app() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char('S')), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
+
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_still_quits_from_the_settings() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Settings,
+            ..App::default()
+        };
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_c, &tx, &mut session).await;
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn the_mouse_is_ignored_on_the_settings_screen() {
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Settings,
+            ..playing_app()
+        };
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
+        handle_mouse(&mut app, down, &mut session).await;
+
+        assert_eq!(app.seek_bar, SeekBarState::default());
+        assert_eq!(app.settings, crate::settings::Settings::default());
     }
 
     #[tokio::test]

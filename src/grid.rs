@@ -27,6 +27,19 @@ pub enum LayoutMode {
 }
 
 impl LayoutMode {
+    /// 設定画面での循環。2 つしかないので入れ替えるだけ。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Grid => Self::List,
+            Self::List => Self::Grid,
+        }
+    }
+
+    /// 設定画面の ← 用。2 つしかないので送りと同じ。
+    pub fn prev(self) -> Self {
+        self.next()
+    }
+
     pub fn key(self) -> &'static str {
         match self {
             Self::Grid => "grid",
@@ -380,5 +393,15 @@ mod tests {
         }
         assert_eq!(LayoutMode::from_key("Grid"), None);
         assert_eq!(LayoutMode::default(), LayoutMode::Grid);
+    }
+
+    #[test]
+    fn layout_mode_cycles_between_the_two_views() {
+        assert_eq!(LayoutMode::Grid.next(), LayoutMode::List);
+        assert_eq!(LayoutMode::List.next(), LayoutMode::Grid);
+        assert_eq!(LayoutMode::default().next().next(), LayoutMode::default());
+        // 2 つしかないので戻しも同じ値になる。
+        assert_eq!(LayoutMode::Grid.prev(), LayoutMode::List);
+        assert_eq!(LayoutMode::List.prev(), LayoutMode::Grid);
     }
 }

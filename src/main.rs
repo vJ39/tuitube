@@ -81,22 +81,29 @@ fn install_mouse_panic_hook() {
     }));
 }
 
-async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    spawn_input_reader(tx.clone());
-
-    // 設定は起動時に一度だけ読む。読み替えたときは notice がステータス行に出る。
-    let loaded = settings::load();
-    let mut app = App {
+/// 読んだ設定から画面側の初期状態を組む。環境変数の上書きもここで持ち回す。
+fn app_from(loaded: settings::Loaded) -> App {
+    App {
         display: loaded.settings.display.mode,
         // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
         cookies: CookieState::from_source(loaded.settings.cookies.clone()),
         tabs: Tabs::with_categories(loaded.settings.categories.clone()),
         subtitles: SubtitleState::from_settings(&loaded.settings.subtitles),
+        settings_backup: loaded.settings.clone(),
         settings: loaded.settings,
+        // 環境変数の一時的な上書きは、設定画面から保存してもファイルへ書かない。
+        env_overridden: loaded.overridden,
         notice: loaded.notice,
         ..App::default()
-    };
+    }
+}
+
+async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    spawn_input_reader(tx.clone());
+
+    // 設定は起動時に一度だけ読む。読み替えたときは notice がステータス行に出る。
+    let mut app = app_from(settings::load());
     if let Some(dir) = app.settings.thumbnails.dir() {
         thumbs::prune_cache(&dir, app.settings.thumbnails.max_cached);
     }
@@ -185,8 +192,9 @@ fn present_thumbs(
     cell: video::CellSize,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    // 再生中は映像と重なるので 1 枚も書かない。戻ったときに貼り直せるよう dirty は残す。
-    if app.mode == Mode::Playing {
+    // 再生中と設定画面では他の描画と重なるので 1 枚も書かない。
+    // 戻ったときに貼り直せるよう dirty は残す。
+    if matches!(app.mode, Mode::Playing | Mode::Settings) {
         return Ok(());
     }
     if !app.thumbs.take_dirty() {
@@ -354,9 +362,9 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
             _ => None,
         });
         // ログインが要るだけなら cookie 連携自体は生きている。結果は出さず理由だけ出す。
+        // モードは動かさない (actions::spawn_search の断りと同じ理由)。
         if let (CookieOutcome::LoginRequired, Target::Feed(feed)) = (&report.outcome, target) {
             app.set_error(Some(cookies::login_required_message(*feed, source)));
-            app.mode = Mode::Input;
             return;
         }
     }
@@ -371,7 +379,7 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
                 }
                 _ => Some(e),
             });
-            app.mode = Mode::Input;
+            app.enter_search_mode(Mode::Input);
         }
     }
 }
@@ -554,6 +562,78 @@ mod tests {
         assert_eq!(app.mode, Mode::Results);
         assert!(!app.searching);
         assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn saving_from_the_settings_screen_does_not_bake_in_the_environment() {
+        // 起動 (設定の読み込み) から保存までの通し。利用者が書いた行を s で消さない。
+        let dir = std::env::temp_dir().join(format!("tuitube-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[cookies]\nbrowser = \"chrome\"\n").expect("書ける");
+
+        let loaded = settings::load_from(
+            Some(&path),
+            settings::EnvOverrides {
+                cookies: Some("none"),
+                ..settings::EnvOverrides::default()
+            },
+        );
+        let mut app = app_from(loaded);
+        assert_eq!(app.settings.cookies, None, "実行中は連携を切る");
+
+        actions::save_settings_to(&mut app, Some(&path), std::time::Instant::now());
+        // 書いた中身を読み直して見る。指定なしだと同じ行がコメントで出るため。
+        let written = std::fs::read_to_string(&path).expect("読める");
+        let reread = settings::load_from(Some(&path), settings::EnvOverrides::default());
+        assert_eq!(
+            reread.settings.cookies,
+            CookieSource::from_spec(Some("chrome")),
+            "{written}"
+        );
+    }
+
+    /// 検索中に S を押した形。裏で検索が終わっても設定画面は開いたままにする。
+    async fn settings_open_when_the_search_lands(
+        results: Result<Vec<SearchResult>, String>,
+    ) -> App {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            mode: Mode::Settings,
+            settings_return: Mode::Input,
+            searching: true,
+            ..App::default()
+        };
+        handle_event(
+            &mut app,
+            search_done(1, CookieOutcome::Ok, results),
+            &tx,
+            &mut session,
+        )
+        .await;
+        app
+    }
+
+    #[tokio::test]
+    async fn a_search_landing_behind_the_settings_screen_does_not_close_it() {
+        let app = settings_open_when_the_search_lands(Ok(vec![result("a")])).await;
+        assert_eq!(app.mode, Mode::Settings, "編集中の画面を閉じない");
+        assert_eq!(app.settings_return, Mode::Results, "閉じたら結果へ戻す");
+        assert_eq!(app.results.len(), 1, "結果は受け取っておく");
+        assert!(!app.searching);
+    }
+
+    #[tokio::test]
+    async fn a_failed_search_behind_the_settings_screen_does_not_close_it_either() {
+        let app = settings_open_when_the_search_lands(Err("yt-dlp が落ちた".to_string())).await;
+        assert_eq!(app.mode, Mode::Settings);
+        assert_eq!(app.settings_return, Mode::Input);
+        assert_eq!(app.error.as_deref(), Some("yt-dlp が落ちた"));
     }
 
     #[tokio::test]

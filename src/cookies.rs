@@ -252,14 +252,15 @@ impl CookieState {
     }
 
     /// ログイン必須の要求を yt-dlp を起動せずに断るときの文言。
+    /// ステータス行は 1 行しかないので、80 桁に収まる長さにする。
+    /// 環境変数での指定は設定ファイルの [cookies] のコメントに書いてある。
     pub fn refusal(&self, feed: Feed) -> String {
         match self {
-            Self::Suspended { reason, .. } => format!(
-                "{} は cookie 連携が停止中のため使えません: {reason}",
-                feed.label()
-            ),
+            Self::Suspended { reason, .. } => {
+                format!("{} は cookie 連携が停止中: {reason}", feed.label())
+            }
             _ => format!(
-                "{} には cookie 連携が必要です。設定ファイルの [cookies] browser か環境変数 {ENV_VAR} を設定してください",
+                "{} には cookie 連携が必要です (設定の [cookies] browser)",
                 feed.label()
             ),
         }
@@ -275,6 +276,14 @@ pub enum Feed {
 }
 
 impl Feed {
+    /// タブの既定の並びと、設定ファイルの案内が使う一覧。
+    pub const ALL: [Feed; 4] = [
+        Feed::Recommended,
+        Feed::History,
+        Feed::Subscriptions,
+        Feed::WatchLater,
+    ];
+
     /// 完全一致のみ。":ytfoo" のような別の文字列は検索語として扱う。
     pub fn parse(query: &str) -> Option<Feed> {
         match query.trim() {
@@ -377,10 +386,15 @@ mod tests {
     }
 
     #[test]
-    fn refusal_names_the_config_key_and_the_environment_variable() {
-        let off = CookieState::Off.refusal(Feed::History);
-        assert!(off.contains("[cookies] browser"), "{off}");
-        assert!(off.contains(ENV_VAR), "{off}");
+    fn refusal_names_the_config_key_and_fits_one_status_row() {
+        for feed in Feed::ALL {
+            let off = CookieState::Off.refusal(feed);
+            assert!(off.contains("[cookies] browser"), "{off}");
+            assert!(off.contains(feed.label()), "{off}");
+            // ステータス行は "エラー: " を足して 80 桁に描く。切れると設定先が読めない。
+            let width = crate::grid::display_width(&format!("エラー: {off}"));
+            assert!(width <= 80, "{width} 桁: {off}");
+        }
     }
 
     #[test]
@@ -735,6 +749,11 @@ mod tests {
         assert_eq!(Feed::parse(":ytrec の使い方"), None);
         // yt-dlp へ渡すのは History だけ短い方に寄せる。
         assert_eq!(Feed::History.keyword(), ":ythis");
+
+        // ALL はタブの並びと設定ファイルの案内が使うので、parse と往復する。
+        for feed in Feed::ALL {
+            assert_eq!(Feed::parse(feed.keyword()), Some(feed), "{}", feed.label());
+        }
     }
 
     #[test]
@@ -767,7 +786,7 @@ mod tests {
 
         // 断り文句は停止中かどうかで変わる。
         let off = CookieState::Off.refusal(Feed::History);
-        assert!(off.contains(ENV_VAR), "{off}");
+        assert!(off.contains("[cookies] browser"), "{off}");
         let suspended = CookieState::Suspended {
             source: source("chrome"),
             reason: "読めませんでした".to_string(),

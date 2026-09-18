@@ -1,11 +1,14 @@
 use crate::category::Tabs;
 use crate::cookies::{CookieState, Target};
-use crate::display::DisplayMode;
+use crate::display::{DisplayMode, FpsCap};
 use crate::mpv::MpvCommand;
 use crate::rgb::RgbImage;
 use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
-use crate::settings::Settings;
+use crate::settings::{
+    EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_LIMIT, MAX_THUMB_TIMEOUT_SECS,
+    MIN_SEARCH_LIMIT, Settings,
+};
 use crate::speed::{Polled, Speed};
 use crate::subtitles::SubtitleState;
 use crate::thumbs::Thumbs;
@@ -74,6 +77,157 @@ pub enum Mode {
     Input,
     Results,
     Playing,
+    Settings,
+}
+
+/// 設定画面で編集できる項目。画面の並びはこの順。
+/// ここに無い値 (window.* / cookies.browser / mpv.extra_args / subtitles.lang / categories) は
+/// config.toml を直接編集する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsItem {
+    DisplayMode,
+    DisplayQuality,
+    FpsCap,
+    SubtitlesEnabled,
+    SearchLayout,
+    SearchLimit,
+    ThumbnailsEnabled,
+    ThumbnailsMaxCached,
+    ThumbnailsTimeoutSecs,
+}
+
+pub const SETTINGS_ITEMS: [SettingsItem; 9] = [
+    SettingsItem::DisplayMode,
+    SettingsItem::DisplayQuality,
+    SettingsItem::FpsCap,
+    SettingsItem::SubtitlesEnabled,
+    SettingsItem::SearchLayout,
+    SettingsItem::SearchLimit,
+    SettingsItem::ThumbnailsEnabled,
+    SettingsItem::ThumbnailsMaxCached,
+    SettingsItem::ThumbnailsTimeoutSecs,
+];
+
+/// 数値項目の 1 回ぶんの刻み。
+const FPS_CAP_STEP: u64 = 5;
+const SEARCH_LIMIT_STEP: u64 = 1;
+const MAX_CACHED_STEP: u64 = 50;
+const THUMB_TIMEOUT_STEP: u64 = 5;
+/// 0 秒では 1 枚も取れないので、秒数はここまでしか下げない。
+const MIN_THUMB_TIMEOUT_SECS: u64 = 1;
+/// max_cached に上限は無い。刻みの計算にだけ使う。
+const NO_MAX: u64 = u64::MAX;
+
+/// 刻みの次の目盛り。上限では止まる。
+fn step_up(current: u64, step: u64, max: u64) -> u64 {
+    (current / step * step).saturating_add(step).min(max)
+}
+
+/// 刻みの 1 つ前の目盛り。下限が刻みに乗っていなくても、目盛りの基準はずらさない。
+/// (例: 刻み 5 / 下限 1 で 5 → 1 → 5 と戻る)
+fn step_down(current: u64, step: u64, min: u64) -> u64 {
+    (current.saturating_sub(1) / step * step).max(min)
+}
+
+impl SettingsItem {
+    /// 設定ファイルのキーをそのまま出す。画面で見た項目を config.toml で探せるため。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DisplayMode => "display.mode",
+            Self::DisplayQuality => "display.quality",
+            Self::FpsCap => "fps_cap",
+            Self::SubtitlesEnabled => "subtitles.enabled",
+            Self::SearchLayout => "search.layout",
+            Self::SearchLimit => "search.limit",
+            Self::ThumbnailsEnabled => "thumbnails.enabled",
+            Self::ThumbnailsMaxCached => "thumbnails.max_cached",
+            Self::ThumbnailsTimeoutSecs => "thumbnails.timeout_secs",
+        }
+    }
+
+    /// 値も設定ファイルの表記に合わせる。
+    pub fn value(self, settings: &Settings) -> String {
+        match self {
+            Self::DisplayMode => settings.display.mode.key().to_string(),
+            Self::DisplayQuality => settings.display.quality.label().to_string(),
+            Self::FpsCap => match settings.fps_cap {
+                Some(cap) => cap.get().to_string(),
+                None => "0 (無制限)".to_string(),
+            },
+            Self::SubtitlesEnabled => settings.subtitles.enabled.to_string(),
+            Self::SearchLayout => settings.search.layout.key().to_string(),
+            Self::SearchLimit => settings.search.limit.to_string(),
+            Self::ThumbnailsEnabled => settings.thumbnails.enabled.to_string(),
+            Self::ThumbnailsMaxCached => settings.thumbnails.max_cached.to_string(),
+            Self::ThumbnailsTimeoutSecs => settings.thumbnails.timeout.as_secs().to_string(),
+        }
+    }
+
+    pub fn row(self, settings: &Settings) -> String {
+        format!("{}: {}", self.label(), self.value(settings))
+    }
+
+    /// 環境変数が上書きしている項目なら、その変数名。保存では書き換えないので画面にも出す。
+    pub fn env_var(self, overridden: &EnvOverridden) -> Option<&'static str> {
+        match self {
+            Self::FpsCap => overridden.fps_cap.is_some().then_some(FPS_LIMIT_VAR),
+            _ => None,
+        }
+    }
+
+    /// ←→ 1 回ぶんの変化。→ は次の値、← は前の値。bool はどちらでも反転する。
+    /// 数値は刻みの目盛りを動き、範囲の端で止まる (ラップしない)。
+    pub fn adjust(self, settings: &mut Settings, delta: i32) {
+        let up = delta >= 0;
+        match self {
+            Self::DisplayMode => {
+                let mode = settings.display.mode;
+                settings.display.mode = if up { mode.next() } else { mode.prev() };
+            }
+            Self::DisplayQuality => {
+                let quality = settings.display.quality;
+                settings.display.quality = if up { quality.next() } else { quality.prev() };
+            }
+            Self::FpsCap => {
+                let current = u64::from(settings.fps_cap.map(FpsCap::get).unwrap_or(0));
+                // 0 は「制限なし」。FpsCap は 1 以上しか作れない。
+                let next = step(current, FPS_CAP_STEP, 0, u64::from(MAX_FPS_CAP), up);
+                settings.fps_cap = FpsCap::new(next as u32);
+            }
+            Self::SubtitlesEnabled => settings.subtitles.enabled = !settings.subtitles.enabled,
+            Self::SearchLayout => {
+                let layout = settings.search.layout;
+                settings.search.layout = if up { layout.next() } else { layout.prev() };
+            }
+            Self::SearchLimit => {
+                let current = settings.search.limit as u64;
+                let min = MIN_SEARCH_LIMIT as u64;
+                let max = MAX_SEARCH_LIMIT as u64;
+                settings.search.limit = step(current, SEARCH_LIMIT_STEP, min, max, up) as usize;
+            }
+            Self::ThumbnailsEnabled => settings.thumbnails.enabled = !settings.thumbnails.enabled,
+            Self::ThumbnailsMaxCached => {
+                let current = settings.thumbnails.max_cached as u64;
+                settings.thumbnails.max_cached =
+                    step(current, MAX_CACHED_STEP, 0, NO_MAX, up) as usize;
+            }
+            Self::ThumbnailsTimeoutSecs => {
+                let current = settings.thumbnails.timeout.as_secs();
+                let min = MIN_THUMB_TIMEOUT_SECS;
+                let secs = step(current, THUMB_TIMEOUT_STEP, min, MAX_THUMB_TIMEOUT_SECS, up);
+                settings.thumbnails.timeout = Duration::from_secs(secs);
+            }
+        }
+    }
+}
+
+/// 数値項目を 1 目盛りぶん動かす。
+fn step(current: u64, width: u64, min: u64, max: u64, up: bool) -> u64 {
+    if up {
+        step_up(current, width, max).max(min)
+    } else {
+        step_down(current, width, min).min(max)
+    }
 }
 
 /// シーク送信から確定までの先行表示。
@@ -164,6 +318,14 @@ pub struct App {
     pub thumbs: Thumbs,
     /// 格子の先頭表示位置 (項目インデックス)。描画のたびに列数で丸める。
     pub scroll: usize,
+    /// 設定画面で選んでいる行。SETTINGS_ITEMS の範囲へ丸めて使う。
+    pub settings_selected: usize,
+    /// 設定画面を開いた元のモード。閉じたらここへ戻る。
+    pub settings_return: Mode,
+    /// 設定画面を開いた時点 (または最後に保存した時点) の設定。Esc はここへ戻す。
+    pub settings_backup: Settings,
+    /// 環境変数が上書きしている項目。画面の断りと、保存時の書き戻しに使う。
+    pub env_overridden: EnvOverridden,
 }
 
 impl Default for App {
@@ -185,6 +347,7 @@ impl Default for App {
             speed: Speed::NORMAL,
             speed_sent_at: None,
             subtitles: SubtitleState::from_settings(&settings.subtitles),
+            settings_backup: settings.clone(),
             settings,
             video: None,
             screen: Rect::default(),
@@ -193,6 +356,9 @@ impl Default for App {
             tabs: Tabs::default(),
             thumbs: Thumbs::default(),
             scroll: 0,
+            settings_selected: 0,
+            settings_return: Mode::Input,
+            env_overridden: EnvOverridden::default(),
         }
     }
 }
@@ -271,9 +437,19 @@ impl App {
         self.sync_from_tab();
         if self.results.is_empty() {
             self.error = Some(target.empty_message());
-            self.mode = Mode::Input;
+            self.enter_search_mode(Mode::Input);
         } else {
-            self.mode = Mode::Results;
+            self.enter_search_mode(Mode::Results);
+        }
+    }
+
+    /// 検索や再生の終わりで戻る検索画面のモード。設定画面を開いている間は戻り先だけ
+    /// 書き換える。裏で終わった検索が、編集中の設定画面を閉じてしまわないため。
+    pub fn enter_search_mode(&mut self, mode: Mode) {
+        if self.mode == Mode::Settings {
+            self.settings_return = mode;
+        } else {
+            self.mode = mode;
         }
     }
 
@@ -356,12 +532,33 @@ impl App {
         None
     }
 
+    /// 選択中の設定項目。壊れた添字でも必ず 1 つ返す。
+    pub fn settings_item(&self) -> SettingsItem {
+        SETTINGS_ITEMS[self.settings_selected.min(SETTINGS_ITEMS.len() - 1)]
+    }
+
+    /// 設定画面に並べる `ラベル: 現在値` の行。
+    /// 環境変数が効いている行には、保存しても書き換わらない旨を添える。
+    pub fn settings_rows(&self) -> Vec<String> {
+        SETTINGS_ITEMS
+            .iter()
+            .map(|item| {
+                let row = item.row(&self.settings);
+                match item.env_var(&self.env_overridden) {
+                    Some(var) => format!("{row}  ({var} が指定中。保存しません)"),
+                    None => row,
+                }
+            })
+            .collect()
+    }
+
     /// 分岐は網羅する。モードを増やしたときの書き分け漏れをコンパイラに拾わせる。
     pub fn status_line(&self) -> String {
         let line = match self.mode {
             Mode::Playing => self.playing_status(),
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
             Mode::Results => self.search_status(self.results_status()),
+            Mode::Settings => self.settings_status(),
         };
         // エラーが出ている行に足すと読みにくいので、そのときは譲る。
         match &self.notice {
@@ -389,6 +586,19 @@ impl App {
             Some(result) => format!("{count}  |  {}", result.title),
             None => count,
         }
+    }
+
+    /// 設定画面は保存の成否をここで返す。ポーリングが上書きしない画面なので、
+    /// エラーが出ていればそれだけを出す。
+    fn settings_status(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("エラー: {error}");
+        }
+        format!(
+            "設定 {}/{}",
+            self.settings_selected.min(SETTINGS_ITEMS.len() - 1) + 1,
+            SETTINGS_ITEMS.len()
+        )
     }
 
     fn search_status(&self, idle: String) -> String {
@@ -473,6 +683,8 @@ pub fn format_time(seconds: Option<f64>) -> String {
 mod tests {
     use super::*;
     use crate::cookies::{CookieSource, Feed};
+    use crate::display::Quality;
+    use crate::grid::LayoutMode;
     use crate::speed::Speed;
     use crate::subtitles::{SELECT_GRACE, SubtitleStatus};
     use serde_json::json;
@@ -1180,5 +1392,302 @@ mod tests {
             ..App::default()
         };
         assert!(app.status_line().starts_with("状態不明"));
+    }
+
+    /// 1 項目だけ動かした結果。他の行に触れていないことも見られるよう丸ごと返す。
+    fn adjusted(item: SettingsItem, delta: i32, settings: &Settings) -> Settings {
+        let mut next = settings.clone();
+        item.adjust(&mut next, delta);
+        next
+    }
+
+    #[test]
+    fn the_settings_screen_lists_every_editable_item_in_order() {
+        let labels: Vec<&str> = SETTINGS_ITEMS.iter().map(|item| item.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "display.mode",
+                "display.quality",
+                "fps_cap",
+                "subtitles.enabled",
+                "search.layout",
+                "search.limit",
+                "thumbnails.enabled",
+                "thumbnails.max_cached",
+                "thumbnails.timeout_secs",
+            ]
+        );
+    }
+
+    #[test]
+    fn each_settings_row_shows_the_value_the_config_file_holds() {
+        // 行の値は設定ファイルの表記と揃える。画面で見た値をそのまま探せるため。
+        assert_eq!(
+            App::default().settings_rows(),
+            [
+                "display.mode: embedded",
+                "display.quality: medium",
+                "fps_cap: 15",
+                "subtitles.enabled: true",
+                "search.layout: grid",
+                "search.limit: 10",
+                "thumbnails.enabled: true",
+                "thumbnails.max_cached: 500",
+                "thumbnails.timeout_secs: 10",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unlimited_fps_cap_is_shown_as_zero() {
+        let mut app = App::default();
+        app.settings.fps_cap = None;
+        assert_eq!(app.settings_rows()[2], "fps_cap: 0 (無制限)");
+    }
+
+    #[test]
+    fn a_row_the_environment_holds_says_that_it_is_not_saved() {
+        // 環境変数が効いている間は保存でファイルへ書かないので、画面で断っておく。
+        let app = App {
+            env_overridden: EnvOverridden {
+                fps_cap: Some(FpsCap::new(30)),
+                ..EnvOverridden::default()
+            },
+            ..App::default()
+        };
+        let row = &app.settings_rows()[2];
+        assert!(row.starts_with("fps_cap: "), "{row}");
+        assert!(row.contains(FPS_LIMIT_VAR), "{row}");
+        assert!(row.contains("保存しません"), "{row}");
+
+        // 上書きされていない行には何も足さない。
+        assert_eq!(app.settings_rows()[5], "search.limit: 10");
+        assert_eq!(App::default().settings_rows()[2], "fps_cap: 15");
+    }
+
+    #[test]
+    fn the_choice_rows_send_forward_on_the_right_and_back_on_the_left() {
+        let settings = Settings::default();
+        assert_eq!(
+            adjusted(SettingsItem::DisplayMode, 1, &settings)
+                .display
+                .mode,
+            DisplayMode::default().next()
+        );
+        assert_eq!(
+            adjusted(SettingsItem::DisplayMode, -1, &settings)
+                .display
+                .mode,
+            DisplayMode::default().prev()
+        );
+        assert_eq!(
+            adjusted(SettingsItem::DisplayQuality, 1, &settings)
+                .display
+                .quality,
+            Quality::default().next()
+        );
+        assert_eq!(
+            adjusted(SettingsItem::DisplayQuality, -1, &settings)
+                .display
+                .quality,
+            Quality::default().prev()
+        );
+        assert_eq!(
+            adjusted(SettingsItem::SearchLayout, 1, &settings)
+                .search
+                .layout,
+            LayoutMode::default().next()
+        );
+        assert_eq!(
+            adjusted(SettingsItem::SearchLayout, -1, &settings)
+                .search
+                .layout,
+            LayoutMode::default().prev()
+        );
+    }
+
+    #[test]
+    fn a_choice_row_comes_back_to_where_it_started() {
+        // ← が「戻る」でないと、4 値ある quality は選び直しに 3 回かかる。
+        let settings = Settings::default();
+        let mut next = settings.clone();
+        SettingsItem::DisplayQuality.adjust(&mut next, 1);
+        SettingsItem::DisplayQuality.adjust(&mut next, -1);
+        assert_eq!(next.display.quality, settings.display.quality);
+
+        let mut back = settings.clone();
+        SettingsItem::DisplayQuality.adjust(&mut back, -1);
+        assert_eq!(back.display.quality, Quality::Low, "medium の 1 つ前");
+    }
+
+    #[test]
+    fn the_flag_rows_toggle_whichever_way_they_are_pushed() {
+        let mut settings = Settings::default();
+        for delta in [-1, 1] {
+            SettingsItem::SubtitlesEnabled.adjust(&mut settings, delta);
+            assert!(!settings.subtitles.enabled, "{delta}");
+            SettingsItem::SubtitlesEnabled.adjust(&mut settings, delta);
+            assert!(settings.subtitles.enabled, "{delta}");
+
+            SettingsItem::ThumbnailsEnabled.adjust(&mut settings, delta);
+            assert!(!settings.thumbnails.enabled, "{delta}");
+            SettingsItem::ThumbnailsEnabled.adjust(&mut settings, delta);
+            assert!(settings.thumbnails.enabled, "{delta}");
+        }
+    }
+
+    #[test]
+    fn the_fps_cap_steps_by_five_and_stops_at_both_ends() {
+        let mut settings = Settings::default();
+        SettingsItem::FpsCap.adjust(&mut settings, 1);
+        assert_eq!(settings.fps_cap.map(FpsCap::get), Some(20));
+        SettingsItem::FpsCap.adjust(&mut settings, -1);
+        assert_eq!(settings.fps_cap.map(FpsCap::get), Some(15));
+
+        // 0 まで下げると制限なし。そこから下は動かない (ラップしない)。
+        for _ in 0..10 {
+            SettingsItem::FpsCap.adjust(&mut settings, -1);
+        }
+        assert_eq!(settings.fps_cap, None);
+
+        for _ in 0..40 {
+            SettingsItem::FpsCap.adjust(&mut settings, 1);
+        }
+        assert_eq!(settings.fps_cap.map(FpsCap::get), Some(MAX_FPS_CAP));
+    }
+
+    #[test]
+    fn the_search_limit_steps_by_one_and_stays_inside_its_range() {
+        let mut settings = Settings::default();
+        SettingsItem::SearchLimit.adjust(&mut settings, 1);
+        assert_eq!(settings.search.limit, 11);
+
+        for _ in 0..20 {
+            SettingsItem::SearchLimit.adjust(&mut settings, -1);
+        }
+        assert_eq!(settings.search.limit, MIN_SEARCH_LIMIT);
+
+        for _ in 0..100 {
+            SettingsItem::SearchLimit.adjust(&mut settings, 1);
+        }
+        assert_eq!(settings.search.limit, MAX_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn the_thumbnail_numbers_step_by_their_own_width() {
+        let mut settings = Settings::default();
+        SettingsItem::ThumbnailsMaxCached.adjust(&mut settings, 1);
+        assert_eq!(settings.thumbnails.max_cached, 550);
+        for _ in 0..20 {
+            SettingsItem::ThumbnailsMaxCached.adjust(&mut settings, -1);
+        }
+        assert_eq!(settings.thumbnails.max_cached, 0, "0 枚で止まる");
+
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
+        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(15));
+        for _ in 0..10 {
+            SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
+        }
+        assert_eq!(
+            settings.thumbnails.timeout,
+            Duration::from_secs(1),
+            "0 秒では 1 枚も取れない"
+        );
+        for _ in 0..40 {
+            SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
+        }
+        assert_eq!(
+            settings.thumbnails.timeout,
+            Duration::from_secs(MAX_THUMB_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn the_timeout_keeps_its_step_after_hitting_the_lower_bound() {
+        // 下限 1 は刻みに乗っていない。ここで基準がずれると既定の 10 へ戻せなくなる。
+        let mut settings = Settings::default();
+        let secs = |settings: &Settings| settings.thumbnails.timeout.as_secs();
+
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
+        assert_eq!(secs(&settings), 5);
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
+        assert_eq!(secs(&settings), 1, "0 秒では取れないので 1 で止まる");
+
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
+        assert_eq!(secs(&settings), 5, "刻みの目盛りへ戻る");
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
+        assert_eq!(secs(&settings), 10, "既定値に戻せる");
+    }
+
+    #[test]
+    fn a_value_off_the_step_is_pulled_back_onto_it() {
+        // 設定ファイルに手で書いた端数から始めても、目盛りの上を動く。
+        let mut settings = Settings::default();
+        settings.thumbnails.timeout = Duration::from_secs(12);
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
+        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(10));
+
+        settings.thumbnails.timeout = Duration::from_secs(12);
+        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
+        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn the_search_results_do_not_close_the_settings_screen() {
+        // 検索中に設定を開いても、結果が届いたところで画面が消えない。
+        let mut app = App {
+            mode: Mode::Settings,
+            settings_return: Mode::Input,
+            ..App::default()
+        };
+        app.enter_search_mode(Mode::Results);
+        assert_eq!(app.mode, Mode::Settings);
+        assert_eq!(app.settings_return, Mode::Results, "閉じたら結果へ戻す");
+
+        // 設定画面を開いていなければ、そのままモードを動かす。
+        let mut app = App::default();
+        app.enter_search_mode(Mode::Results);
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[test]
+    fn an_out_of_range_selection_still_points_at_a_row() {
+        let mut app = App::default();
+        assert_eq!(app.settings_selected, 0);
+        assert_eq!(app.settings_item(), SETTINGS_ITEMS[0]);
+
+        app.settings_selected = 99;
+        assert_eq!(
+            app.settings_item(),
+            SETTINGS_ITEMS[SETTINGS_ITEMS.len() - 1]
+        );
+    }
+
+    #[test]
+    fn the_settings_status_line_shows_the_position_and_keeps_the_notice() {
+        let t0 = Instant::now();
+        let mut app = App {
+            mode: Mode::Settings,
+            ..App::default()
+        };
+        assert_eq!(
+            app.status_line(),
+            format!("設定 1/{}", SETTINGS_ITEMS.len())
+        );
+
+        app.settings_selected = 2;
+        assert!(
+            app.status_line().starts_with("設定 3/"),
+            "{}",
+            app.status_line()
+        );
+
+        app.set_temporary_notice("保存しました".to_string(), t0);
+        assert!(app.status_line().ends_with("保存しました"));
+
+        // 保存に失敗した理由はエラーとして出す。
+        app.set_temporary_error("保存できません".to_string(), t0);
+        assert_eq!(app.status_line(), "エラー: 保存できません");
     }
 }

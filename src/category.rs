@@ -1,7 +1,8 @@
 //! 擬似カテゴリタブ。YouTube 側の本物のカテゴリは廃止済みなので固定キーワードで代える。
 
-use crate::cookies::Target;
+use crate::cookies::{Feed, Target};
 use crate::search::SearchResult;
+use std::cell::Cell;
 
 /// 先頭に必ず入るタブ。検索ボックスの入力を使う。
 pub const ALL_LABEL: &str = "すべて";
@@ -23,10 +24,15 @@ impl Category {
 
 /// 設定ファイルで丸ごと差し替えられる既定の一覧。「すべて」は含めない。
 pub fn default_categories() -> Vec<Category> {
-    ["音楽", "ゲーム", "ニュース", "アニメ", "スポーツ"]
+    let keywords = ["音楽", "ゲーム", "ニュース", "アニメ", "スポーツ"]
         .into_iter()
-        .map(|label| Category::new(label, label))
-        .collect()
+        .map(|label| Category::new(label, label));
+    // cookie 連携のフィードは `:ytrec` 等を覚えていないと打てないのでタブにも出す。
+    // query はそのまま Target::for_query() を通り、cookie が無ければ既存の断り文になる。
+    let feeds = Feed::ALL
+        .into_iter()
+        .map(|feed| Category::new(feed.label(), feed.keyword()));
+    keywords.chain(feeds).collect()
 }
 
 /// タブごとに持ち越す画面の状態。戻ったときに再検索を待たせないために保つ。
@@ -43,6 +49,9 @@ pub struct Tabs {
     categories: Vec<Category>,
     selected: usize,
     states: Vec<TabState>,
+    /// タブ行に出している窓の開始位置。端末の幅は描画時にしか分からないので、
+    /// 描く側 (ui::draw_tabs) が調整した結果をここへ戻す。
+    window: Cell<usize>,
 }
 
 impl Default for Tabs {
@@ -61,7 +70,18 @@ impl Tabs {
             categories: all,
             selected: 0,
             states,
+            window: Cell::new(0),
         }
+    }
+
+    /// タブ行に出している窓の開始位置。
+    pub fn window(&self) -> usize {
+        self.window.get()
+    }
+
+    /// 描いた窓を覚える。次に描くときはここから最小限だけ動かす。
+    pub fn remember_window(&self, start: usize) {
+        self.window.set(start);
     }
 
     pub fn next(&mut self) {
@@ -132,7 +152,18 @@ mod tests {
         assert_eq!(tabs.labels()[0], ALL_LABEL);
         assert_eq!(
             tabs.labels(),
-            ["すべて", "音楽", "ゲーム", "ニュース", "アニメ", "スポーツ"]
+            [
+                "すべて",
+                "音楽",
+                "ゲーム",
+                "ニュース",
+                "アニメ",
+                "スポーツ",
+                "おすすめ",
+                "履歴",
+                "登録チャンネル",
+                "後で見る"
+            ]
         );
         assert_eq!(tabs.selected(), 0);
         assert!(tabs.is_all());
@@ -143,13 +174,40 @@ mod tests {
     }
 
     #[test]
+    fn the_cookie_feeds_are_reachable_as_tabs() {
+        // キーワードを覚えていなくてもタブで選べる。
+        for feed in Feed::ALL {
+            let mut tabs = Tabs::default();
+            let index = tabs
+                .labels()
+                .iter()
+                .position(|label| *label == feed.label())
+                .unwrap_or_else(|| panic!("{} のタブがない", feed.label()));
+            while tabs.selected() != index {
+                tabs.next();
+            }
+            // 検索ボックスに何が入っていてもフィードとして扱う。
+            assert_eq!(tabs.target("ラーメン"), Some(Target::Feed(feed)));
+        }
+    }
+
+    #[test]
+    fn the_cookie_feed_tabs_come_after_the_keyword_tabs() {
+        let labels = Tabs::default().labels().join(" ");
+        let music = labels.find("音楽").expect("音楽");
+        let recommended = labels.find("おすすめ").expect("おすすめ");
+        assert!(music < recommended, "{labels}");
+    }
+
+    #[test]
     fn next_and_prev_wrap_around() {
         let mut tabs = Tabs::default();
-        for expected in [1, 2, 3, 4, 5, 0] {
+        let last = tabs.labels().len() - 1;
+        for expected in (1..=last).chain([0]) {
             tabs.next();
             assert_eq!(tabs.selected(), expected);
         }
-        for expected in [5, 4, 3, 2, 1, 0] {
+        for expected in (1..=last).rev().chain([0]) {
             tabs.prev();
             assert_eq!(tabs.selected(), expected);
         }
@@ -229,15 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_tab_row_fits_an_80_column_terminal() {
-        // ラベルを " │ " で繋いだ幅。80 桁に収まらないと見出しが折り返す。
-        let tabs = Tabs::default();
-        let labels = tabs.labels();
-        let width: usize = labels
-            .iter()
-            .map(|label| crate::grid::display_width(label))
-            .sum::<usize>()
-            + 3 * (labels.len() - 1);
-        assert!(width <= 80, "{width} 桁");
+    fn every_default_tab_label_fits_a_narrow_terminal() {
+        // 全部を一度に並べる幅はもう無いので、タブ行は窓で切り出す (ui::tab_spans)。
+        // 選択中のタブが切れずに出るために、ラベル 1 つぶんは狭い端末にも入る必要がある。
+        for label in Tabs::default().labels() {
+            let width = crate::grid::display_width(label);
+            assert!(width <= 16, "{label} は {width} 桁");
+        }
     }
 }

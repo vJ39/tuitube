@@ -34,6 +34,15 @@ impl DisplayMode {
         }
     }
 
+    /// 設定画面の ← 用。next() の逆順。
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Embedded => Self::Window,
+            Self::Text => Self::Embedded,
+            Self::Window => Self::Text,
+        }
+    }
+
     /// mpv が実際に使っている VO からモードを読む。値が来るまでは None。
     pub fn from_current_vo(vo: Option<&str>) -> Option<Self> {
         match vo? {
@@ -125,6 +134,26 @@ pub enum Quality {
 }
 
 impl Quality {
+    /// 設定画面での循環。粗い方から順に送る。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Low => Self::Medium,
+            Self::Medium => Self::High,
+            Self::High => Self::Native,
+            Self::Native => Self::Low,
+        }
+    }
+
+    /// 設定画面の ← 用。next() の逆順。4 値あるので戻せないと選び直しが遠い。
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Low => Self::Native,
+            Self::Medium => Self::Low,
+            Self::High => Self::Medium,
+            Self::Native => Self::High,
+        }
+    }
+
     pub fn max_pixels(self) -> u32 {
         match self {
             Self::Low => 320 * 180,
@@ -393,6 +422,56 @@ mod tests {
         assert!(Quality::High.max_pixels() < Quality::Native.max_pixels());
         assert_eq!(Quality::Medium.max_pixels(), MAX_FRAME_PIXELS);
         assert_eq!(Quality::default(), Quality::Medium);
+    }
+
+    #[test]
+    fn quality_and_display_mode_step_back_the_way_they_came() {
+        // 設定画面の ← 用。next() を 1 回ぶん取り消せる。
+        for quality in [
+            Quality::Low,
+            Quality::Medium,
+            Quality::High,
+            Quality::Native,
+        ] {
+            assert_eq!(quality.next().prev(), quality, "{quality:?}");
+            assert_eq!(quality.prev().next(), quality, "{quality:?}");
+        }
+        assert_eq!(Quality::Low.prev(), Quality::Native, "端では巻き戻る");
+
+        for mode in [
+            DisplayMode::Embedded,
+            DisplayMode::Text,
+            DisplayMode::Window,
+        ] {
+            assert_eq!(mode.next().prev(), mode, "{mode:?}");
+        }
+        assert_eq!(DisplayMode::Embedded.prev(), DisplayMode::Window);
+    }
+
+    #[test]
+    fn quality_cycles_from_the_coarsest_to_the_finest_and_back() {
+        assert_eq!(Quality::Low.next(), Quality::Medium);
+        assert_eq!(Quality::Medium.next(), Quality::High);
+        assert_eq!(Quality::High.next(), Quality::Native);
+        assert_eq!(Quality::Native.next(), Quality::Low);
+
+        // 4 回で一周する。どの値からでも全部を選べる。
+        let mut quality = Quality::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(quality);
+            quality = quality.next();
+        }
+        assert_eq!(quality, Quality::default());
+        assert_eq!(seen.len(), 4);
+        for value in [
+            Quality::Low,
+            Quality::Medium,
+            Quality::High,
+            Quality::Native,
+        ] {
+            assert!(seen.contains(&value), "{} が出ない", value.label());
+        }
     }
 
     #[test]
