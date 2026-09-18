@@ -9,7 +9,9 @@ mod seekbar;
 mod ui;
 mod video;
 
-use actions::{Session, apply_resize, end_playback, schedule_resize, stop_playback};
+use actions::{
+    Session, apply_fps_limit, apply_resize, end_playback, schedule_resize, stop_playback,
+};
 use anyhow::Result;
 use app::{App, AppEvent, Mode};
 use crossterm::event::{
@@ -67,7 +69,13 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     spawn_input_reader(tx.clone());
 
-    let mut app = App::default();
+    // 設定は起動時に一度だけ読む。読み替えたときは notice がステータス行に出る。
+    let fps = mpv::FpsLimit::from_env();
+    let mut app = App {
+        fps_limit: fps.limit,
+        notice: fps.notice,
+        ..App::default()
+    };
     let mut session = Session::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
@@ -205,7 +213,12 @@ async fn handle_event(
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
-                app.apply_property(id, data);
+                // fps 上限は表示でなく mpv への指示なので、App でなく player へ渡す。
+                if id == mpv::REQ_CONTAINER_FPS {
+                    apply_fps_limit(app, session, data.and_then(|v| v.as_f64())).await;
+                } else {
+                    app.apply_property(id, data);
+                }
             }
         }
         AppEvent::VideoFrame { nonce } => {

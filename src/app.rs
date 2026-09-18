@@ -105,7 +105,11 @@ pub struct App {
     pub selected: usize,
     pub searching: bool,
     pub error: Option<String>,
+    /// 設定を読み替えたときなど、エラーではないが一度伝えたいこと。
+    pub notice: Option<String>,
     pub playback: Playback,
+    /// mpv に適用する fps 上限。None は制限なし。
+    pub fps_limit: Option<u32>,
     /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
     pub video: Option<VideoSink>,
     /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
@@ -123,7 +127,9 @@ impl Default for App {
             selected: 0,
             searching: false,
             error: None,
+            notice: None,
             playback: Playback::default(),
+            fps_limit: crate::mpv::FpsLimit::default().limit,
             video: None,
             screen: Rect::default(),
             seek_bar: SeekBarState::default(),
@@ -176,10 +182,15 @@ impl App {
 
     /// 分岐は網羅する。モードを増やしたときの書き分け漏れをコンパイラに拾わせる。
     pub fn status_line(&self) -> String {
-        match self.mode {
+        let line = match self.mode {
             Mode::Playing => self.playing_status(),
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
             Mode::Results => self.search_status(format!("{} 件", self.results.len())),
+        };
+        // エラーが出ている行に足すと読みにくいので、そのときは譲る。
+        match &self.notice {
+            Some(notice) if self.error.is_none() => format!("{line}  |  {notice}"),
+            _ => line,
         }
     }
 
@@ -328,6 +339,44 @@ mod tests {
         app.apply_property(crate::mpv::REQ_PAUSE, None);
         assert_eq!(app.playback.paused, None);
         assert!(!app.status_line().starts_with("PLAYING"));
+    }
+
+    #[test]
+    fn the_notice_stays_visible_until_an_error_takes_the_line() {
+        // 設定を読み替えた旨は、気づけるようステータス行に出し続ける。
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            notice: Some("TUITUBE_FPS_LIMIT=3O を数値として読めません".to_string()),
+            ..App::default()
+        };
+        assert_eq!(
+            app.status_line(),
+            "1 件  |  TUITUBE_FPS_LIMIT=3O を数値として読めません"
+        );
+
+        // 検索中でも消えない。
+        app.searching = true;
+        assert!(app.status_line().starts_with("検索中..."));
+        assert!(app.status_line().ends_with("読めません"));
+
+        // 再生中も再生状況の後ろに続く。
+        app.searching = false;
+        app.mode = Mode::Playing;
+        assert!(app.status_line().starts_with("状態不明"));
+        assert!(app.status_line().ends_with("読めません"));
+
+        // エラーが出ている行には足さない。
+        app.error = Some("boom".to_string());
+        assert!(app.status_line().ends_with("エラー: boom"));
+    }
+
+    #[test]
+    fn the_default_fps_limit_is_the_one_the_mpv_module_defines() {
+        assert_eq!(
+            App::default().fps_limit,
+            Some(crate::mpv::DEFAULT_FPS_LIMIT)
+        );
     }
 
     #[test]

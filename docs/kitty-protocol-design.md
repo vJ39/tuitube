@@ -100,7 +100,21 @@ mpv に渡すピクセル窓 = 映像領域のセル数 × セル 1 個のピク
 | 1080×600(120×30 セル × 9×20 px) | 1.94 MB | 2.59 MB | 77.8 MB/s |
 | 1920×1080 | 6.22 MB | 8.29 MB | 249 MB/s |
 
-初期値は `MAX_FRAME_PIXELS = 640 * 360`(230,400)とし、実機で入力遅延・フレーム落ち・CPU を見て調整する。追加の抑制手段(必要になったときの候補、v1 では使わない): `--vo-kitty-use-shm=yes`(共有メモリ転送、端末側 `t=s` 対応が必要)、`--vf=fps=30`(高フレームレート動画の間引き)、`--profile=sw-fast`(man page 推奨のスケーラ軽量化)。
+初期値は `MAX_FRAME_PIXELS = 640 * 360`(230,400)とし、実機で入力遅延・フレーム落ち・CPU を見て調整する。フレーム数側の抑制は fps 上限(§3-7)で行う。使わない手段: `--vo-kitty-use-shm=yes`(§6)。まだ使っていない候補: `--profile=sw-fast`(man page 推奨のスケーラ軽量化)。
+
+### 2-4. fps 上限
+
+kitty 出力は 1 フレームごとに画素を CPU で作るため、60fps のソースをそのまま流すと再生が重い(実測 CPU 122%)。上限を 15fps にすると 40% まで下がる。上限は環境変数 `TUITUBE_FPS_LIMIT` で変えられる。
+
+| 指定 | 動き |
+|---|---|
+| 未設定・空 | 既定の 15fps |
+| `1`〜`120` | その値 |
+| `0` / `unlimited` | 制限しない |
+| 120 超 | 120 に丸めてステータス行に表示 |
+| 数値として読めない値 | 15fps に倒してステータス行に表示 |
+
+上限を超える値を丸めるのは、桁を打ち間違えた値(`TUITUBE_FPS_LIMIT=4294967295` 等)を mpv に渡すと、複製フレームが際限なく出て端末とパイプが飽和するため(実測: 0.5 秒の動画が 120 秒たっても終わらない)。読み替えた場合にステータス行へ出すのは、黙って倒すと「設定したのに効かない」理由に気づけないため。
 
 ## 3. アーキテクチャ
 
@@ -254,9 +268,21 @@ mpv --input-ipc-server=<sock> --log-file=<log> --no-terminal
 | `--vo-kitty-left/top` | 1 | mpv の位置決めを無効化する。HVP は常に `ESC[1;1f` になり読み捨てる |
 | `--vo-kitty-alt-screen=no` | — | `?1049h/l` はパイプ内で捨てられるので正しさには無関係だが、不要な列を減らす |
 | `--vo-kitty-config-clear=no` | — | `2J` を出させない(同上) |
-| `--vo-kitty-use-shm` / `--vo-kitty-auto-multiplexer-passthrough` | 既定(no) | shm は端末対応が要る。multiplexer passthrough は APC を DCS で包むためパーサ非対応(§6) |
+| `--vo-kitty-use-shm` / `--vo-kitty-auto-multiplexer-passthrough` | 既定(no) | shm は tuitube の再送出と噛み合わない(§6)。multiplexer passthrough は APC を DCS で包むためパーサ非対応(§6) |
+
+`--vf` は渡さない。fps 上限は再生開始後に IPC で足す(§3-7)。
 
 再生中の寸法変更(IPC): `set_property vo-kitty-cols` → `rows` → `width` → `height` → `set_property vid no` → `set_property vid auto`。tct 方式の `resize_video()` と同じ骨格で、プロパティ名と本数だけ変わる。
+
+### 3-7. fps 上限の適用
+
+lavfi の `fps` フィルタは上限ではなく定レート変換で、指定値より遅いソースではフレームを複製する(実測: 2fps のソースを 2 秒再生して 5 フレーム → `fps=15` で 25 フレーム)。起動引数で一律に付けると、低 fps のソースで kitty 描画とパイプ転送が増えて目的と逆に働くため、ソースの fps が分かってから判断する。
+
+1. ティッカーの `poll_properties()` が `container-fps` も問い合わせる(判定が済むまで毎秒)。
+2. 値が返ったら `MpvController::limit_fps()` が 1 回だけ判定する。`container-fps > 上限` のときだけコマンド `["vf", "add", "fps=<上限>"]` を送る。
+3. 読み込み前は値が返らないので、取れないうちは次のポーリングに任せる。上限なし(`FpsLimit::limit == None`)のときは問い合わせ自体をしない。
+
+`--vf=` ではなく `vf add` を使うのは、フィルタチェーンの置換だと利用者の `~/.config/mpv/mpv.conf` の `vf` 設定を丸ごと消すため(tuitube は `--no-config` を渡していない)。追加したフィルタは寸法変更の `vid no` → `vid auto` を跨いで残る(実測)。
 
 ### 3-5. ANSI ストリーム処理規則
 
@@ -389,7 +415,10 @@ fn frame(s: u32, v: u32, data: &[u8]) -> Vec<u8>;
 - tmux / GNU screen 内では動かない(APC を DCS で包む passthrough が必要。パーサは DCS を読み飛ばす)。
 - Kitty graphics protocol 非対応端末では映像領域が空白のまま(エラーは出ない。`q=2` で端末も何も返さない)。検出して案内する機能は対象外。
 - `c=`/`r=`(端末側スケーリング)に対応しない端末では拡大が効かず、`MAX_FRAME_PIXELS` で縮めたぶんだけ映像が領域より小さく中央寄せで出る。等倍で領域に収まらないフレームは `placement()` が捨てるので、ステータス行・ヘルプ行には被らない。
-- 共有メモリ転送(`--vo-kitty-use-shm`)、画像 ID / placement ID による差分更新は対象外。
+- 共有メモリ転送(`--vo-kitty-use-shm`)は使えない。mpv 0.41.0 で実測した理由は 2 つ。
+  - shm の 1 フレームは `m=1` の APC 1 個だけで、終端の `m=0` チャンクが来ない。`FrameAssembler` は組み立てを終えられず、映像領域は黒のまま音声だけになる。
+  - 共有メモリオブジェクトの名前が VO 1 インスタンスにつき固定(`/mpv-kitty-%p`)で、mpv は毎フレーム同じオブジェクトを開き直して上書きする。tuitube は mpv の stdout を読んでから実端末へ書く非同期経路なので、端末が読む時点の中身が送出したエスケープの指すフレームとは限らない(ティアリング・1 枚ズレ)。名前に世代が無いため対応付ける手段もない。
+- 画像 ID / placement ID による差分更新は対象外。
 
 ## 7. 実装順
 

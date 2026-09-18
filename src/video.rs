@@ -430,6 +430,30 @@ mod tests {
     }
 
     #[test]
+    fn mpv_args_do_not_use_shared_memory_transfer() {
+        // t=s のフレームは m=1 の APC 1 個だけで終端の m=0 が来ず、組み立てが完了しない
+        // (mpv 0.41.0 実測)。オブジェクト名も VO ごとに固定で毎フレーム上書きされるため、
+        // stdout を読んでから端末へ送り直す tuitube の経路では中身が入れ替わる。
+        let args = geometry(80, 22).mpv_args();
+        assert!(
+            !args.iter().any(|a| a.starts_with("--vo-kitty-use-shm")),
+            "共有メモリ転送は使えない"
+        );
+    }
+
+    #[test]
+    fn a_shared_memory_frame_never_completes() {
+        // mpv 0.41.0 の --vo-kitty-use-shm=yes が実際に出す列。1 フレーム = m=1 の APC 1 個で、
+        // 終端の m=0 が来ないので組み立ては終わらない。データ部は共有メモリの名前 (毎回同じ)。
+        let sink = VideoSink::new(geometry(80, 22));
+        let shm =
+            b"\x1b[1;1f\x1b_Ga=T,t=s,f=24,s=160,v=160,C=1,q=2,m=1;bXB2LWtpdHR5LTB4MTU4NjEzYjcw\x1b\\";
+        assert!(!sink.feed(shm));
+        assert!(!sink.feed(shm));
+        assert!(sink.take().is_none(), "shm のフレームは完成しない");
+    }
+
+    #[test]
     fn encode_writes_clear_then_cup_then_frame_bytes() {
         let pending = Pending {
             clear: true,

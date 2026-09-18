@@ -123,7 +123,15 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     session.player_nonce += 1;
     let nonce = session.player_nonce;
     let video = VideoSink::new(video_geometry());
-    match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone()).await {
+    match MpvController::launch(
+        &result.url(),
+        nonce,
+        tx.clone(),
+        video.clone(),
+        app.fps_limit,
+    )
+    .await
+    {
         Ok(controller) => {
             app.playback = Playback {
                 title: result.title.clone(),
@@ -139,6 +147,19 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
             app.video = None;
             app.error = Some(e);
         }
+    }
+}
+
+/// ソースの fps が届いたら、上限を超えるときだけ mpv に fps フィルタを足す。
+/// 読み込み前は値が返らないので、取れないうちは次のポーリングに任せる。
+pub async fn apply_fps_limit(app: &mut App, session: &mut Session, source_fps: Option<f64>) {
+    let Some(source_fps) = source_fps.filter(|fps| fps.is_finite() && *fps > 0.0) else {
+        return;
+    };
+    if let Some(p) = session.player.as_mut()
+        && let Err(e) = p.controller.limit_fps(source_fps).await
+    {
+        app.error = Some(e);
     }
 }
 
@@ -288,6 +309,19 @@ mod tests {
             .take()
             .expect("検索タスクが積まれている")
             .abort();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_source_fps_leaves_the_filter_for_the_next_poll() {
+        // container-fps は読み込み前だと返らない。値が無いうちは何もしない。
+        let mut app = App::default();
+        let mut session = Session::default();
+        apply_fps_limit(&mut app, &mut session, None).await;
+        apply_fps_limit(&mut app, &mut session, Some(f64::NAN)).await;
+        apply_fps_limit(&mut app, &mut session, Some(0.0)).await;
+        // 再生していなければ送り先も無い。
+        apply_fps_limit(&mut app, &mut session, Some(30.0)).await;
+        assert!(app.error.is_none());
     }
 
     #[tokio::test]
