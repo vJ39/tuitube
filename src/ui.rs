@@ -1,4 +1,5 @@
 use crate::app::{App, Mode, format_time};
+use crate::comments;
 use crate::display::DisplayMode;
 use crate::geometry::cell_size;
 use crate::grid::{self, LayoutMode};
@@ -44,6 +45,11 @@ pub fn status_area(area: Rect) -> Rect {
 /// 操作説明の行。
 pub fn help_area(area: Rect) -> Rect {
     playing_areas(area)[3]
+}
+
+/// コメント一覧の枠の内側。描画と送り幅が同じ寸法を数える。
+pub fn comments_viewport(screen: Rect) -> Rect {
+    comments_block().inner(video_area(screen))
 }
 
 /// 描画とヒットテストが共有する割り付け。
@@ -354,18 +360,46 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_playing(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let video = video_area(area);
-    match app.display {
-        DisplayMode::Window => draw_window_placeholder(frame, video, app.display),
-        DisplayMode::Text => {
-            if let Some(sink) = &app.video {
-                sink.render_text(video, frame.buffer_mut());
+    if app.comments.visible() {
+        draw_comments(frame, video, app);
+    } else {
+        match app.display {
+            DisplayMode::Window => draw_window_placeholder(frame, video, app.display),
+            DisplayMode::Text => {
+                if let Some(sink) = &app.video {
+                    sink.render_text(video, frame.buffer_mut());
+                }
             }
+            // 埋め込みの画像は draw の後にメインループが APC で重ねる。
+            DisplayMode::Embedded => {}
         }
-        // 埋め込みの画像は draw の後にメインループが APC で重ねる。
-        DisplayMode::Embedded => {}
     }
     draw_seek_bar(frame, app, area);
     draw_footer(frame, app, status_area(area), help_area(area));
+}
+
+fn comments_block() -> Block<'static> {
+    Block::default().borders(Borders::ALL).title(" コメント ")
+}
+
+/// コメント表示中は映像の代わりに一覧を出す。映像フレームの送出は present_video が止める。
+/// 上限 50 件は 1 画面に入らないので、↑↓ の送り幅ぶんだけずらして描く。
+fn draw_comments(frame: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 {
+        return;
+    }
+    let block = comments_block();
+    let inner = block.inner(area);
+    let height = inner.height as usize;
+    let lines = comments::display_lines(app.comments.state(), inner.width as usize);
+    let offset = app.comments.scroll(lines.len(), height);
+    let items: Vec<ListItem> = lines
+        .into_iter()
+        .skip(offset)
+        .take(height)
+        .map(ListItem::new)
+        .collect();
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 /// 別ウィンドウ中は映像が来ないので、どこで再生しているかを映像領域に出す。
@@ -422,8 +456,13 @@ fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
         status,
     );
     frame.render_widget(
-        Paragraph::new(help_text(app.mode, app.display, help.width))
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(help_text(
+            app.mode,
+            app.display,
+            app.comments.visible(),
+            help.width,
+        ))
+        .style(Style::default().fg(Color::DarkGray)),
         help,
     );
 }
@@ -444,11 +483,11 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
         .min(input_area.right().saturating_sub(2))
 }
 
-fn help_text(mode: Mode, display: DisplayMode, width: u16) -> String {
+fn help_text(mode: Mode, display: DisplayMode, comments_open: bool, width: u16) -> String {
     let hints = match mode {
         Mode::Input => input_hints(),
         Mode::Results => results_hints(),
-        Mode::Playing => playing_hints(display),
+        Mode::Playing => playing_hints(display, comments_open),
         Mode::Settings => settings_hints(),
     };
     fit_hints(&hints, width as usize)
@@ -490,18 +529,25 @@ fn settings_hints() -> Vec<String> {
     ]
 }
 
-/// 再生中の案内。全部で 110 桁ほどあり 80 桁端末には入らないので、
-/// 落ちて困らないものを後ろに置く。先頭 7 つは最も幅を食う w:別ウィンドウでも 75 桁に収まる。
-fn playing_hints(display: DisplayMode) -> Vec<String> {
+/// 再生中の案内。全部で 130 桁ほどあり 80 桁端末には入らないので、
+/// 落ちて困らないものを後ろに置く。先頭 7 つは最も幅を食う w:別ウィンドウとコメント表示中でも
+/// 77 桁に収まる。
+fn playing_hints(display: DisplayMode, comments_open: bool) -> Vec<String> {
     vec![
         "space:一時停止".to_string(),
         "←→:シーク".to_string(),
-        "↑↓:音量".to_string(),
+        // コメント表示中の ↑↓ は一覧送りに使う。
+        if comments_open {
+            "↑↓:行送り".to_string()
+        } else {
+            "↑↓:音量".to_string()
+        },
         "c:URLコピー".to_string(),
         format!("w:{}", display.next().label()),
         "Esc:停止".to_string(),
         "q:終了".to_string(),
         "s:字幕".to_string(),
+        "o:コメント".to_string(),
         "[ ]:速度±0.1".to_string(),
         "BS:等速".to_string(),
         "クリック:シーク".to_string(),
@@ -586,7 +632,7 @@ mod tests {
 
     /// 80 桁端末のヘルプ。案内が落ちるかどうかはここで決まる。
     fn help_80(mode: Mode, display: DisplayMode) -> String {
-        help_text(mode, display, 80)
+        help_text(mode, display, false, 80)
     }
 
     #[test]
@@ -620,7 +666,7 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_speed_keys() {
         // 80 桁では入らないので、広い端末での案内で見る。
-        let help = help_text(Mode::Playing, DisplayMode::Embedded, 200);
+        let help = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
         assert!(help.contains("[ ]"), "{help}");
         assert!(help.contains("BS"), "{help}");
         assert!(help.contains("速度"), "{help}");
@@ -920,18 +966,21 @@ mod tests {
 
     #[test]
     fn playing_help_drops_whole_hints_when_the_terminal_is_narrow() {
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, 200);
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
         assert!(wide.contains("クリック:シーク"), "{wide}");
 
-        let narrow = help_text(Mode::Playing, DisplayMode::Embedded, 30);
+        let narrow = help_text(Mode::Playing, DisplayMode::Embedded, false, 30);
         assert_eq!(narrow, "space:一時停止 ←→:シーク");
-        assert_eq!(help_text(Mode::Playing, DisplayMode::Embedded, 0), "");
+        assert_eq!(
+            help_text(Mode::Playing, DisplayMode::Embedded, false, 0),
+            ""
+        );
     }
 
     #[test]
     fn playing_help_mentions_the_subtitle_key() {
         // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, 200);
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
         assert!(wide.contains("s:字幕"), "{wide}");
         // 幅に入らないぶんは丸ごと落ちる。途中で切れた案内は出さない。
         let narrow = help_80(Mode::Playing, DisplayMode::Text);
@@ -1005,7 +1054,10 @@ mod tests {
         }
         assert!(grid::display_width(&help) <= 80, "{help}");
         // 狭い端末では途中で切らず丸ごと落とす。
-        assert_eq!(help_text(Mode::Settings, DisplayMode::Embedded, 0), "");
+        assert_eq!(
+            help_text(Mode::Settings, DisplayMode::Embedded, false, 0),
+            ""
+        );
     }
 
     #[test]
@@ -1041,10 +1093,124 @@ mod tests {
         assert!(!screen.contains("結果"), "{screen}");
     }
 
+    /// コメントを取り終えた再生画面。
+    fn commented_app(list: Vec<crate::comments::Comment>) -> App {
+        let mut app = App {
+            mode: Mode::Playing,
+            display: DisplayMode::Embedded,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        app.comments.begin("abc".to_string());
+        app.comments.apply("abc", Ok(list));
+        app
+    }
+
+    fn comment(author: &str, text: &str) -> crate::comments::Comment {
+        crate::comments::Comment {
+            author: author.to_string(),
+            text: text.to_string(),
+            like_count: Some(3),
+        }
+    }
+
+    #[test]
+    fn the_comment_list_takes_over_the_video_area() {
+        let mut app = commented_app(vec![comment("alice", "おもしろい")]);
+        app.comments.toggle();
+        let screen = rendered(&app, 80, 24);
+
+        assert!(screen.contains("alice (+3)"), "{screen}");
+        assert!(screen.contains("おもしろい"), "{screen}");
+        // 映像領域を置き換えるだけで、下 3 段はそのまま。
+        assert!(screen.contains("space:一時停止"), "{screen}");
+    }
+
+    #[test]
+    fn a_video_with_comments_disabled_says_so_instead_of_looking_broken() {
+        let mut app = commented_app(Vec::new());
+        app.comments.toggle();
+        assert!(
+            rendered(&app, 80, 24).contains(crate::comments::NO_COMMENTS),
+            "コメント無効の動画はエラーにしない"
+        );
+    }
+
+    #[test]
+    fn the_video_comes_back_when_the_comment_list_is_closed() {
+        let mut app = commented_app(vec![comment("alice", "おもしろい")]);
+        app.display = DisplayMode::Window;
+        app.comments.toggle();
+        assert!(rendered(&app, 80, 24).contains("alice"));
+
+        app.comments.toggle();
+        let screen = rendered(&app, 80, 24);
+        assert!(!screen.contains("alice"), "{screen}");
+        assert!(screen.contains("別ウィンドウで再生中"), "{screen}");
+    }
+
+    #[test]
+    fn playing_help_mentions_the_comment_key() {
+        // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        assert!(wide.contains("o:コメント"), "{wide}");
+    }
+
+    #[test]
+    fn the_arrow_hint_switches_to_the_comment_list_while_it_is_open() {
+        let open = help_text(Mode::Playing, DisplayMode::Embedded, true, 200);
+        assert!(open.contains("↑↓:行送り"), "{open}");
+        assert!(!open.contains("↑↓:音量"), "{open}");
+
+        let closed = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        assert!(closed.contains("↑↓:音量"), "{closed}");
+    }
+
+    /// 1 件 2 行なので、80x24 の枠 (内側 19 行) には 9 件と少ししか入らない。
+    fn many_comments(count: usize) -> App {
+        commented_app(
+            (0..count)
+                .map(|i| comment(&format!("author{i}"), &format!("本文{i}")))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_comment_list_scrolls_to_the_entries_that_do_not_fit() {
+        let mut app = many_comments(comments::COMMENT_LIMIT);
+        app.comments.toggle();
+        let top = rendered(&app, 80, 24);
+        assert!(top.contains("author0"), "{top}");
+        assert!(!top.contains("author20"), "{top}");
+
+        let view = comments_viewport(app.screen);
+        let lines = comments::display_lines(app.comments.state(), view.width as usize).len();
+        app.comments.scroll_by(40, lines, view.height as usize);
+        let scrolled = rendered(&app, 80, 24);
+        assert!(scrolled.contains("author20"), "{scrolled}");
+        assert!(!scrolled.contains("author0 "), "{scrolled}");
+
+        // 最後の 1 件までは送れる。
+        app.comments
+            .scroll_by(lines as isize, lines, view.height as usize);
+        let bottom = rendered(&app, 80, 24);
+        assert!(
+            bottom.contains(&format!("author{}", comments::COMMENT_LIMIT - 1)),
+            "{bottom}"
+        );
+    }
+
+    #[test]
+    fn the_comment_viewport_is_the_inside_of_the_frame() {
+        let screen = Rect::new(0, 0, 80, 24);
+        let view = comments_viewport(screen);
+        assert_eq!(view, Rect::new(1, 1, 78, 19));
+    }
+
     #[test]
     fn playing_help_mentions_the_mouse() {
         // マウスの案内は幅が余ったときだけ出す。
-        assert!(help_text(Mode::Playing, DisplayMode::Embedded, 200).contains("クリック"));
+        assert!(help_text(Mode::Playing, DisplayMode::Embedded, false, 200).contains("クリック"));
         assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
     }
 }

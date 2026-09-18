@@ -1,4 +1,5 @@
 use crate::category::Tabs;
+use crate::comments::{Comment, Comments};
 use crate::cookies::{CookieState, Target};
 use crate::display::{DisplayMode, FpsCap};
 use crate::mpv::MpvCommand;
@@ -69,6 +70,13 @@ pub enum AppEvent {
         notice: Option<String>,
         /// 以後サムネイル取得を止める理由 (curl が無い)。
         disable: Option<String>,
+    },
+    /// コメントの取得が終わった。nonce は再生ごとに進むので、
+    /// 前の動画ぶんが遅れて届いても混ざらない。
+    CommentsReady {
+        nonce: u64,
+        video_id: String,
+        comments: Result<Vec<Comment>, String>,
     },
 }
 
@@ -316,6 +324,8 @@ pub struct App {
     /// 擬似カテゴリタブ。results / selected / scroll はここの写し。
     pub tabs: Tabs,
     pub thumbs: Thumbs,
+    /// 再生中の動画のコメント。取得状態と表示の on/off。
+    pub comments: Comments,
     /// 格子の先頭表示位置 (項目インデックス)。描画のたびに列数で丸める。
     pub scroll: usize,
     /// 設定画面で選んでいる行。SETTINGS_ITEMS の範囲へ丸めて使う。
@@ -355,6 +365,7 @@ impl Default for App {
             should_quit: false,
             tabs: Tabs::default(),
             thumbs: Thumbs::default(),
+            comments: Comments::default(),
             scroll: 0,
             settings_selected: 0,
             settings_return: Mode::Input,

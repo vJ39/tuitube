@@ -175,7 +175,7 @@ fn outcome_of(used_cookies: bool, outcome: CookieOutcome) -> CookieOutcome {
     }
 }
 
-fn launch_error(e: &std::io::Error) -> String {
+pub fn launch_error(e: &std::io::Error) -> String {
     if e.kind() == ErrorKind::NotFound {
         "yt-dlp が見つかりません (PATH を確認してください)".to_string()
     } else {
@@ -184,27 +184,19 @@ fn launch_error(e: &std::io::Error) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixtures {
     use super::*;
-    use crate::cookies::Feed;
     use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    const LINE_FULL: &str =
-        r#"{"id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
-
-    fn source(spec: &str) -> CookieSource {
-        CookieSource::from_spec(Some(spec)).expect("spec")
-    }
-
-    enum Step {
+    pub enum Step {
         Done(std::io::Result<Output>),
         /// 応答が返らない状況 (キーチェーンのダイアログ待ち等)。
         Hang,
     }
 
-    fn done(code: i32, stdout: &str, stderr: &str) -> Step {
+    pub fn done(code: i32, stdout: &str, stderr: &str) -> Step {
         Step::Done(Ok(Output {
             // ExitStatus は生の wait ステータスから作る (下位 8 bit はシグナル用)。
             status: ExitStatusExt::from_raw(code << 8),
@@ -213,21 +205,28 @@ mod tests {
         }))
     }
 
-    #[derive(Default)]
-    struct FakeYtDlp {
-        script: Mutex<VecDeque<Step>>,
-        calls: Mutex<Vec<Vec<String>>>,
+    /// yt-dlp そのものが PATH に無い。
+    pub fn missing() -> Step {
+        Step::Done(Err(std::io::Error::from(ErrorKind::NotFound)))
+    }
+
+    /// 起動せず台本どおりに振る舞う yt-dlp。呼ばれた引数を溜める。
+    /// 溜め込み先を Arc で持つのは、spawn したタスクへ渡した後も呼び出しを読むため。
+    #[derive(Clone, Default)]
+    pub struct FakeYtDlp {
+        script: Arc<Mutex<VecDeque<Step>>>,
+        calls: Arc<Mutex<Vec<Vec<String>>>>,
     }
 
     impl FakeYtDlp {
-        fn new(steps: impl IntoIterator<Item = Step>) -> Self {
+        pub fn new(steps: impl IntoIterator<Item = Step>) -> Self {
             Self {
-                script: Mutex::new(steps.into_iter().collect()),
-                calls: Mutex::new(Vec::new()),
+                script: Arc::new(Mutex::new(steps.into_iter().collect())),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
-        fn calls(&self) -> Vec<Vec<String>> {
+        pub fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().expect("lock").clone()
         }
     }
@@ -244,6 +243,20 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cookies::Feed;
+    use crate::search::fixtures::{FakeYtDlp, Step, done};
+
+    const LINE_FULL: &str =
+        r#"{"id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
+
+    fn source(spec: &str) -> CookieSource {
+        CookieSource::from_spec(Some(spec)).expect("spec")
     }
 
     fn has_cookie_flag(args: &[String]) -> bool {

@@ -2,6 +2,7 @@
 
 use crate::app::{App, AppEvent, Mode, Playback, SETTINGS_ITEMS};
 use crate::clipboard::{Clipboard, MISSING_PBCOPY};
+use crate::comments;
 use crate::cookies::Target;
 use crate::display::{self, DisplayMode, LaunchPlan};
 use crate::fetch::{Fetcher, RealCurl};
@@ -70,6 +71,10 @@ pub struct Session {
     pub search_task: Option<JoinHandle<()>>,
     /// サムネイルの取得・デコード。nonce は search_nonce を共用する。
     pub thumbs_task: Option<JoinHandle<()>>,
+    /// 再生中の動画のコメント取得。
+    pub comments_task: Option<JoinHandle<()>>,
+    /// 再生ごとに進む世代。前の動画のコメントが遅れて届いても混ざらない。
+    pub comments_nonce: u64,
     /// 直近の端末サイズと、それを映像へ反映する時刻。
     pub pending_resize: Option<(u16, u16)>,
     pub resize_at: Option<Instant>,
@@ -147,6 +152,8 @@ pub async fn seek_absolute(
 
 pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<String>) {
     stop_playback(session).await;
+    cancel_comments(session);
+    app.comments.end();
     app.playback = Playback::default();
     app.seek_bar = SeekBarState::default();
     app.video = None;
@@ -359,6 +366,78 @@ pub fn start_thumbnails_with<F>(
     }));
 }
 
+pub fn start_comments(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    video_id: String,
+    url: String,
+) {
+    start_comments_with(app, tx, session, video_id, url, RealYtDlp);
+}
+
+/// 再生中の動画のコメントを背景で取る。再生はブロックしない。
+/// yt-dlp の実行者を差し替えられる形。テストはここに偽物を渡して外部プロセスへ届かせない。
+pub fn start_comments_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    video_id: String,
+    url: String,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    cancel_comments(session);
+    let nonce = session.comments_nonce;
+    app.comments.begin(video_id.clone());
+    let tx = tx.clone();
+    session.comments_task = Some(tokio::spawn(async move {
+        let comments = comments::fetch_comments(&runner, &url).await;
+        let _ = tx.send(AppEvent::CommentsReady {
+            nonce,
+            video_id,
+            comments,
+        });
+    }));
+}
+
+/// 先行の取得を打ち切る。nonce を進めるので、送信済みの結果は捨てられる。
+fn cancel_comments(session: &mut Session) {
+    if let Some(task) = session.comments_task.take() {
+        task.abort();
+    }
+    session.comments_nonce += 1;
+}
+
+/// o のコメント表示トグル。貼ってある映像は ratatui の差分描画では消えないので、
+/// 出すときに剥がす (present_video が以後のフレームを止める)。
+pub fn toggle_comments(app: &mut App, session: &mut Session) {
+    if app.comments.toggle() {
+        session.owe_clear = true;
+    }
+}
+
+/// コメント一覧の送り。行数も送れる幅も、描画と同じ枠の内側で数える。
+pub fn scroll_comments(app: &mut App, step: CommentScroll) {
+    let view = ui::comments_viewport(app.screen);
+    let height = view.height as usize;
+    let total = comments::display_lines(app.comments.state(), view.width as usize).len();
+    let delta = match step {
+        CommentScroll::Line(lines) => lines,
+        // 1 画面ぶん。高さ 0 でも止まらないよう最低 1 行は動かす。
+        CommentScroll::Page(pages) => pages * height.max(1) as isize,
+    };
+    app.comments.scroll_by(delta, total, height);
+}
+
+/// コメント一覧の送り幅。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentScroll {
+    Line(isize),
+    Page(isize),
+}
+
 /// 先行の検索を打ち切る。nonce を進めるので、届いてしまった結果は捨てられる
 /// (kill_on_drop で子プロセスも落ちる)。
 fn cancel_search(app: &mut App, session: &mut Session) {
@@ -419,11 +498,12 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     let url = result.url();
     match MpvController::launch(&url, nonce, tx.clone(), video.clone(), &plan).await {
         Ok(controller) => {
-            enter_playback(app, session, result.title.clone(), url, video);
+            enter_playback(app, session, result.title.clone(), url.clone(), video);
             session.player = Some(Player {
                 sink: Box::new(controller),
                 nonce,
             });
+            start_comments(app, tx, session, result.id.clone(), url);
         }
         Err(e) => {
             app.video = None;
@@ -682,11 +762,13 @@ pub async fn stop_playback(session: &mut Session) {
 mod tests {
     use super::*;
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
+    use crate::comments::CommentState;
     use crate::cookies::{CookieSource, CookieState};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::rgb::RgbImage;
     use crate::search::SearchResult;
+    use crate::search::fixtures::{FakeYtDlp, Step, done};
     use crate::settings::{DisplaySettings, Settings};
     use crate::speed::Speed;
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
@@ -2403,5 +2485,187 @@ mod tests {
         save_settings_to(&mut app, None, t0);
         app.expire_error(t0 + crate::app::NOTICE_TTL);
         assert!(app.error.is_none());
+    }
+
+    const COMMENTS_JSON: &str = r#"{"id":"abc","comments":[{"author":"alice","text":"first"}]}"#;
+
+    /// CommentsReady を 1 件受け取る。届かなければ None。
+    async fn next_comments(
+        rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        session: &mut Session,
+    ) -> Option<AppEvent> {
+        let task = session.comments_task.take()?;
+        task.await.expect("タスクは panic しない");
+        rx.try_recv().ok()
+    }
+
+    #[tokio::test]
+    async fn start_comments_fetches_for_the_video_that_just_started() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        let runner = FakeYtDlp::new([done(0, COMMENTS_JSON, "")]);
+        start_comments_with(
+            &mut app,
+            &tx,
+            &mut session,
+            "abc".to_string(),
+            "https://www.youtube.com/watch?v=abc".to_string(),
+            runner.clone(),
+        );
+
+        assert_eq!(app.comments.state(), Some(&CommentState::Pending));
+        let event = next_comments(&mut rx, &mut session).await.expect("届く");
+        let AppEvent::CommentsReady {
+            nonce,
+            video_id,
+            comments,
+        } = event
+        else {
+            panic!("CommentsReady のはず");
+        };
+        assert_eq!(nonce, session.comments_nonce);
+        assert_eq!(video_id, "abc");
+        assert_eq!(comments.expect("取れる").len(), 1);
+        assert_eq!(
+            runner.calls()[0][0],
+            "https://www.youtube.com/watch?v=abc",
+            "再生中の URL を渡す"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_the_next_video_abandons_the_previous_fetch() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        start_comments_with(
+            &mut app,
+            &tx,
+            &mut session,
+            "old".to_string(),
+            "u1".to_string(),
+            FakeYtDlp::new([Step::Hang]),
+        );
+        let first = session.comments_nonce;
+        start_comments_with(
+            &mut app,
+            &tx,
+            &mut session,
+            "new".to_string(),
+            "u2".to_string(),
+            FakeYtDlp::new([Step::Hang]),
+        );
+
+        // 世代が変わるので、先に出した取得が返っても新しい再生には混ざらない。
+        assert_ne!(session.comments_nonce, first);
+        app.comments.apply("old", Ok(Vec::new()));
+        assert_eq!(app.comments.state(), Some(&CommentState::Pending));
+    }
+
+    #[tokio::test]
+    async fn opening_comments_peels_the_embedded_image_off() {
+        let mut app = App::default();
+        let mut session = Session::default();
+        toggle_comments(&mut app, &mut session);
+        assert!(app.comments.visible());
+        assert!(session.owe_clear, "貼ってある映像は差分描画では消えない");
+
+        session.owe_clear = false;
+        toggle_comments(&mut app, &mut session);
+        assert!(!app.comments.visible());
+        assert!(!session.owe_clear, "閉じるときは映像が続きを貼る");
+    }
+
+    #[tokio::test]
+    async fn end_playback_drops_the_comment_fetch() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        start_comments_with(
+            &mut app,
+            &tx,
+            &mut session,
+            "abc".to_string(),
+            "u".to_string(),
+            FakeYtDlp::new([Step::Hang]),
+        );
+        let nonce = session.comments_nonce;
+        end_playback(&mut app, &mut session, None).await;
+
+        assert!(session.comments_task.is_none());
+        assert_eq!(app.comments.state(), None);
+        assert!(!app.comments.visible());
+        assert_ne!(
+            session.comments_nonce, nonce,
+            "打ち切った世代の結果は nonce でも弾く"
+        );
+    }
+
+    /// コメント表示中の 80x24。映像領域の枠の内側は 78x19。
+    fn commented_app() -> App {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        app.comments.begin("abc".to_string());
+        let list = (0..comments::COMMENT_LIMIT)
+            .map(|i| comments::Comment {
+                author: format!("author{i}"),
+                text: format!("本文{i}"),
+                like_count: None,
+            })
+            .collect();
+        app.comments.apply("abc", Ok(list));
+        app.comments.toggle();
+        app
+    }
+
+    #[test]
+    fn scrolling_moves_by_a_line_and_by_a_screen() {
+        let mut app = commented_app();
+        let lines = 2 * comments::COMMENT_LIMIT;
+        let height = 19;
+
+        scroll_comments(&mut app, CommentScroll::Line(1));
+        assert_eq!(app.comments.scroll(lines, height), 1);
+        scroll_comments(&mut app, CommentScroll::Page(1));
+        assert_eq!(app.comments.scroll(lines, height), 1 + height);
+        scroll_comments(&mut app, CommentScroll::Page(-1));
+        assert_eq!(app.comments.scroll(lines, height), 1);
+        scroll_comments(&mut app, CommentScroll::Line(-1));
+        assert_eq!(app.comments.scroll(lines, height), 0);
+    }
+
+    #[test]
+    fn scrolling_stops_at_the_last_screen_of_the_list() {
+        let mut app = commented_app();
+        let lines = 2 * comments::COMMENT_LIMIT;
+        let height = 19;
+
+        for _ in 0..20 {
+            scroll_comments(&mut app, CommentScroll::Page(1));
+        }
+        assert_eq!(
+            app.comments.scroll(lines, height),
+            lines - height,
+            "最後の画面から先へは送らない"
+        );
+        scroll_comments(&mut app, CommentScroll::Line(-1));
+        assert_eq!(app.comments.scroll(lines, height), lines - height - 1);
+    }
+
+    #[test]
+    fn scrolling_a_list_that_fits_stays_at_the_top() {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        app.comments.begin("abc".to_string());
+        app.comments.apply("abc", Ok(Vec::new()));
+        app.comments.toggle();
+
+        scroll_comments(&mut app, CommentScroll::Page(1));
+        assert_eq!(app.comments.scroll(1, 19), 0);
     }
 }

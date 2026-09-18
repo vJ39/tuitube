@@ -1,10 +1,11 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    SEEK_STEP_SECS, Session, adjust_settings_value, change_speed, close_settings, copy_url_with,
-    cycle_display_mode, move_selection, move_settings_selection, open_settings, reload_tab,
-    reset_speed, save_settings, seek_absolute, seek_relative, send_to_player, start_playback,
-    start_search, stop_playback, switch_tab, toggle_subtitles,
+    CommentScroll, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed, close_settings,
+    copy_url_with, cycle_display_mode, move_selection, move_settings_selection, open_settings,
+    reload_tab, reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative,
+    send_to_player, start_playback, start_search, stop_playback, switch_tab, toggle_comments,
+    toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -143,6 +144,13 @@ async fn handle_key_playing_with<C: Clipboard>(
     session: &mut Session,
     clipboard: C,
 ) {
+    // コメントを読んでいる間の ↑↓ は一覧送り。音量は閉じてから。
+    if app.comments.visible()
+        && let Some(step) = comment_scroll_step(key.code)
+    {
+        scroll_comments(app, step);
+        return;
+    }
     if let Some(delta) = seek_step(key.code) {
         seek_relative(app, session, delta, std::time::Instant::now()).await;
     }
@@ -164,6 +172,9 @@ async fn handle_key_playing_with<C: Clipboard>(
     }
     if key.code == KeyCode::Char('s') {
         toggle_subtitles(app, session, std::time::Instant::now()).await;
+    }
+    if key.code == KeyCode::Char('o') {
+        toggle_comments(app, session);
     }
     if key.code == KeyCode::Char('q') {
         app.should_quit = true;
@@ -212,6 +223,17 @@ fn seek_step(code: KeyCode) -> Option<f64> {
     match code {
         KeyCode::Left => Some(-SEEK_STEP_SECS),
         KeyCode::Right => Some(SEEK_STEP_SECS),
+        _ => None,
+    }
+}
+
+/// コメント表示中の送り幅。上限 50 件は 1 画面に入らないので、行送りと画面送りを用意する。
+fn comment_scroll_step(code: KeyCode) -> Option<CommentScroll> {
+    match code {
+        KeyCode::Up => Some(CommentScroll::Line(-1)),
+        KeyCode::Down => Some(CommentScroll::Line(1)),
+        KeyCode::PageUp => Some(CommentScroll::Page(-1)),
+        KeyCode::PageDown => Some(CommentScroll::Page(1)),
         _ => None,
     }
 }
@@ -311,6 +333,97 @@ mod tests {
         let results: Vec<SearchResult> = (0..count).map(|i| result(&format!("id{i}"))).collect();
         app.set_results(results, &crate::cookies::Target::Search("q".to_string()));
         app
+    }
+
+    #[tokio::test]
+    async fn o_toggles_the_comment_list_while_playing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playing_app();
+
+        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
+        assert!(app.comments.visible());
+        assert!(session.owe_clear, "貼ってある映像を剥がす");
+
+        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
+        assert!(!app.comments.visible());
+    }
+
+    /// 上限まで取れた再生画面。1 件 2 行なので 80x24 の枠 (内側 19 行) には収まらない。
+    fn commented_app() -> App {
+        let mut app = playing_app();
+        app.comments.begin("abc".to_string());
+        let list = (0..crate::comments::COMMENT_LIMIT)
+            .map(|i| crate::comments::Comment {
+                author: format!("author{i}"),
+                text: format!("本文{i}"),
+                like_count: None,
+            })
+            .collect();
+        app.comments.apply("abc", Ok(list));
+        app
+    }
+
+    #[tokio::test]
+    async fn the_arrows_scroll_the_comment_list_while_it_is_open() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = commented_app();
+        // 50 件 = 100 行を 19 行の枠で見る。
+        let lines = 2 * crate::comments::COMMENT_LIMIT;
+        let height = 19;
+
+        // 閉じている間の ↑↓ は音量のままで、一覧は動かない。
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.comments.scroll(lines, height), 0);
+
+        app.comments.toggle();
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.comments.scroll(lines, height), 1);
+        handle_key(&mut app, key(KeyCode::PageDown), &tx, &mut session).await;
+        assert_eq!(app.comments.scroll(lines, height), 1 + height);
+        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        assert_eq!(app.comments.scroll(lines, height), height);
+        handle_key(&mut app, key(KeyCode::PageUp), &tx, &mut session).await;
+        assert_eq!(app.comments.scroll(lines, height), 0);
+    }
+
+    #[tokio::test]
+    async fn scrolling_does_not_take_over_the_other_playback_keys() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = commented_app();
+        app.comments.toggle();
+
+        // ←→ のシークも o の開閉もそのまま効く。
+        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
+        assert_eq!(app.playback.time_pos, Some(SEEK_STEP_SECS));
+        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
+        assert!(!app.comments.visible());
+    }
+
+    #[tokio::test]
+    async fn o_is_not_a_comment_key_outside_playback() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        let mut app = grid_app(1);
+        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
+        assert!(!app.comments.visible());
+        assert!(!take_search(&mut session));
+
+        // 入力欄では検索語の 1 文字。
+        let mut app = App::default();
+        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
+        assert_eq!(app.query, "o");
+        assert!(!app.comments.visible());
+
+        let mut app = App {
+            mode: Mode::Settings,
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
+        assert!(!app.comments.visible());
     }
 
     #[test]

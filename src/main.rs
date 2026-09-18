@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod category;
 mod clipboard;
+mod comments;
 mod cookies;
 mod display;
 mod fetch;
@@ -140,9 +141,13 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             break;
         }
     }
-    for task in [session.search_task.take(), session.thumbs_task.take()]
-        .into_iter()
-        .flatten()
+    for task in [
+        session.search_task.take(),
+        session.thumbs_task.take(),
+        session.comments_task.take(),
+    ]
+    .into_iter()
+    .flatten()
     {
         task.abort();
     }
@@ -163,11 +168,16 @@ fn present_video(
     area: Rect,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    let mut pending = app
-        .video
-        .as_ref()
-        .and_then(VideoSink::take)
-        .unwrap_or_default();
+    // コメントを出している間は映像領域を一覧が占めるので、フレームを取り出さない。
+    // 取り出して捨てると sink からも消えて、閉じたときに貼り直すものが無くなる。
+    let mut pending = if app.comments.visible() {
+        video::Pending::default()
+    } else {
+        app.video
+            .as_ref()
+            .and_then(VideoSink::take)
+            .unwrap_or_default()
+    };
     if std::mem::take(&mut session.owe_clear) {
         pending.clear = true;
     }
@@ -342,6 +352,17 @@ async fn handle_event(
                 app.set_notice(Some(reason));
             }
             app.thumbs.apply(images, target_px);
+        }
+        AppEvent::CommentsReady {
+            nonce,
+            video_id,
+            comments,
+        } => {
+            if nonce != session.comments_nonce {
+                return;
+            }
+            session.comments_task = None;
+            app.comments.apply(&video_id, comments);
         }
     }
 }
@@ -1083,6 +1104,142 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert!(images[0].1.is_ok(), "キャッシュから読めている");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn comment(text: &str) -> crate::comments::Comment {
+        crate::comments::Comment {
+            author: "alice".to_string(),
+            text: text.to_string(),
+            like_count: None,
+        }
+    }
+
+    /// コメント取得中の再生画面。
+    fn commenting_app() -> App {
+        let mut app = App {
+            mode: Mode::Playing,
+            ..App::default()
+        };
+        app.comments.begin("abc".to_string());
+        app
+    }
+
+    #[tokio::test]
+    async fn comments_ready_is_taken_in_for_the_video_that_is_playing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            comments_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = commenting_app();
+        handle_event(
+            &mut app,
+            AppEvent::CommentsReady {
+                nonce: 1,
+                video_id: "abc".to_string(),
+                comments: Ok(vec![comment("first")]),
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(
+            app.comments.state(),
+            Some(&comments::CommentState::Ready(vec![comment("first")]))
+        );
+        assert!(session.comments_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn comments_from_a_superseded_playback_are_discarded() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            comments_nonce: 2,
+            ..Session::default()
+        };
+        let mut app = commenting_app();
+        handle_event(
+            &mut app,
+            AppEvent::CommentsReady {
+                nonce: 1,
+                video_id: "abc".to_string(),
+                comments: Ok(vec![comment("古い")]),
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(
+            app.comments.state(),
+            Some(&comments::CommentState::Pending),
+            "前の再生ぶんは捨てる"
+        );
+    }
+
+    #[test]
+    fn present_stops_the_video_while_the_comments_are_open() {
+        let video = sink();
+        assert!(video.feed(KITTY_RECONFIG));
+        assert!(video.feed(&frame(320, 176, b"DATA")));
+        let mut app = App {
+            video: Some(video),
+            ..App::default()
+        };
+        app.comments.toggle();
+        // コメントを出した側が予約した削除は書く。貼ってある映像を残さない。
+        let mut session = Session {
+            owe_clear: true,
+            ..Session::default()
+        };
+
+        let out = present(&mut session, &app);
+        assert_eq!(out, clear_bytes(), "削除だけで、フレームは書かない");
+    }
+
+    #[test]
+    fn present_resumes_the_video_once_the_comments_are_closed() {
+        let video = sink();
+        assert!(video.feed(KITTY_RECONFIG));
+        assert!(video.feed(&frame(320, 176, b"DATA")));
+        let mut app = App {
+            video: Some(video),
+            ..App::default()
+        };
+        app.comments.toggle();
+        app.comments.toggle();
+        let mut session = Session::default();
+
+        assert!(!present(&mut session, &app).is_empty());
+    }
+
+    #[test]
+    fn a_frame_that_arrives_while_the_comments_are_open_is_kept_for_when_they_close() {
+        let video = sink();
+        let mut app = App {
+            video: Some(video.clone()),
+            ..App::default()
+        };
+        app.comments.toggle();
+        let mut session = Session {
+            owe_clear: true,
+            ..Session::default()
+        };
+        assert!(video.feed(KITTY_RECONFIG));
+        assert!(video.feed(&frame(320, 176, b"DATA")));
+
+        assert_eq!(
+            present(&mut session, &app),
+            clear_bytes(),
+            "表示中は削除だけ書く"
+        );
+
+        app.comments.toggle();
+        assert!(
+            !present(&mut session, &app).is_empty(),
+            "閉じたら保留していたフレームを貼り直す"
+        );
     }
 
     #[test]
