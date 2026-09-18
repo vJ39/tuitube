@@ -72,9 +72,9 @@ impl YtDlp for RealYtDlp {
     }
 }
 
-pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>) -> Vec<String> {
+pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>, limit: usize) -> Vec<String> {
     let mut args = vec![
-        target.yt_dlp_url(),
+        target.yt_dlp_url(limit),
         "--flat-playlist".to_string(),
         "--dump-json".to_string(),
     ];
@@ -105,11 +105,12 @@ pub async fn run_search(
     runner: &impl YtDlp,
     target: &Target,
     cookies: Option<&CookieSource>,
+    limit: usize,
 ) -> SearchReport {
-    let first = attempt(runner, target, cookies).await;
+    let first = attempt(runner, target, cookies, limit).await;
     // 読めないときは検索そのものが実行されないので、同じ target を cookie 無しで出し直す。
     if let CookieOutcome::Unreadable(_) = &first.outcome {
-        let retry = attempt(runner, target, None).await;
+        let retry = attempt(runner, target, None, limit).await;
         return SearchReport {
             results: retry.results,
             outcome: first.outcome,
@@ -123,9 +124,15 @@ pub async fn run_search(
     }
 }
 
-async fn attempt(runner: &impl YtDlp, target: &Target, cookies: Option<&CookieSource>) -> Attempt {
+async fn attempt(
+    runner: &impl YtDlp,
+    target: &Target,
+    cookies: Option<&CookieSource>,
+    limit: usize,
+) -> Attempt {
     let used_cookies = cookies.is_some();
-    let output = match timeout(YT_DLP_TIMEOUT, runner.run(yt_dlp_args(target, cookies))).await {
+    let args = yt_dlp_args(target, cookies, limit);
+    let output = match timeout(YT_DLP_TIMEOUT, runner.run(args)).await {
         Err(_) => {
             return Attempt {
                 results: Err(format!(
@@ -317,7 +324,7 @@ mod tests {
     #[test]
     fn yt_dlp_args_without_cookies_match_the_current_command() {
         assert_eq!(
-            yt_dlp_args(&Target::Search("q".to_string()), None),
+            yt_dlp_args(&Target::Search("q".to_string()), None, 10),
             ["ytsearch10:q", "--flat-playlist", "--dump-json"]
         );
     }
@@ -327,6 +334,7 @@ mod tests {
         let args = yt_dlp_args(
             &Target::Search("q".to_string()),
             Some(&source("chrome:P 1")),
+            10,
         );
         assert_eq!(
             args,
@@ -341,8 +349,18 @@ mod tests {
     }
 
     #[test]
+    fn yt_dlp_args_take_the_result_count_from_the_setting() {
+        let args = yt_dlp_args(&Target::Search("q".to_string()), None, 25);
+        assert_eq!(args[0], "ytsearch25:q");
+    }
+
+    #[test]
     fn yt_dlp_args_limit_feeds() {
-        let args = yt_dlp_args(&Target::Feed(Feed::Recommended), Some(&source("chrome")));
+        let args = yt_dlp_args(
+            &Target::Feed(Feed::Recommended),
+            Some(&source("chrome")),
+            10,
+        );
         assert_eq!(
             args,
             [
@@ -356,7 +374,7 @@ mod tests {
             ]
         );
         assert!(
-            !yt_dlp_args(&Target::Search("q".to_string()), None)
+            !yt_dlp_args(&Target::Search("q".to_string()), None, 10)
                 .iter()
                 .any(|a| a == "--playlist-end")
         );
@@ -376,6 +394,7 @@ mod tests {
             &runner,
             &Target::Search("q".to_string()),
             Some(&source("firefox")),
+            10,
         )
         .await;
 
@@ -399,6 +418,7 @@ mod tests {
             &runner,
             &Target::Search("q".to_string()),
             Some(&source("chrome")),
+            10,
         )
         .await;
 
@@ -419,6 +439,7 @@ mod tests {
             &runner,
             &Target::Search("q".to_string()),
             Some(&source("chrome")),
+            10,
         )
         .await;
 
@@ -439,6 +460,7 @@ mod tests {
             &runner,
             &Target::Feed(Feed::History),
             Some(&source("safari")),
+            10,
         )
         .await;
 
@@ -454,7 +476,7 @@ mod tests {
             "",
             "ERROR: could not find chrome cookies database in '/x'",
         )]);
-        let report = run_search(&runner, &Target::Search("q".to_string()), None).await;
+        let report = run_search(&runner, &Target::Search("q".to_string()), None, 10).await;
 
         // cookie を渡していない実行の stderr は cookie の判定材料にしない。
         assert_eq!(runner.calls().len(), 1);
@@ -469,6 +491,7 @@ mod tests {
             &runner,
             &Target::Search("q".to_string()),
             Some(&source("chrome")),
+            10,
         )
         .await;
 

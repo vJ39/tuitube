@@ -12,6 +12,8 @@ serde_json = "1"
 toml = "1"
 anyhow = "1"
 vt100 = "0.15"
+zune-jpeg = "0.5.15"
+zune-core = "0.5.3"
 
 [dev-dependencies]
 # start_paused = true でプロセス kill の猶予待ちを実時間で待たないため。

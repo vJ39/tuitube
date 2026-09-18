@@ -1,10 +1,12 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    SEEK_STEP_SECS, Session, change_speed, cycle_display_mode, reset_speed, seek_absolute,
-    seek_relative, send_to_player, start_playback, start_search, stop_playback,
+    SEEK_STEP_SECS, Session, change_speed, cycle_display_mode, move_selection, reload_tab,
+    reset_speed, seek_absolute, seek_relative, send_to_player, start_playback, start_search,
+    stop_playback, switch_tab,
 };
 use crate::app::{App, AppEvent, Mode};
+use crate::grid::Dir;
 use crate::mpv::{self, MpvCommand};
 use crate::seekbar::{MouseAction, MouseInput};
 use crate::ui;
@@ -38,6 +40,8 @@ fn handle_key_input(
 ) {
     match key.code {
         KeyCode::Enter => start_search(app, tx, session),
+        KeyCode::Tab => switch_tab(app, tx, session, true),
+        KeyCode::BackTab => switch_tab(app, tx, session, false),
         KeyCode::Backspace => {
             app.query.pop();
         }
@@ -63,8 +67,13 @@ async fn handle_key_results(
     session: &mut Session,
 ) {
     match key.code {
-        KeyCode::Down => app.select_next(),
-        KeyCode::Up => app.select_prev(),
+        KeyCode::Down => move_selection(app, Dir::Down),
+        KeyCode::Up => move_selection(app, Dir::Up),
+        KeyCode::Right => move_selection(app, Dir::Right),
+        KeyCode::Left => move_selection(app, Dir::Left),
+        KeyCode::Tab => switch_tab(app, tx, session, true),
+        KeyCode::BackTab => switch_tab(app, tx, session, false),
+        KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Enter => start_playback(app, tx, session).await,
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
@@ -211,6 +220,30 @@ mod tests {
             duration: None,
             uploader: None,
         }
+    }
+
+    /// 積まれた検索タスクを、外部プロセスへ届く前に捨てる。
+    /// キーの振り分けだけを見るので、実行者の差し替えはアクション側のテストで確かめる。
+    fn take_search(session: &mut Session) -> bool {
+        match session.search_task.take() {
+            Some(task) => {
+                task.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 80x24 の検索画面。格子は 4 列 2 行になる。
+    fn grid_app(count: usize) -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        let results: Vec<SearchResult> = (0..count).map(|i| result(&format!("id{i}"))).collect();
+        app.set_results(results, &crate::cookies::Target::Search("q".to_string()));
+        app
     }
 
     #[test]
@@ -556,5 +589,130 @@ mod tests {
         handle_key(&mut app, ctrl_c, &tx, &mut session).await;
 
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn tab_switches_the_category_in_the_input_mode() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
+        assert_eq!(app.tabs.selected(), 1);
+        take_search(&mut session);
+
+        handle_key_input(&mut app, key(KeyCode::BackTab), &tx, &mut session);
+        assert_eq!(app.tabs.selected(), 0);
+        take_search(&mut session);
+    }
+
+    #[tokio::test]
+    async fn tab_switches_the_category_in_the_results_mode() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+
+        handle_key_results(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 1);
+        take_search(&mut session);
+
+        handle_key_results(&mut app, key(KeyCode::BackTab), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 0);
+        take_search(&mut session);
+    }
+
+    #[tokio::test]
+    async fn tab_starts_a_search_only_for_a_tab_that_has_not_loaded_yet() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+
+        handle_key_results(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
+        assert!(take_search(&mut session), "未読のタブは検索する");
+
+        handle_key_results(&mut app, key(KeyCode::BackTab), &tx, &mut session).await;
+        assert!(
+            !take_search(&mut session),
+            "読み込み済みのタブは保持していた結果を出す"
+        );
+        assert_eq!(app.results.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn enter_in_the_input_mode_returns_to_the_all_tab() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: "ラーメン".to_string(),
+            ..App::default()
+        };
+        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
+        take_search(&mut session);
+        assert!(!app.tabs.is_all());
+
+        handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session);
+        assert!(app.tabs.is_all());
+        assert!(take_search(&mut session));
+    }
+
+    #[tokio::test]
+    async fn typing_still_appends_to_the_query_while_a_category_tab_is_selected() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
+        take_search(&mut session);
+
+        handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session);
+        assert_eq!(app.query, "ラー", "戻れば元の入力が残っている");
+        assert!(!app.tabs.is_all());
+    }
+
+    #[tokio::test]
+    async fn left_and_right_move_inside_the_grid_in_the_results_mode() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+
+        handle_key_results(&mut app, key(KeyCode::Right), &tx, &mut session).await;
+        assert_eq!(app.selected, 1);
+        handle_key_results(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.selected, 5);
+        handle_key_results(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        assert_eq!(app.selected, 1);
+        handle_key_results(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        assert_eq!(app.selected, 0);
+        // 先頭で ← を押しても巻き戻らない。
+        handle_key_results(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        assert_eq!(app.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn r_reloads_the_current_tab() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+        app.query = "ラーメン".to_string();
+        assert!(app.tabs.state().loaded);
+
+        handle_key_results(&mut app, key(KeyCode::Char('r')), &tx, &mut session).await;
+        assert!(!app.tabs.state().loaded);
+        assert!(take_search(&mut session));
+    }
+
+    #[tokio::test]
+    async fn tab_is_ignored_while_playing() {
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Playing,
+            ..playing_app()
+        };
+        for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('r')] {
+            handle_key_playing(&mut app, key(code), &mut session).await;
+        }
+        assert_eq!(app.tabs.selected(), 0);
+        assert!(session.search_task.is_none());
+        assert!(!app.should_quit);
     }
 }

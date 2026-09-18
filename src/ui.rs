@@ -1,10 +1,13 @@
 use crate::app::{App, Mode, format_time};
 use crate::display::DisplayMode;
+use crate::geometry::cell_size;
+use crate::grid::{self, LayoutMode};
 use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
+use crate::video::CellSize;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 /// 別ウィンドウ再生中に映像領域へ出す案内。
@@ -60,19 +63,142 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_search(frame: &mut Frame, app: &App) {
-    let areas = Layout::vertical([
+/// 検索画面は [入力, タブ, 結果, ステータス, ヘルプ] の5段。結果に残り全体を渡す。
+pub fn search_areas(area: Rect) -> [Rect; 5] {
+    Layout::vertical([
         Constraint::Length(3),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
-    .split(frame.area());
+    .areas(area)
+}
+
+/// 結果ブロックの内側。格子の割り付けと画像の貼り付けが同じ矩形を使う。
+pub fn results_inner(area: Rect) -> Rect {
+    Block::default()
+        .borders(Borders::ALL)
+        .inner(search_areas(area)[2])
+}
+
+/// 描画と画像の貼り付けが共有する割り付け。格子を組めないときは None。
+pub fn grid_layout(app: &App, cell: CellSize) -> Option<grid::Layout> {
+    grid_layout_in(app, app.screen, cell)
+}
+
+/// 指定の画面寸法での割り付け。リサイズは描き直す前の寸法を渡す。
+pub fn grid_layout_in(app: &App, screen: Rect, cell: CellSize) -> Option<grid::Layout> {
+    if app.settings.search.layout != LayoutMode::Grid {
+        return None;
+    }
+    grid::layout(results_inner(screen), cell, app.results.len(), app.scroll)
+}
+
+/// 入力欄のカーソル位置 (0 始まり)。draw と、画像を貼った後の戻し先が同じ計算を使う。
+pub fn input_cursor(screen: Rect, query: &str) -> (u16, u16) {
+    let area = search_areas(screen)[0];
+    (cursor_x(area, query), area.y + 1)
+}
+
+fn draw_search(frame: &mut Frame, app: &App) {
+    let areas = search_areas(frame.area());
 
     let input = Paragraph::new(app.query.as_str())
         .block(Block::default().borders(Borders::ALL).title(" 検索 "));
     frame.render_widget(input, areas[0]);
+    draw_tabs(frame, app, areas[1]);
 
+    // app.screen は直前の draw の寸法なので、割り付けは今のフレームで組み直す。
+    let layout = if app.settings.search.layout == LayoutMode::Grid {
+        grid::layout(
+            Block::default().borders(Borders::ALL).inner(areas[2]),
+            cell_size(),
+            app.results.len(),
+            app.scroll,
+        )
+    } else {
+        None
+    };
+    match &layout {
+        Some(layout) => draw_grid(frame, app, areas[2], layout),
+        None => draw_list(frame, app, areas[2]),
+    }
+
+    draw_footer(frame, app, areas[3], areas[4]);
+
+    if app.mode == Mode::Input {
+        frame.set_cursor_position(input_cursor(frame.area(), &app.query));
+    }
+}
+
+fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
+    let selected = app.tabs.selected();
+    let mut spans = Vec::new();
+    for (index, label) in app.tabs.labels().into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
+        let style = if index == selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(label.to_string(), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// 可視範囲と総数。スクロールしても今どこを見ているか分かるようにする。
+fn results_title(offset: usize, shown: usize, total: usize) -> String {
+    if total == 0 || shown == 0 {
+        return " 結果 ".to_string();
+    }
+    format!(" 結果 {}-{}/{total} ", offset + 1, offset + shown)
+}
+
+fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
+    let title = results_title(layout.offset, layout.cells.len(), app.results.len());
+    frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+
+    for (i, cell) in layout.cells.iter().enumerate() {
+        let index = layout.offset + i;
+        let Some(result) = app.results.get(index) else {
+            break;
+        };
+        // 画像が来ていないセルは枠だけ。来ていれば空けておき、APC が上に載る。
+        if app.thumbs.get(&result.id).is_none() {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+                cell.image,
+            );
+        }
+        let title_style = if index == app.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(
+            Paragraph::new(grid::truncate(&result.title, usize::from(cell.title.width)))
+                .style(title_style),
+            cell.title,
+        );
+        let uploader = result.uploader.as_deref().unwrap_or("-");
+        let meta = format!("{}  {uploader}", format_time(result.duration));
+        frame.render_widget(
+            Paragraph::new(grid::truncate(&meta, usize::from(cell.meta.width)))
+                .style(Style::default().fg(Color::DarkGray)),
+            cell.meta,
+        );
+    }
+}
+
+/// Kitty graphics protocol 非対応の端末と、格子を組めない狭さのときの従来表示。
+fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .results
         .iter()
@@ -94,13 +220,7 @@ fn draw_search(frame: &mut Frame, app: &App) {
     if !app.results.is_empty() {
         state.select(Some(app.selected));
     }
-    frame.render_stateful_widget(list, areas[1], &mut state);
-
-    draw_footer(frame, app, areas[2], areas[3]);
-
-    if app.mode == Mode::Input {
-        frame.set_cursor_position((cursor_x(areas[0], &app.query), areas[0].y + 1));
-    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 /// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
@@ -193,11 +313,13 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
 
 fn help_text(mode: Mode, display: DisplayMode) -> String {
     match mode {
+        // 旧版はキーワードを4つ並べて83桁あり、80桁端末では末尾が切れていた。
         Mode::Input => {
-            "Enter:検索  :ytrec/:ythis/:ytsubs/:ytwatchlater:ログイン連動の一覧  Esc:結果へ/終了"
-                .to_string()
+            "Enter:検索  Tab:カテゴリ  :yt*:ログイン連動の一覧  Esc:結果へ/終了".to_string()
         }
-        Mode::Results => "↑↓:選択  Enter:再生  /またはEsc:検索入力へ  q:終了".to_string(),
+        Mode::Results => {
+            "↑↓←→:選択  Enter:再生  Tab:カテゴリ  r:再取得  /またはEsc:検索へ  q:終了".to_string()
+        }
         Mode::Playing => format!(
             "space:一時停止  ←→/クリック:シーク  ↑↓:音量  [ ]:速度±0.1  BS:等速  w:{}  Esc:停止  q:終了",
             display.next().label()
@@ -209,7 +331,17 @@ fn help_text(mode: Mode, display: DisplayMode) -> String {
 mod tests {
     use super::*;
     use crate::app::Playback;
+    use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
+
+    fn result(index: usize) -> SearchResult {
+        SearchResult {
+            id: format!("id{index}"),
+            title: format!("title {index}"),
+            duration: None,
+            uploader: None,
+        }
+    }
 
     #[test]
     fn a_video_without_duration_gets_no_marker_to_seek_with() {
@@ -298,11 +430,100 @@ mod tests {
 
     #[test]
     fn input_help_mentions_feed_keywords() {
+        // 4 つ並べると 83 桁で 80 桁端末に入らないため、":yt*" に畳んである。
         let help = help_text(Mode::Input, DisplayMode::Embedded);
-        for keyword in [":ytrec", ":ythis", ":ytsubs", ":ytwatchlater"] {
-            assert!(help.contains(keyword), "{keyword} がない: {help}");
+        assert!(help.contains(":yt*"), "{help}");
+        assert!(help.contains("Enter:検索"), "{help}");
+        assert!(help.contains("Tab:カテゴリ"), "{help}");
+        assert!(grid::display_width(&help) <= 80, "{help}");
+    }
+
+    #[test]
+    fn results_help_mentions_the_grid_and_tab_keys() {
+        let help = help_text(Mode::Results, DisplayMode::Embedded);
+        for key in ["↑↓←→", "Tab:カテゴリ", "r:再取得", "Enter:再生"] {
+            assert!(help.contains(key), "{key} がない: {help}");
         }
-        assert!(help.contains("Enter:検索"));
+        assert!(grid::display_width(&help) <= 80, "{help}");
+    }
+
+    #[test]
+    fn search_areas_do_not_overlap_and_cover_the_screen() {
+        let area = Rect::new(0, 0, 80, 24);
+        let areas = search_areas(area);
+        assert_eq!(areas[0].y, area.y);
+        for pair in areas.windows(2) {
+            assert_eq!(pair[0].bottom(), pair[1].y, "{pair:?}");
+            assert_eq!(pair[0].width, area.width);
+        }
+        assert_eq!(areas[4].bottom(), area.bottom());
+    }
+
+    #[test]
+    fn tab_row_sits_between_the_input_box_and_the_results() {
+        let areas = search_areas(Rect::new(0, 0, 80, 24));
+        assert_eq!(areas[0], Rect::new(0, 0, 80, 3), "入力ボックスは 3 行");
+        assert_eq!(areas[1], Rect::new(0, 3, 80, 1), "タブは 1 行");
+        assert_eq!(areas[2].y, 4, "結果はタブの下");
+    }
+
+    #[test]
+    fn results_area_shrinks_by_one_row_compared_to_the_current_layout() {
+        // タブ行が1行増えたぶんだけ結果が狭くなる。ステータス・ヘルプは動かさない。
+        let areas = search_areas(Rect::new(0, 0, 80, 24));
+        assert_eq!(areas[2], Rect::new(0, 4, 80, 18));
+        assert_eq!(areas[3], Rect::new(0, 22, 80, 1));
+        assert_eq!(areas[4], Rect::new(0, 23, 80, 1));
+        // 結果ブロックの内側は枠のぶんさらに狭い。
+        assert_eq!(
+            results_inner(Rect::new(0, 0, 80, 24)),
+            Rect::new(1, 5, 78, 16)
+        );
+    }
+
+    #[test]
+    fn search_areas_survive_a_terminal_too_short_for_every_row() {
+        for height in 0..8 {
+            let area = Rect::new(0, 0, 40, height);
+            let areas = search_areas(area);
+            for rect in areas {
+                assert!(rect.bottom() <= area.bottom(), "{rect:?} / {area:?}");
+            }
+            // 内側を取っても矩形として成立する。
+            let inner = results_inner(area);
+            assert!(inner.bottom() <= area.bottom(), "{inner:?} / {area:?}");
+        }
+    }
+
+    #[test]
+    fn grid_layout_follows_the_configured_mode() {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            results: (0..10).map(result).collect(),
+            ..App::default()
+        };
+        let cell = CellSize {
+            width_px: 8,
+            height_px: 16,
+        };
+        let layout = grid_layout(&app, cell).expect("格子を組める");
+        assert_eq!((layout.columns, layout.rows), (4, 2));
+        assert_eq!(layout.image_px, (144, 80));
+
+        app.settings.search.layout = LayoutMode::List;
+        assert!(grid_layout(&app, cell).is_none(), "list ではリスト表示");
+
+        // 狭い端末では設定が grid でもリスト表示へ落ちる。
+        app.settings.search.layout = LayoutMode::Grid;
+        app.screen = Rect::new(0, 0, 80, 10);
+        assert!(grid_layout(&app, cell).is_none());
+    }
+
+    #[test]
+    fn the_results_title_shows_the_visible_range() {
+        assert_eq!(results_title(0, 8, 10), " 結果 1-8/10 ");
+        assert_eq!(results_title(8, 2, 10), " 結果 9-10/10 ");
+        assert_eq!(results_title(0, 0, 0), " 結果 ");
     }
 
     #[test]

@@ -1,27 +1,36 @@
 mod actions;
 mod app;
+mod category;
 mod cookies;
 mod display;
+mod fetch;
 mod geometry;
+mod grid;
 mod input;
+mod jpeg;
 mod kitty;
 mod mpv;
+mod rgb;
 mod search;
 mod seekbar;
 mod settings;
 mod speed;
 mod tct;
+mod thumbs;
 mod ui;
 mod video;
 
 use actions::{Session, apply_resize, end_playback, poll_player, schedule_resize, stop_playback};
 use anyhow::Result;
 use app::{App, AppEvent, Mode};
+use category::Tabs;
 use cookies::{CookieOutcome, CookieState, Target};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyEventKind,
 };
 use crossterm::execute;
+use fetch::{Fetcher, RealCurl};
+use geometry::cell_size;
 use input::{handle_key, handle_mouse};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
@@ -79,10 +88,14 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         display: loaded.settings.display.mode,
         // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
         cookies: CookieState::from_source(loaded.settings.cookies.clone()),
+        tabs: Tabs::with_categories(loaded.settings.categories.clone()),
         settings: loaded.settings,
         notice: loaded.notice,
         ..App::default()
     };
+    if let Some(dir) = app.settings.thumbnails.dir() {
+        thumbs::prune_cache(&dir, app.settings.thumbnails.max_cached);
+    }
     let mut session = Session::default();
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
@@ -92,6 +105,8 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         app.screen = terminal.draw(|frame| ui::draw(frame, &app))?.area;
         let area = ui::video_area(app.screen);
         present_video(&mut session, &app, area, terminal.backend_mut())?;
+        // present_video が先。再生終了で持ち越した a=d が、貼ったばかりの画像を消さない順序。
+        present_thumbs(&mut app, cell_size(), terminal.backend_mut())?;
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break };
@@ -107,14 +122,17 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             _ = ticker.tick() => poll_player(&mut app, &mut session).await,
             _ = wait_until(session.resize_at) => {
                 session.resize_at = None;
-                apply_resize(&mut app, &mut session).await;
+                apply_resize(&mut app, &mut session, &tx).await;
             }
         }
         if app.should_quit {
             break;
         }
     }
-    if let Some(task) = session.search_task.take() {
+    for task in [session.search_task.take(), session.thumbs_task.take()]
+        .into_iter()
+        .flatten()
+    {
         task.abort();
     }
     stop_playback(&mut session).await;
@@ -156,6 +174,45 @@ fn present_video(
     out.flush()
 }
 
+/// 変化があったときだけ、画面上の画像を消してから可視セルぶんを貼り直す。
+/// 毎周書くと 1 画面で 370KB 前後になり端末が詰まる。
+fn present_thumbs(
+    app: &mut App,
+    cell: video::CellSize,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    // 再生中は映像と重なるので 1 枚も書かない。戻ったときに貼り直せるよう dirty は残す。
+    if app.mode == Mode::Playing {
+        return Ok(());
+    }
+    if !app.thumbs.take_dirty() {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    video::encode_clear(&mut bytes);
+    if let Some(layout) = ui::grid_layout(app, cell) {
+        for (i, rect) in layout.cells.iter().enumerate() {
+            let Some(result) = app.results.get(layout.offset + i) else {
+                break;
+            };
+            let Some(image) = app.thumbs.get(&result.id) else {
+                continue;
+            };
+            if let Some(at) = video::placement(rect.image, cell, (image.width, image.height)) {
+                rgb::encode_image(image, at, &mut bytes);
+            }
+        }
+    }
+    // 画像は CUP で絶対位置へ寄せる。入力中は検索欄へ戻さないと、
+    // 次の draw までカーソルが格子の中で点滅する。
+    if app.mode == Mode::Input {
+        let (x, y) = ui::input_cursor(app.screen, &app.query);
+        bytes.extend_from_slice(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
+    }
+    out.write_all(&bytes)?;
+    out.flush()
+}
+
 /// 予定が無いときは永久に待つ (select! の他の枝だけを動かす)。
 async fn wait_until(deadline: Option<Instant>) {
     match deadline {
@@ -186,6 +243,26 @@ fn spawn_input_reader(tx: UnboundedSender<AppEvent>) {
     });
 }
 
+/// キーを捌き、タブが移っていたらサムネイルを取り直す。
+/// 取得者を引数に取るのは、テストから curl を起動させないため。
+async fn handle_key_event<F>(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    fetcher: F,
+) where
+    F: Fetcher + Send + Sync + 'static,
+{
+    let tab = app.tabs.selected();
+    handle_key(app, key, tx, session).await;
+    // タブを移ると結果集合ごと入れ替わる。読み込み済みのタブでも
+    // メモリ上の画像は捨ててあるので、キャッシュから読み直す。
+    if app.tabs.selected() != tab {
+        actions::start_thumbnails_with(app, tx, session, fetcher);
+    }
+}
+
 async fn handle_event(
     app: &mut App,
     event: AppEvent,
@@ -193,7 +270,7 @@ async fn handle_event(
     session: &mut Session,
 ) {
     match event {
-        AppEvent::Key(key) => handle_key(app, key, tx, session).await,
+        AppEvent::Key(key) => handle_key_event(app, key, tx, session, RealCurl).await,
         AppEvent::Mouse(mouse) => handle_mouse(app, mouse, session).await,
         AppEvent::Resize { width, height } => schedule_resize(session, width, height),
         AppEvent::SearchDone {
@@ -207,6 +284,7 @@ async fn handle_event(
             session.search_task = None;
             app.searching = false;
             apply_search_done(app, &target, report);
+            actions::start_thumbnails(app, tx, session);
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
@@ -231,6 +309,27 @@ async fn handle_event(
                 let error = note_cookie_failure(app, error);
                 end_playback(app, session, error).await;
             }
+        }
+        AppEvent::ThumbsReady {
+            nonce,
+            target_px,
+            images,
+            notice,
+            disable,
+        } => {
+            if nonce != session.search_nonce {
+                return;
+            }
+            session.thumbs_task = None;
+            app.thumbs.set_fetching(false);
+            if let Some(notice) = notice {
+                app.notice = Some(notice);
+            }
+            if let Some(reason) = disable {
+                app.thumbs.disable(reason.clone());
+                app.notice = Some(reason);
+            }
+            app.thumbs.apply(images, target_px);
         }
     }
 }
@@ -293,6 +392,7 @@ mod tests {
     use super::*;
     use crate::app::Playback;
     use crate::cookies::CookieSource;
+    use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
     use crate::search::{SearchReport, SearchResult};
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
@@ -592,5 +692,317 @@ mod tests {
         assert_eq!(app.error.as_deref(), Some("boom"));
         assert!(app.playback.title.is_empty());
         assert_eq!(present(&mut session, &app), clear_bytes());
+    }
+
+    fn thumb_app(count: usize) -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        let results: Vec<SearchResult> = (0..count).map(|i| result(&format!("id{i}"))).collect();
+        app.set_results(results, &Target::Search("q".to_string()));
+        app.thumbs.take_dirty();
+        app
+    }
+
+    /// 1 セルに収まる小さな画像。placement が拒まない寸法にしておく。
+    fn thumb() -> rgb::RgbImage {
+        rgb::RgbImage::new(16, 16, vec![9; 16 * 16 * 3]).expect("長さは合っている")
+    }
+
+    fn make_ready(app: &mut App, ids: &[&str]) {
+        let images = ids
+            .iter()
+            .map(|id| ((*id).to_string(), Ok(thumb())))
+            .collect();
+        app.thumbs.apply(images, (144, 80));
+    }
+
+    fn thumbs_bytes(app: &mut App) -> Vec<u8> {
+        let mut out = Vec::new();
+        present_thumbs(app, CELL, &mut out).expect("Vec への書き込みは失敗しない");
+        out
+    }
+
+    fn count_images(out: &[u8]) -> usize {
+        out.windows(6).filter(|w| *w == b"\x1b_Ga=T").count()
+    }
+
+    #[test]
+    fn present_thumbs_writes_nothing_when_not_dirty() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        assert!(!thumbs_bytes(&mut app).is_empty(), "変化があれば書く");
+        assert!(thumbs_bytes(&mut app).is_empty(), "変化が無ければ書かない");
+    }
+
+    #[test]
+    fn present_thumbs_writes_clear_then_one_apc_per_ready_image() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0", "id1", "id2", "id3"]);
+        let out = thumbs_bytes(&mut app);
+
+        assert!(
+            out.starts_with(&clear_bytes()),
+            "貼り直す前に画面の画像を消す"
+        );
+        assert_eq!(count_images(&out), 4);
+        // 1 枚ごとに CUP で絶対位置へ寄せる。
+        assert_eq!(
+            out.windows(2).filter(|w| *w == b"\x1b[").count(),
+            4,
+            "CUP の数が画像の数と合わない"
+        );
+    }
+
+    #[test]
+    fn present_thumbs_skips_cells_without_an_image() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id1"]);
+        let out = thumbs_bytes(&mut app);
+
+        assert!(out.starts_with(&clear_bytes()));
+        assert_eq!(count_images(&out), 1, "届いた 1 枚だけ貼る");
+    }
+
+    #[test]
+    fn present_thumbs_writes_nothing_while_playing() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        app.mode = Mode::Playing;
+        assert!(thumbs_bytes(&mut app).is_empty(), "映像と重なる");
+
+        // 戻れば貼り直す。再生中に dirty を食い潰さない。
+        app.mode = Mode::Results;
+        assert_eq!(count_images(&thumbs_bytes(&mut app)), 1);
+    }
+
+    #[test]
+    fn present_thumbs_clears_the_dirty_flag_after_writing() {
+        let mut app = thumb_app(4);
+        app.thumbs.mark_dirty();
+        assert!(!thumbs_bytes(&mut app).is_empty());
+        assert!(thumbs_bytes(&mut app).is_empty());
+
+        // スクロールや結果の入れ替えでまた立つ。
+        app.thumbs.mark_dirty();
+        assert!(!thumbs_bytes(&mut app).is_empty());
+    }
+
+    #[test]
+    fn present_thumbs_returns_the_cursor_to_the_search_box_in_input_mode() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        app.mode = Mode::Input;
+        app.query = "らー".to_string();
+        let out = thumbs_bytes(&mut app);
+
+        let (x, y) = ui::input_cursor(app.screen, &app.query);
+        let cup = format!("\x1b[{};{}H", y + 1, x + 1).into_bytes();
+        assert!(count_images(&out) > 0, "画像を貼ってからの話");
+        assert!(out.ends_with(&cup), "入力欄へ戻さないと格子の中で点滅する");
+
+        // 結果一覧ではカーソルを出していないので戻す必要がない。
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        assert!(!thumbs_bytes(&mut app).ends_with(&cup));
+    }
+
+    #[test]
+    fn present_thumbs_writes_only_the_clear_in_list_mode() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        app.settings.search.layout = crate::grid::LayoutMode::List;
+        let out = thumbs_bytes(&mut app);
+
+        assert_eq!(out, clear_bytes(), "リスト表示では貼らず、残骸だけ消す");
+    }
+
+    #[test]
+    fn starting_playback_erases_the_thumbnails_from_the_screen() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        // 画像を貼った状態から再生へ移る。
+        assert_eq!(count_images(&thumbs_bytes(&mut app)), 1);
+
+        let mut session = Session::default();
+        actions::enter_playback(&mut app, &mut session, "song".to_string(), sink());
+        let out = present(&mut session, &app);
+
+        assert!(out.starts_with(&clear_bytes()), "a=d が出ない");
+        // 再生中は present_thumbs が 1 バイトも書かないので、消せるのはここだけ。
+        assert!(thumbs_bytes(&mut app).is_empty());
+    }
+
+    #[test]
+    fn present_video_runs_before_present_thumbs() {
+        // 再生終了で持ち越した a=d が、貼ったばかりのサムネイルを消さない順序であること。
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0"]);
+        let mut session = Session {
+            owe_clear: true,
+            ..Session::default()
+        };
+
+        let mut out = Vec::new();
+        present_video(&mut session, &app, area(), &mut out).expect("書ける");
+        present_thumbs(&mut app, CELL, &mut out).expect("書ける");
+
+        let clear = clear_bytes();
+        let last_clear = out
+            .windows(clear.len())
+            .rposition(|w| w == clear.as_slice())
+            .expect("画像の削除が入っている");
+        let first_image = out
+            .windows(6)
+            .position(|w| w == b"\x1b_Ga=T")
+            .expect("画像が入っている");
+        assert!(
+            last_clear < first_image,
+            "最後の a=d より後に画像が来ていない"
+        );
+    }
+
+    #[tokio::test]
+    async fn thumbs_ready_from_a_superseded_nonce_is_discarded() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 2,
+            ..Session::default()
+        };
+        let mut app = thumb_app(2);
+        handle_event(
+            &mut app,
+            AppEvent::ThumbsReady {
+                nonce: 1,
+                target_px: (144, 80),
+                images: vec![("id0".to_string(), Ok(thumb()))],
+                notice: None,
+                disable: None,
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(app.thumbs.get("id0").is_none(), "古い検索の画像は捨てる");
+        assert!(!app.thumbs.take_dirty());
+    }
+
+    #[tokio::test]
+    async fn thumbs_ready_applies_the_images_and_the_notice() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = thumb_app(2);
+        app.thumbs.set_fetching(true);
+        handle_event(
+            &mut app,
+            AppEvent::ThumbsReady {
+                nonce: 0,
+                target_px: (144, 80),
+                images: vec![
+                    ("id0".to_string(), Ok(thumb())),
+                    ("id1".to_string(), Err(())),
+                ],
+                notice: Some("保存先を作れませんでした".to_string()),
+                disable: None,
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(app.thumbs.get("id0").is_some());
+        assert!(app.thumbs.get("id1").is_none());
+        assert!(app.thumbs.take_dirty());
+        assert!(!app.thumbs.is_fetching());
+        assert_eq!(app.notice.as_deref(), Some("保存先を作れませんでした"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_curl_disables_thumbnails_with_a_notice() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = thumb_app(2);
+        handle_event(
+            &mut app,
+            AppEvent::ThumbsReady {
+                nonce: 0,
+                target_px: (144, 80),
+                images: vec![("id0".to_string(), Err(()))],
+                notice: None,
+                disable: Some(thumbs::MISSING_CURL.to_string()),
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.notice.as_deref(), Some(thumbs::MISSING_CURL));
+        // 以後は取りに行かない。
+        assert!(app.thumbs.wanted(&app.result_ids(), (144, 80)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_loaded_tab_refetches_its_thumbnails_from_the_cache() {
+        // タブを戻したときメモリ上の画像は捨ててあるので、キャッシュから読み直す。
+        let dir = std::env::temp_dir().join(format!("tuitube-main-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("id0.jpg"),
+            include_bytes!("testdata/tiny8x4.jpg").as_slice(),
+        )
+        .expect("書ける");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = thumb_app(0);
+        app.settings.thumbnails.cache_dir = Some(dir.clone());
+
+        // 2 つ目のタブに結果を持たせてから「すべて」へ戻る。
+        app.tabs.next();
+        app.set_results(vec![result("id0")], &Target::Search("音楽".to_string()));
+        app.store_to_tab();
+        app.tabs.prev();
+        app.sync_from_tab();
+        app.thumbs.take_dirty();
+
+        // Tab で読み込み済みのタブへ移ると、yt-dlp は動かずサムネイルだけ取り直す。
+        // 取得は渡した偽物を通るので、キャッシュが外れても curl は起動しない。
+        handle_key_event(
+            &mut app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Tab,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Failed, b""),
+        )
+        .await;
+
+        assert!(session.search_task.is_none(), "保持していた結果を出すだけ");
+        let task = session.thumbs_task.take().expect("取り直しが積まれる");
+        task.await.expect("タスクは panic しない");
+        let event = rx.try_recv().expect("ThumbsReady が届く");
+        let AppEvent::ThumbsReady { images, .. } = &event else {
+            panic!("ThumbsReady のはず");
+        };
+        assert_eq!(images.len(), 1);
+        assert!(images[0].1.is_ok(), "キャッシュから読めている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_configured_categories_reach_the_tab_row() {
+        // App::default() の既定ではなく、設定ファイルの [[categories]] を出す。
+        let categories = vec![crate::category::Category::new("将棋", "将棋 対局")];
+        let app = App {
+            tabs: Tabs::with_categories(categories),
+            ..App::default()
+        };
+        assert_eq!(app.tabs.labels(), ["すべて", "将棋"]);
     }
 }

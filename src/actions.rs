@@ -3,12 +3,17 @@
 use crate::app::{App, AppEvent, Mode, Playback};
 use crate::cookies::Target;
 use crate::display::{self, DisplayMode, LaunchPlan};
+use crate::fetch::{Fetcher, RealCurl};
 use crate::geometry::{cell_size, geometry_for, video_geometry};
+use crate::grid::{self, Dir};
 use crate::mpv::{self, MpvCommand, MpvController};
 use crate::search::{self, RealYtDlp, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::speed::Speed;
+use crate::thumbs;
+use crate::ui;
 use crate::video::{DecoderKind, VideoSink};
+use ratatui::layout::Rect;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -55,6 +60,8 @@ pub struct Session {
     pub player_nonce: u64,
     pub search_nonce: u64,
     pub search_task: Option<JoinHandle<()>>,
+    /// サムネイルの取得・デコード。nonce は search_nonce を共用する。
+    pub thumbs_task: Option<JoinHandle<()>>,
     /// 直近の端末サイズと、それを映像へ反映する時刻。
     pub pending_resize: Option<(u16, u16)>,
     pub resize_at: Option<Instant>,
@@ -129,6 +136,8 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
     app.video = None;
     // sink を手放した後も残骸は消す。SIGKILL 経路では mpv 自身が消せない。
     session.owe_clear = true;
+    // mpv の a=d でサムネイルも消えているので、結果へ戻ったら貼り直す。
+    app.thumbs.mark_dirty();
     if error.is_some() {
         app.error = error;
     }
@@ -156,7 +165,41 @@ pub fn start_search_with<R>(
     if query.is_empty() {
         return;
     }
-    let target = Target::for_query(&query);
+    // 検索ボックスの文字列は「すべて」タブのもの。対応を 1 対 1 に保つ。
+    if !app.tabs.is_all() {
+        app.store_to_tab();
+        app.tabs.select_all();
+        app.sync_from_tab();
+    }
+    spawn_search(app, tx, session, Target::for_query(&query), runner);
+}
+
+/// 今のタブのクエリで検索する。「すべて」タブでは検索ボックスの文字列を使う。
+pub fn start_tab_search_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    let Some(target) = app.tabs.target(&app.query) else {
+        // 検索できないタブでも先行検索は打ち切る。残すと結果がこのタブへ流れ込む。
+        cancel_search(app, session);
+        return;
+    };
+    spawn_search(app, tx, session, target, runner);
+}
+
+fn spawn_search<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    target: Target,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
     // 断る場合も先に打ち切る。生き残った先行検索の結果が後から画面を塗り替えないため。
     cancel_search(app, session);
     // cookie が無いフィードは yt-dlp を 10 秒待たせても結果が出ないので、その場で断る。
@@ -169,16 +212,132 @@ pub fn start_search_with<R>(
         return;
     }
     let nonce = session.search_nonce;
+    let limit = app.settings.search.limit;
     app.searching = true;
     app.error = None;
     let cookies = app.cookies.for_search().cloned();
     let tx = tx.clone();
     session.search_task = Some(tokio::spawn(async move {
-        let report = search::run_search(&runner, &target, cookies.as_ref()).await;
+        let report = search::run_search(&runner, &target, cookies.as_ref(), limit).await;
         let _ = tx.send(AppEvent::SearchDone {
             nonce,
             target,
             report,
+        });
+    }));
+}
+
+pub fn switch_tab(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    forward: bool,
+) {
+    switch_tab_with(app, tx, session, forward, RealYtDlp);
+}
+
+/// タブを移り、そのタブの状態を画面へ写す。まだ読んでいないタブだけ検索する。
+pub fn switch_tab_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    forward: bool,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    // 移る前に必ず打ち切る。走らせたままにすると、その結果が移った先のタブへ書き込まれる。
+    cancel_search(app, session);
+    app.store_to_tab();
+    if forward {
+        app.tabs.next();
+    } else {
+        app.tabs.prev();
+    }
+    app.sync_from_tab();
+    app.error = None;
+    if app.tabs.state().loaded {
+        return;
+    }
+    start_tab_search_with(app, tx, session, runner);
+}
+
+pub fn reload_tab(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    reload_tab_with(app, tx, session, RealYtDlp);
+}
+
+pub fn reload_tab_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    app.tabs.state_mut().loaded = false;
+    start_tab_search_with(app, tx, session, runner);
+}
+
+/// 格子の中の移動。リスト表示に落ちているときは既存の巻き戻る移動を使う。
+pub fn move_selection(app: &mut App, dir: Dir) {
+    let Some(layout) = ui::grid_layout(app, cell_size()) else {
+        match dir {
+            Dir::Down => app.select_next(),
+            Dir::Up => app.select_prev(),
+            Dir::Left | Dir::Right => {}
+        }
+        return;
+    };
+    app.selected = grid::move_selection(app.selected, app.results.len(), layout.columns, dir);
+    let scroll = grid::ensure_visible(app.selected, layout.columns, layout.rows, app.scroll);
+    // 選択の強調は画像の外に描くので、可視範囲が動いたときだけ貼り直す。
+    if scroll != app.scroll {
+        app.scroll = scroll;
+        app.thumbs.mark_dirty();
+    }
+}
+
+pub fn start_thumbnails(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    start_thumbnails_with(app, tx, session, RealCurl);
+}
+
+/// 未取得のサムネイルを 1 タスクで取り、デコードして目標寸法へ縮める。
+pub fn start_thumbnails_with<F>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    fetcher: F,
+) where
+    F: Fetcher + Send + Sync + 'static,
+{
+    if let Some(task) = session.thumbs_task.take() {
+        task.abort();
+    }
+    app.thumbs.set_fetching(false);
+    if !app.settings.thumbnails.enabled || app.thumbs.disabled().is_some() {
+        return;
+    }
+    let Some(layout) = ui::grid_layout(app, cell_size()) else {
+        return;
+    };
+    let target_px = layout.image_px;
+    let ids = app.thumbs.wanted(&app.result_ids(), target_px);
+    if ids.is_empty() {
+        return;
+    }
+    let nonce = session.search_nonce;
+    let cache = app.settings.thumbnails.dir();
+    let timeout = app.settings.thumbnails.timeout;
+    let tx = tx.clone();
+    app.thumbs.set_fetching(true);
+    session.thumbs_task = Some(tokio::spawn(async move {
+        let outcome = thumbs::fetch_thumbnails(&fetcher, ids, target_px, cache, timeout).await;
+        let _ = tx.send(AppEvent::ThumbsReady {
+            nonce,
+            target_px,
+            images: outcome.images,
+            notice: outcome.notice,
+            disable: outcome.disable,
         });
     }));
 }
@@ -207,6 +366,20 @@ fn playback_plan(app: &App) -> (VideoSink, LaunchPlan) {
     (video, plan)
 }
 
+/// 起動できた後の画面側の状態。mpv を起動せずに検証できるよう切り出してある。
+pub fn enter_playback(app: &mut App, session: &mut Session, title: String, video: VideoSink) {
+    app.playback = Playback {
+        title,
+        ..Playback::default()
+    };
+    app.seek_bar = SeekBarState::default();
+    app.video = Some(video);
+    app.mode = Mode::Playing;
+    app.error = None;
+    // 貼ってあるサムネイルは ratatui の差分描画では消えない。end_playback と対称に剥がす。
+    session.owe_clear = true;
+}
+
 pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
     let Some(result) = app.selected_result().cloned() else {
         return;
@@ -217,14 +390,7 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     let (video, plan) = playback_plan(app);
     match MpvController::launch(&result.url(), nonce, tx.clone(), video.clone(), &plan).await {
         Ok(controller) => {
-            app.playback = Playback {
-                title: result.title.clone(),
-                ..Playback::default()
-            };
-            app.seek_bar = SeekBarState::default();
-            app.video = Some(video);
-            app.mode = Mode::Playing;
-            app.error = None;
+            enter_playback(app, session, result.title.clone(), video);
             session.player = Some(Player {
                 sink: Box::new(controller),
                 nonce,
@@ -302,11 +468,31 @@ pub fn schedule_resize(session: &mut Session, width: u16, height: u16) {
 }
 
 /// 端末サイズが変わったら、映像の寸法を mpv ごと作り直して食い違いを解消する。
-pub async fn apply_resize(app: &mut App, session: &mut Session) {
+pub async fn apply_resize(app: &mut App, session: &mut Session, tx: &UnboundedSender<AppEvent>) {
+    apply_resize_with(app, session, tx, RealCurl).await;
+}
+
+/// サムネイルの取得者を差し替えられる形。テストはここに偽物を渡して curl を起動させない。
+pub async fn apply_resize_with<F>(
+    app: &mut App,
+    session: &mut Session,
+    tx: &UnboundedSender<AppEvent>,
+    fetcher: F,
+) where
+    F: Fetcher + Send + Sync + 'static,
+{
     let Some((cols, rows)) = session.pending_resize.take() else {
         return;
     };
     let Some(video) = app.video.clone() else {
+        // 非再生中。ratatui の 2J で画像が消えているので、新しい寸法で貼り直す。
+        // 列数・行数が変わると選択が可視範囲の外へ出るので、新しい割り付けで追い直す。
+        if let Some(layout) = ui::grid_layout_in(app, Rect::new(0, 0, cols, rows), cell_size()) {
+            app.scroll =
+                grid::ensure_visible(app.selected, layout.columns, layout.rows, app.scroll);
+        }
+        app.thumbs.mark_dirty();
+        start_thumbnails_with(app, tx, session, fetcher);
         return;
     };
     let geometry = geometry_for(cols, rows, cell_size(), app.settings.display.max_pixels());
@@ -340,6 +526,8 @@ mod tests {
     use super::*;
     use crate::cookies::{CookieSource, CookieState};
     use crate::display::Quality;
+    use crate::fetch::fixtures::{CurlResult, FakeCurl};
+    use crate::rgb::RgbImage;
     use crate::search::SearchResult;
     use crate::settings::{DisplaySettings, Settings};
     use crate::speed::Speed;
@@ -410,6 +598,12 @@ mod tests {
             duration: None,
             uploader: None,
         }
+    }
+
+    /// 送り先を気にしないリサイズ。サムネイル取得の要求だけが捨てられる。
+    async fn resize(app: &mut App, session: &mut Session) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        apply_resize_with(app, session, &tx, FakeCurl::new(CurlResult::Failed, b"")).await;
     }
 
     fn sink() -> VideoSink {
@@ -601,7 +795,7 @@ mod tests {
             pending_resize: Some((100, 40)),
             ..Session::default()
         };
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         assert!(session.pending_resize.is_none());
         assert!(app.error.is_none());
@@ -618,7 +812,7 @@ mod tests {
             pending_resize: Some((100, 40)),
             ..Session::default()
         };
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         assert_eq!(
             video.geometry(),
@@ -656,7 +850,7 @@ mod tests {
             pending_resize: Some((100, 40)),
             ..Session::default()
         };
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         assert_eq!(
             video.geometry(),
@@ -683,7 +877,7 @@ mod tests {
             pending_resize: Some((100, 40)),
             ..Session::default()
         };
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         let frame = video.geometry().frame_px;
         let pixels = u64::from(frame.0) * u64::from(frame.1);
@@ -826,7 +1020,7 @@ mod tests {
             ..Session::default()
         };
         let sent = record(&mut session, Ok(()));
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         let geometry = geometry_for(100, 40, cell_size(), MAX_FRAME_PIXELS);
         assert_eq!(
@@ -868,7 +1062,7 @@ mod tests {
             ..Session::default()
         };
         let sent = record(&mut session, Ok(()));
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         assert!(lines(&sent).is_empty());
     }
@@ -1052,7 +1246,7 @@ mod tests {
             ..Session::default()
         };
         let sent = record(&mut session, Ok(()));
-        apply_resize(&mut app, &mut session).await;
+        resize(&mut app, &mut session).await;
 
         let geometry = geometry_for(100, 40, cell_size(), MAX_FRAME_PIXELS);
         assert_eq!(
@@ -1062,5 +1256,359 @@ mod tests {
                 .map(|c| c.to_line())
                 .collect::<Vec<_>>()
         );
+    }
+
+    const TINY_8X4: &[u8] = include_bytes!("testdata/tiny8x4.jpg");
+
+    /// 80x24 の検索画面。格子は 4 列 2 行になる。
+    fn grid_app(count: usize) -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        let results: Vec<SearchResult> = (0..count).map(|i| result(&format!("id{i}"))).collect();
+        app.set_results(results, &Target::Search("q".to_string()));
+        app.thumbs.take_dirty();
+        app
+    }
+
+    fn thumb_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("tuitube-actions-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// ThumbsReady を 1 件受け取る。届かなければ None。
+    async fn next_thumbs(
+        rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        session: &mut Session,
+    ) -> Option<AppEvent> {
+        let task = session.thumbs_task.take()?;
+        task.await.expect("タスクは panic しない");
+        rx.try_recv().ok()
+    }
+
+    fn thumbs_ids(event: &AppEvent) -> Vec<String> {
+        let AppEvent::ThumbsReady { images, .. } = event else {
+            panic!("ThumbsReady のはず");
+        };
+        images.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn switch_tab_searches_only_a_tab_that_has_not_loaded_yet() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: "ラーメン".to_string(),
+            ..App::default()
+        };
+        switch_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+
+        assert_eq!(app.tabs.selected(), 1);
+        assert!(session.search_task.is_some(), "未読のタブは検索する");
+        assert!(app.searching);
+
+        // 読み込み済みにして戻り、また来ても検索し直さない。
+        app.set_results(vec![result("a")], &Target::Search("音楽".to_string()));
+        session.search_task = None;
+        app.searching = false;
+        switch_tab_with(&mut app, &tx, &mut session, false, StubYtDlp);
+        assert!(app.tabs.is_all());
+        // 「すべて」タブは未読なので検索が積まれる。それを片付けてから戻る。
+        session.search_task = None;
+        switch_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+        assert!(
+            session.search_task.is_none(),
+            "保持していた結果をそのまま出す"
+        );
+        assert_eq!(app.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn switching_to_a_loaded_tab_drops_the_running_search() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        // 「すべて」タブに結果を持たせてから、隣のタブで検索を走らせる。
+        let mut app = grid_app(1);
+        switch_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+        let running = session.search_nonce;
+        assert!(session.search_task.is_some());
+        assert!(app.searching);
+
+        switch_tab_with(&mut app, &tx, &mut session, false, StubYtDlp);
+        assert!(app.tabs.is_all());
+        assert!(session.search_task.is_none(), "走らせたままにしない");
+        assert!(!app.searching, "検索中の表示が残らない");
+        assert_ne!(
+            session.search_nonce, running,
+            "先に走っていた検索の結果を移った先のタブへ書き込ませない"
+        );
+        assert_eq!(app.result_ids(), ["id0"], "保持していた結果のまま");
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_cannot_search_still_drops_the_running_one() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(1);
+        app.query = "ラーメン".to_string();
+        reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+        let running = session.search_nonce;
+        assert!(session.search_task.is_some());
+
+        // 検索ボックスが空の「すべて」タブは検索を作れない。それでも先行分は止める。
+        app.query.clear();
+        reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_none());
+        assert!(!app.searching);
+        assert_ne!(session.search_nonce, running);
+    }
+
+    #[test]
+    fn entering_playback_owes_a_clear_for_the_thumbnails() {
+        let mut app = grid_app(4);
+        let mut session = Session::default();
+        enter_playback(&mut app, &mut session, "song".to_string(), sink());
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(app.video.is_some());
+        assert_eq!(app.playback.title, "song");
+        // 貼ってあるサムネイルは 2J でしか消えない。終了側と同じく持ち越して消す。
+        assert!(session.owe_clear, "再生画面の上にサムネイルを残さない");
+    }
+
+    #[tokio::test]
+    async fn switching_tabs_carries_the_selection_of_each_tab() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        app.selected = 6;
+        app.scroll = 4;
+
+        switch_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+        assert_eq!(app.selected, 0);
+        assert!(app.results.is_empty());
+
+        switch_tab_with(&mut app, &tx, &mut session, false, StubYtDlp);
+        assert_eq!(app.selected, 6);
+        assert_eq!(app.scroll, 4);
+        assert_eq!(app.results.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn reload_tab_searches_the_current_tab_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        assert!(app.tabs.state().loaded);
+        // query が空だと「すべて」タブは検索できないので、語を入れておく。
+        app.query = "ラーメン".to_string();
+
+        reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_some());
+        assert!(!app.tabs.state().loaded);
+    }
+
+    #[tokio::test]
+    async fn a_search_from_the_input_box_returns_to_the_all_tab() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: "ラーメン".to_string(),
+            ..App::default()
+        };
+        app.tabs.next();
+        assert!(!app.tabs.is_all());
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(app.tabs.is_all(), "ボックスとタブの対応を 1 対 1 に保つ");
+        assert!(session.search_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_finished_search_starts_a_thumbnail_fetch_for_its_ids() {
+        let dir = thumb_dir("fetch");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        app.settings.thumbnails.cache_dir = Some(dir.clone());
+        let curl = FakeCurl::new(CurlResult::Wrote, TINY_8X4);
+
+        start_thumbnails_with(&mut app, &tx, &mut session, curl);
+        assert!(app.thumbs.is_fetching());
+        let event = next_thumbs(&mut rx, &mut session).await.expect("届く");
+        assert_eq!(thumbs_ids(&event), ["id0", "id1", "id2"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn thumbnails_are_not_fetched_when_the_setting_is_off() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        app.settings.thumbnails.enabled = false;
+        start_thumbnails_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Wrote, b""),
+        );
+
+        assert!(session.thumbs_task.is_none());
+        assert!(!app.thumbs.is_fetching());
+    }
+
+    #[tokio::test]
+    async fn thumbnails_are_not_fetched_once_disabled_or_in_list_mode() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+
+        let mut app = grid_app(3);
+        app.thumbs.disable(crate::thumbs::MISSING_CURL.to_string());
+        start_thumbnails_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Wrote, b""),
+        );
+        assert!(session.thumbs_task.is_none());
+
+        let mut app = grid_app(3);
+        app.settings.search.layout = crate::grid::LayoutMode::List;
+        start_thumbnails_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Wrote, b""),
+        );
+        assert!(
+            session.thumbs_task.is_none(),
+            "リスト表示では画像を使わない"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resize_while_not_playing_repaints_and_refetches_from_the_cache() {
+        let dir = thumb_dir("resize");
+        std::fs::write(dir.join("id0.jpg"), TINY_8X4).expect("書ける");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = grid_app(1);
+        app.settings.thumbnails.cache_dir = Some(dir.clone());
+        let mut session = Session {
+            pending_resize: Some((100, 40)),
+            ..Session::default()
+        };
+        // キャッシュにあるので、落ちる偽 curl を渡しても読めている。
+        let curl = FakeCurl::new(CurlResult::Failed, b"");
+        apply_resize_with(&mut app, &mut session, &tx, curl).await;
+
+        // 端末リサイズでは ratatui の 2J で画像が消えるので貼り直しを予約する。
+        assert!(app.thumbs.take_dirty());
+        assert!(session.pending_resize.is_none());
+        let event = next_thumbs(&mut rx, &mut session).await.expect("届く");
+        assert_eq!(thumbs_ids(&event), ["id0"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_resize_downloads_through_the_given_fetcher() {
+        let dir = thumb_dir("resize-fetcher");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = grid_app(1);
+        app.settings.thumbnails.cache_dir = Some(dir.clone());
+        let mut session = Session {
+            pending_resize: Some((100, 40)),
+            ..Session::default()
+        };
+        // キャッシュが空なので取りに行く。渡した偽物が使われる限り curl は起動しない。
+        let curl = FakeCurl::new(CurlResult::Wrote, TINY_8X4);
+        apply_resize_with(&mut app, &mut session, &tx, curl).await;
+
+        let event = next_thumbs(&mut rx, &mut session).await.expect("届く");
+        let AppEvent::ThumbsReady { images, .. } = &event else {
+            panic!("ThumbsReady のはず");
+        };
+        assert_eq!(images.len(), 1);
+        assert!(images[0].1.is_ok(), "偽物が書いた画像を読めている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_resize_follows_the_selection_into_the_new_grid() {
+        let dir = thumb_dir("resize-follow");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = grid_app(40);
+        app.settings.thumbnails.cache_dir = Some(dir.clone());
+        // 80x24 は 4 列 2 行。末尾を選んで最終ページを出している状態。
+        app.selected = 39;
+        app.scroll = 32;
+        let mut session = Session {
+            pending_resize: Some((128, 24)),
+            ..Session::default()
+        };
+        let curl = FakeCurl::new(CurlResult::Failed, b"");
+        apply_resize_with(&mut app, &mut session, &tx, curl).await;
+
+        // 128x24 は 6 列 1 行。39 番は 30..36 の外へ出るので追い直す。
+        assert_eq!(app.scroll, 36, "選択が可視範囲の外に取り残される");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_selection_walks_the_grid_and_scrolls_only_when_needed() {
+        let mut app = grid_app(10);
+        move_selection(&mut app, Dir::Right);
+        assert_eq!(app.selected, 1);
+        move_selection(&mut app, Dir::Down);
+        assert_eq!(app.selected, 5);
+        move_selection(&mut app, Dir::Up);
+        assert_eq!(app.selected, 1);
+        move_selection(&mut app, Dir::Left);
+        assert_eq!(app.selected, 0);
+        // 可視範囲の中で動くだけなら貼り直さない。
+        assert_eq!(app.scroll, 0);
+        assert!(!app.thumbs.take_dirty());
+    }
+
+    #[test]
+    fn move_selection_falls_back_to_the_wrapping_list_move_without_a_grid() {
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a"), result("b")],
+            // 画面寸法が無いので格子は組めない。
+            ..App::default()
+        };
+        move_selection(&mut app, Dir::Down);
+        assert_eq!(app.selected, 1);
+        move_selection(&mut app, Dir::Down);
+        assert_eq!(app.selected, 0, "リストでは巻き戻る");
+        move_selection(&mut app, Dir::Right);
+        assert_eq!(app.selected, 0, "←→ はリストでは効かない");
+    }
+
+    #[test]
+    fn end_playback_asks_for_a_thumbnail_repaint() {
+        // mpv の a=d でサムネイルも消えている。
+        let mut app = grid_app(3);
+        app.mode = Mode::Playing;
+        let mut session = Session::default();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(end_playback(&mut app, &mut session, None));
+        assert!(app.thumbs.take_dirty());
+    }
+
+    #[test]
+    fn a_ready_thumbnail_is_not_fetched_again() {
+        let mut app = grid_app(2);
+        let image = RgbImage::new(2, 2, vec![0; 12]).expect("長さは合っている");
+        app.thumbs
+            .apply(vec![("id0".to_string(), Ok(image))], (144, 80));
+        assert_eq!(app.thumbs.wanted(&app.result_ids(), (144, 80)), ["id1"]);
     }
 }

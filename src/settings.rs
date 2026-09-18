@@ -1,12 +1,16 @@
 //! 設定ファイル (TOML) のパス決定・読み込み・検証・テンプレート生成・保存。
 
+use crate::category::{Category, default_categories};
 use crate::cookies::{self, CookieSource};
 use crate::display::{DisplayMode, FocusOn, FpsCap, Quality, WindowOptions};
+use crate::grid::LayoutMode;
+use crate::thumbs;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// fps 上限を一時的に上書きする環境変数。0 か unlimited で制限を外す。
 pub const FPS_LIMIT_VAR: &str = "TUITUBE_FPS_LIMIT";
@@ -17,6 +21,15 @@ pub const DEFAULT_FPS_CAP: u32 = 15;
 pub const MAX_FPS_CAP: u32 = 120;
 pub const MIN_FRAME_PIXELS: u32 = 64 * 36;
 pub const MAX_FRAME_PIXELS_LIMIT: u32 = 3840 * 2160;
+/// 1 回の検索で取る件数 (ytsearchN の N)。
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+pub const MIN_SEARCH_LIMIT: usize = 1;
+pub const MAX_SEARCH_LIMIT: usize = 50;
+/// 起動時にディスクキャッシュへ残す枚数。
+pub const DEFAULT_MAX_CACHED: usize = 500;
+/// サムネイル 1 枚あたりのダウンロード上限秒数。
+pub const DEFAULT_THUMB_TIMEOUT_SECS: u64 = 10;
+pub const MAX_THUMB_TIMEOUT_SECS: u64 = 120;
 
 const CONFIG_FILE: &str = "config.toml";
 const APP_DIR: &str = "tuitube";
@@ -29,6 +42,29 @@ pub struct RawConfig {
     pub window: Option<RawWindow>,
     pub mpv: Option<RawMpv>,
     pub cookies: Option<RawCookies>,
+    pub search: Option<RawSearch>,
+    pub thumbnails: Option<RawThumbnails>,
+    pub categories: Option<Vec<RawCategory>>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawSearch {
+    pub layout: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawThumbnails {
+    pub enabled: Option<bool>,
+    pub cache_dir: Option<String>,
+    pub max_cached: Option<i64>,
+    pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawCategory {
+    pub label: Option<String>,
+    pub query: Option<String>,
 }
 
 /// 選択肢のキーは文字列で受ける。serde の enum で受けるとファイル全体が
@@ -91,6 +127,53 @@ impl DisplaySettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSettings {
+    pub layout: LayoutMode,
+    pub limit: usize,
+}
+
+impl Default for SearchSettings {
+    fn default() -> Self {
+        Self {
+            layout: LayoutMode::default(),
+            limit: DEFAULT_SEARCH_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbnailSettings {
+    pub enabled: bool,
+    /// 明示指定だけを持つ。未指定のときは `dir()` が環境変数から決める。
+    pub cache_dir: Option<PathBuf>,
+    pub max_cached: usize,
+    pub timeout: Duration,
+}
+
+impl Default for ThumbnailSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_dir: None,
+            max_cached: DEFAULT_MAX_CACHED,
+            timeout: Duration::from_secs(DEFAULT_THUMB_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl ThumbnailSettings {
+    /// 実際に使う置き場。設定が無ければ $XDG_CACHE_HOME / $HOME から決める。
+    pub fn dir(&self) -> Option<PathBuf> {
+        if self.cache_dir.is_some() {
+            return self.cache_dir.clone();
+        }
+        let xdg = std::env::var_os("XDG_CACHE_HOME");
+        let home = std::env::var_os("HOME");
+        thumbs::cache_dir(xdg.as_deref(), home.as_deref())
+    }
+}
+
 /// 検証済みの値。App が持つのはこれ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -101,6 +184,10 @@ pub struct Settings {
     pub extra_args: Vec<String>,
     /// None は cookie 連携 Off。
     pub cookies: Option<CookieSource>,
+    pub search: SearchSettings,
+    pub thumbnails: ThumbnailSettings,
+    /// 「すべて」を除いたカテゴリタブ。
+    pub categories: Vec<Category>,
 }
 
 impl Default for Settings {
@@ -111,6 +198,9 @@ impl Default for Settings {
             window: WindowOptions::default(),
             extra_args: Vec::new(),
             cookies: None,
+            search: SearchSettings::default(),
+            thumbnails: ThumbnailSettings::default(),
+            categories: default_categories(),
         }
     }
 }
@@ -193,6 +283,10 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
         ));
     }
 
+    let search = validate_search(raw.search.unwrap_or_default(), &mut notices);
+    let thumbnails = validate_thumbnails(raw.thumbnails.unwrap_or_default(), &mut notices);
+    let categories = validate_categories(raw.categories, &mut notices);
+
     (
         Settings {
             display,
@@ -200,9 +294,115 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
             window,
             extra_args,
             cookies,
+            search,
+            thumbnails,
+            categories,
         },
         notices,
     )
+}
+
+fn validate_search(raw: RawSearch, notices: &mut Vec<String>) -> SearchSettings {
+    let layout = parse_choice(
+        "[search] layout",
+        raw.layout.as_deref(),
+        LayoutMode::from_key,
+        &format!("{} で表示します", LayoutMode::default().key()),
+        notices,
+    )
+    .unwrap_or_default();
+    let limit = match raw.limit {
+        None => DEFAULT_SEARCH_LIMIT,
+        Some(limit) => {
+            let clamped = limit.clamp(MIN_SEARCH_LIMIT as i64, MAX_SEARCH_LIMIT as i64);
+            if clamped != limit {
+                notices.push(format!("[search] limit={limit} は {clamped} に丸めました"));
+            }
+            clamped as usize
+        }
+    };
+    SearchSettings { layout, limit }
+}
+
+fn validate_thumbnails(raw: RawThumbnails, notices: &mut Vec<String>) -> ThumbnailSettings {
+    let defaults = ThumbnailSettings::default();
+    let cache_dir = raw
+        .cache_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(expand_home);
+    if raw.cache_dir.is_some() && cache_dir.is_none() {
+        notices.push("[thumbnails] cache_dir が空です。既定の場所を使います".to_string());
+    }
+    let max_cached = match raw.max_cached {
+        None => defaults.max_cached,
+        Some(count) if count >= 0 => count as usize,
+        Some(count) => {
+            notices.push(format!(
+                "[thumbnails] max_cached={count} は読めません。{DEFAULT_MAX_CACHED} 枚まで残します"
+            ));
+            defaults.max_cached
+        }
+    };
+    let timeout = match raw.timeout_secs {
+        None => defaults.timeout,
+        Some(secs) if (1..=MAX_THUMB_TIMEOUT_SECS as i64).contains(&secs) => {
+            Duration::from_secs(secs as u64)
+        }
+        Some(secs) => {
+            let clamped = secs.clamp(1, MAX_THUMB_TIMEOUT_SECS as i64);
+            notices.push(format!(
+                "[thumbnails] timeout_secs={secs} は {clamped} に丸めました"
+            ));
+            Duration::from_secs(clamped as u64)
+        }
+    };
+    ThumbnailSettings {
+        enabled: raw.enabled.unwrap_or(defaults.enabled),
+        cache_dir,
+        max_cached,
+        timeout,
+    }
+}
+
+/// 先頭の `~/` だけ $HOME へ置き換える。そのままだと "~" という名前の
+/// ディレクトリが作られてしまう。
+fn expand_home(dir: &str) -> PathBuf {
+    let Some(rest) = dir.strip_prefix("~/") else {
+        return PathBuf::from(dir);
+    };
+    match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => Path::new(&home).join(rest),
+        None => PathBuf::from(dir),
+    }
+}
+
+fn validate_categories(raw: Option<Vec<RawCategory>>, notices: &mut Vec<String>) -> Vec<Category> {
+    let Some(raw) = raw else {
+        return default_categories();
+    };
+    let listed = raw.len();
+    let categories: Vec<Category> = raw
+        .into_iter()
+        .filter_map(|entry| {
+            let label = entry.label?;
+            let query = entry.query?;
+            (!label.trim().is_empty() && !query.trim().is_empty())
+                .then(|| Category::new(label.trim(), query.trim()))
+        })
+        .collect();
+    if categories.len() != listed {
+        notices.push(format!(
+            "[[categories]] の {} 件は label か query が空でした。その項目は出しません",
+            listed - categories.len()
+        ));
+    }
+    if categories.is_empty() {
+        notices.push("[[categories]] が空です。既定のカテゴリを出します".to_string());
+        return default_categories();
+    }
+    categories
 }
 
 /// 選択肢のキーを読む。綴りが違うときはそのキーだけ落として notice を出し、
@@ -428,6 +628,49 @@ pub fn render(settings: &Settings) -> String {
             .collect();
         out.push_str(&format!("extra_args = [{}]\n", values.join(", ")));
     }
+
+    out.push_str("\n[search]\n");
+    out.push_str(
+        "# 検索結果の見せ方。\"grid\" = サムネイル付きの格子、\"list\" = 1 行ずつのリスト。\n",
+    );
+    out.push_str("# Kitty graphics protocol 非対応の端末では \"list\" にする。\n");
+    out.push_str(&format!("layout = \"{}\"\n", settings.search.layout.key()));
+    out.push_str(&format!(
+        "# 1 回の検索で取る件数。{MIN_SEARCH_LIMIT}..={MAX_SEARCH_LIMIT}。\n"
+    ));
+    out.push_str(&format!("limit = {}\n", settings.search.limit));
+
+    let thumbnails = &settings.thumbnails;
+    out.push_str("\n[thumbnails]\n");
+    out.push_str("# false にすると取得しない。格子のまま枠だけが出る。\n");
+    out.push_str(&format!("enabled = {}\n", thumbnails.enabled));
+    out.push_str("# 取得したサムネイルの置き場。既定は $XDG_CACHE_HOME/tuitube/thumbs。\n");
+    out.push_str(&string_line(
+        "cache_dir",
+        thumbnails.cache_dir.as_deref().and_then(Path::to_str),
+        "~/.cache/tuitube/thumbs",
+    ));
+    out.push_str("# 起動時にここまで間引く枚数。\n");
+    out.push_str(&format!("max_cached = {}\n", thumbnails.max_cached));
+    out.push_str(&format!(
+        "# 1 枚あたりのダウンロード上限秒数。1..={MAX_THUMB_TIMEOUT_SECS}。\n"
+    ));
+    out.push_str(&format!(
+        "timeout_secs = {}\n",
+        thumbnails.timeout.as_secs()
+    ));
+
+    out.push_str("\n# カテゴリタブ。書いた場合は既定の一覧を丸ごと置き換える。\n");
+    out.push_str("# 先頭の「すべて」タブは常に自動で付くので書かない。\n");
+    if settings.categories == default_categories() {
+        out.push_str("# [[categories]]\n# label = \"音楽\"\n# query = \"音楽\"\n");
+    } else {
+        for category in &settings.categories {
+            out.push_str("\n[[categories]]\n");
+            out.push_str(&format!("label = \"{}\"\n", escape(&category.label)));
+            out.push_str(&format!("query = \"{}\"\n", escape(&category.query)));
+        }
+    }
     out
 }
 
@@ -549,6 +792,7 @@ mod tests {
     use super::*;
     use crate::cookies::CookieSource;
     use crate::display::{DisplayMode, FocusOn, FpsCap, Quality, WindowOptions};
+    use crate::grid::LayoutMode;
     use std::ffi::OsStr;
     use std::fs;
 
@@ -932,6 +1176,7 @@ mod tests {
             },
             extra_args: vec!["--hwdec=videotoolbox-copy".to_string()],
             cookies: spec("chrome:Profile 1"),
+            ..Settings::default()
         };
         assert_eq!(settings_of(&render(&custom)), custom);
     }
@@ -988,6 +1233,140 @@ mod tests {
         );
         assert_eq!(loaded.settings.fps_cap, None);
         assert!(loaded.notice.is_none());
+    }
+
+    #[test]
+    fn search_layout_and_limit_are_read() {
+        let settings = settings_of("[search]\nlayout = \"list\"\nlimit = 25\n");
+        assert_eq!(settings.search.layout, LayoutMode::List);
+        assert_eq!(settings.search.limit, 25);
+        assert!(notices_of("[search]\nlayout = \"list\"\nlimit = 25\n").is_empty());
+
+        assert_eq!(settings_of("").search, SearchSettings::default());
+        assert_eq!(SearchSettings::default().limit, DEFAULT_SEARCH_LIMIT);
+        assert_eq!(SearchSettings::default().layout, LayoutMode::Grid);
+    }
+
+    #[test]
+    fn an_unreadable_search_layout_falls_back_to_grid_with_a_notice() {
+        let text = "[search]\nlayout = \"tiles\"\nlimit = 5\n";
+        assert_eq!(settings_of(text).search.layout, LayoutMode::Grid);
+        // 綴りの合っている limit は巻き添えにしない。
+        assert_eq!(settings_of(text).search.limit, 5);
+        let notices = notices_of(text);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("layout=\"tiles\""), "{notices:?}");
+    }
+
+    #[test]
+    fn a_search_limit_outside_the_range_is_rounded_with_a_notice() {
+        for (raw, expected) in [(0, MIN_SEARCH_LIMIT), (51, MAX_SEARCH_LIMIT), (-3, 1)] {
+            let text = format!("[search]\nlimit = {raw}\n");
+            assert_eq!(settings_of(&text).search.limit, expected, "{text}");
+            let notice = notices_of(&text).join(" / ");
+            assert!(notice.contains(&raw.to_string()), "{notice}");
+        }
+    }
+
+    #[test]
+    fn thumbnail_settings_are_read() {
+        let text = "[thumbnails]\nenabled = false\ncache_dir = \"/tmp/thumbs\"\nmax_cached = 20\ntimeout_secs = 5\n";
+        let thumbnails = settings_of(text).thumbnails;
+        assert!(!thumbnails.enabled);
+        assert_eq!(thumbnails.cache_dir, Some(PathBuf::from("/tmp/thumbs")));
+        assert_eq!(thumbnails.max_cached, 20);
+        assert_eq!(thumbnails.timeout, Duration::from_secs(5));
+        assert!(notices_of(text).is_empty());
+
+        // 未指定なら既定。置き場は環境変数から決める。
+        assert_eq!(settings_of("").thumbnails, ThumbnailSettings::default());
+        assert_eq!(ThumbnailSettings::default().cache_dir, None);
+    }
+
+    #[test]
+    fn unreadable_thumbnail_values_are_rounded_with_a_notice() {
+        let text = "[thumbnails]\nmax_cached = -1\ntimeout_secs = 0\ncache_dir = \"  \"\n";
+        let thumbnails = settings_of(text).thumbnails;
+        assert_eq!(thumbnails.max_cached, DEFAULT_MAX_CACHED);
+        assert_eq!(thumbnails.timeout, Duration::from_secs(1));
+        assert_eq!(thumbnails.cache_dir, None);
+        assert_eq!(notices_of(text).len(), 3, "{:?}", notices_of(text));
+
+        let over = "[thumbnails]\ntimeout_secs = 600\n";
+        assert_eq!(
+            settings_of(over).thumbnails.timeout,
+            Duration::from_secs(MAX_THUMB_TIMEOUT_SECS)
+        );
+        assert_eq!(notices_of(over).len(), 1);
+    }
+
+    #[test]
+    fn a_cache_dir_starting_with_a_tilde_is_expanded_to_the_home_directory() {
+        let home = std::env::var("HOME").expect("HOME");
+        let text = "[thumbnails]\ncache_dir = \"~/.cache/tuitube/thumbs\"\n";
+        assert_eq!(
+            settings_of(text).thumbnails.cache_dir,
+            Some(PathBuf::from(format!("{home}/.cache/tuitube/thumbs")))
+        );
+    }
+
+    #[test]
+    fn categories_replace_the_defaults_when_listed() {
+        let text = "[[categories]]\nlabel = \"将棋\"\nquery = \"将棋 対局\"\n\n[[categories]]\nlabel = \"おすすめ\"\nquery = \":ytrec\"\n";
+        assert_eq!(
+            settings_of(text).categories,
+            [
+                Category::new("将棋", "将棋 対局"),
+                Category::new("おすすめ", ":ytrec"),
+            ]
+        );
+        assert!(notices_of(text).is_empty());
+        assert_eq!(settings_of("").categories, default_categories());
+    }
+
+    #[test]
+    fn an_empty_category_list_falls_back_to_the_defaults_with_a_notice() {
+        let text = "categories = []\n";
+        assert_eq!(settings_of(text).categories, default_categories());
+        assert_eq!(notices_of(text).len(), 1, "{:?}", notices_of(text));
+    }
+
+    #[test]
+    fn a_category_without_a_label_or_query_is_dropped_with_a_notice() {
+        let text = "[[categories]]\nlabel = \"将棋\"\nquery = \"将棋\"\n\n[[categories]]\nlabel = \"\"\nquery = \"x\"\n\n[[categories]]\nlabel = \"y\"\n";
+        assert_eq!(
+            settings_of(text).categories,
+            [Category::new("将棋", "将棋")]
+        );
+        let notice = notices_of(text).join(" / ");
+        assert!(notice.contains("2 件"), "{notice}");
+    }
+
+    #[test]
+    fn render_round_trips_the_new_sections() {
+        let custom = Settings {
+            search: SearchSettings {
+                layout: LayoutMode::List,
+                limit: 30,
+            },
+            thumbnails: ThumbnailSettings {
+                enabled: false,
+                cache_dir: Some(PathBuf::from("/tmp/th")),
+                max_cached: 12,
+                timeout: Duration::from_secs(7),
+            },
+            categories: vec![Category::new("将棋", "将棋 対局")],
+            ..Settings::default()
+        };
+        assert_eq!(settings_of(&render(&custom)), custom);
+
+        // 既定のカテゴリは書き方の例をコメントで出す。
+        let text = render(&Settings::default());
+        assert!(text.contains("# [[categories]]"), "{text}");
+        assert!(
+            text.contains("[search]") && text.contains("[thumbnails]"),
+            "{text}"
+        );
     }
 
     #[test]

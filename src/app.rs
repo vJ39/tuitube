@@ -1,10 +1,13 @@
+use crate::category::Tabs;
 use crate::cookies::{CookieState, Target};
 use crate::display::DisplayMode;
 use crate::mpv::MpvCommand;
+use crate::rgb::RgbImage;
 use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::Settings;
 use crate::speed::{Polled, Speed};
+use crate::thumbs::Thumbs;
 use crate::video::VideoSink;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
@@ -49,6 +52,17 @@ pub enum AppEvent {
     MpvExited {
         nonce: u64,
         error: Option<String>,
+    },
+    /// サムネイルのデコードが終わった。nonce は検索と共用で、
+    /// 検索が入れ替わっていれば古い画像として捨てる。
+    ThumbsReady {
+        nonce: u64,
+        target_px: (u32, u32),
+        images: Vec<(String, Result<RgbImage, ()>)>,
+        /// 一度だけ伝える事情 (保存先を作れない等)。
+        notice: Option<String>,
+        /// 以後サムネイル取得を止める理由 (curl が無い)。
+        disable: Option<String>,
     },
 }
 
@@ -134,6 +148,11 @@ pub struct App {
     pub screen: Rect,
     pub seek_bar: SeekBarState,
     pub should_quit: bool,
+    /// 擬似カテゴリタブ。results / selected / scroll はここの写し。
+    pub tabs: Tabs,
+    pub thumbs: Thumbs,
+    /// 格子の先頭表示位置 (項目インデックス)。描画のたびに列数で丸める。
+    pub scroll: usize,
 }
 
 impl Default for App {
@@ -156,6 +175,9 @@ impl Default for App {
             screen: Rect::default(),
             seek_bar: SeekBarState::default(),
             should_quit: false,
+            tabs: Tabs::default(),
+            thumbs: Thumbs::default(),
+            scroll: 0,
         }
     }
 }
@@ -180,14 +202,42 @@ impl App {
     }
 
     pub fn set_results(&mut self, results: Vec<SearchResult>, target: &Target) {
-        self.results = results;
-        self.selected = 0;
+        let state = self.tabs.state_mut();
+        state.results = results;
+        state.selected = 0;
+        state.scroll = 0;
+        // 0 件でも読み込み済みにする。戻るたびに同じ検索を投げ直さないため。
+        state.loaded = true;
+        self.sync_from_tab();
         if self.results.is_empty() {
             self.error = Some(target.empty_message());
             self.mode = Mode::Input;
         } else {
             self.mode = Mode::Results;
         }
+    }
+
+    /// 今のタブの内容を App 側の写しへ取り込む。サムネイルの状態表も入れ替える。
+    pub fn sync_from_tab(&mut self) {
+        let state = self.tabs.state();
+        self.results = state.results.clone();
+        self.selected = state.selected;
+        self.scroll = state.scroll;
+        let ids = self.result_ids();
+        self.thumbs.reset(&ids);
+        self.thumbs.mark_dirty();
+    }
+
+    /// 画面から離れる前に、タブへ選択位置を書き戻す。
+    pub fn store_to_tab(&mut self) {
+        let (selected, scroll) = (self.selected, self.scroll);
+        let state = self.tabs.state_mut();
+        state.selected = selected;
+        state.scroll = scroll;
+    }
+
+    pub fn result_ids(&self) -> Vec<String> {
+        self.results.iter().map(|r| r.id.clone()).collect()
     }
 
     /// ポーリングの応答を取り込む。mpv へ送り返すものがあれば返す。
@@ -244,7 +294,7 @@ impl App {
         let line = match self.mode {
             Mode::Playing => self.playing_status(),
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
-            Mode::Results => self.search_status(format!("{} 件", self.results.len())),
+            Mode::Results => self.search_status(self.results_status()),
         };
         // エラーが出ている行に足すと読みにくいので、そのときは譲る。
         match &self.notice {
@@ -259,6 +309,18 @@ impl App {
         match &self.error {
             Some(error) => format!("{line}  |  エラー: {error}"),
             None => line,
+        }
+    }
+
+    /// 格子のタイトルは 18 桁ほどで切れるので、選択中の完全なタイトルはここに出す。
+    fn results_status(&self) -> String {
+        let count = format!("{} 件", self.results.len());
+        if self.thumbs.is_fetching() {
+            return format!("{count}  |  サムネイル取得中...");
+        }
+        match self.selected_result() {
+            Some(result) => format!("{count}  |  {}", result.title),
+            None => count,
         }
     }
 
@@ -408,6 +470,68 @@ mod tests {
         app.set_results(Vec::new(), &search_target());
         assert_eq!(app.mode, Mode::Input);
         assert!(app.error.is_some());
+    }
+
+    #[test]
+    fn the_results_status_shows_the_full_title_of_the_selection() {
+        // 格子ではタイトルが切り詰められるので、完全なタイトルはここでしか読めない。
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a"), result("b")],
+            selected: 1,
+            ..App::default()
+        };
+        assert_eq!(app.status_line(), "2 件  |  title b");
+
+        app.thumbs.set_fetching(true);
+        assert_eq!(app.status_line(), "2 件  |  サムネイル取得中...");
+
+        // 0 件なら件数だけ。
+        let app = App {
+            mode: Mode::Results,
+            ..App::default()
+        };
+        assert_eq!(app.status_line(), "0 件");
+    }
+
+    #[test]
+    fn set_results_writes_through_to_the_current_tab() {
+        let mut app = App {
+            selected: 5,
+            scroll: 8,
+            ..App::default()
+        };
+        app.set_results(vec![result("a"), result("b")], &search_target());
+
+        assert_eq!(app.tabs.state().results.len(), 2);
+        assert!(app.tabs.state().loaded, "戻ったときに再検索しない");
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll, 0);
+        // 0 件でも読み込み済みにする。
+        app.set_results(Vec::new(), &search_target());
+        assert!(app.tabs.state().loaded);
+    }
+
+    #[test]
+    fn storing_and_syncing_moves_the_selection_between_tabs() {
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.selected = 1;
+        app.scroll = 4;
+        app.store_to_tab();
+
+        app.tabs.next();
+        app.sync_from_tab();
+        assert!(app.results.is_empty());
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.scroll, 0);
+
+        app.tabs.prev();
+        app.sync_from_tab();
+        assert_eq!(app.results.len(), 2);
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.scroll, 4);
+        assert_eq!(app.result_ids(), ["a", "b"]);
     }
 
     #[test]
@@ -621,9 +745,10 @@ mod tests {
             notice: Some("TUITUBE_FPS_LIMIT=3O を数値として読めません".to_string()),
             ..App::default()
         };
+        // 件数と選択中のタイトルの後ろに続く。
         assert_eq!(
             app.status_line(),
-            "1 件  |  TUITUBE_FPS_LIMIT=3O を数値として読めません"
+            "1 件  |  title a  |  TUITUBE_FPS_LIMIT=3O を数値として読めません"
         );
 
         // 検索中でも消えない。

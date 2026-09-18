@@ -320,9 +320,10 @@ impl Target {
         }
     }
 
-    pub fn yt_dlp_url(&self) -> String {
+    /// limit は [search] limit。フィードは件数を --playlist-end で渡すのでここでは使わない。
+    pub fn yt_dlp_url(&self, limit: usize) -> String {
         match self {
-            Target::Search(query) => format!("ytsearch10:{query}"),
+            Target::Search(query) => format!("ytsearch{limit}:{query}"),
             Target::Feed(feed) => feed.keyword().to_string(),
         }
     }
@@ -740,11 +741,14 @@ mod tests {
     fn target_for_query_wraps_searches_and_passes_feeds() {
         let target = Target::for_query("rust tui");
         assert_eq!(target, Target::Search("rust tui".to_string()));
-        assert_eq!(target.yt_dlp_url(), "ytsearch10:rust tui");
+        assert_eq!(target.yt_dlp_url(10), "ytsearch10:rust tui");
+        // 件数は設定から渡る。
+        assert_eq!(target.yt_dlp_url(25), "ytsearch25:rust tui");
 
         let target = Target::for_query(" :ytsubs ");
         assert_eq!(target, Target::Feed(Feed::Subscriptions));
-        assert_eq!(target.yt_dlp_url(), ":ytsubs");
+        assert_eq!(target.yt_dlp_url(10), ":ytsubs");
+        assert_eq!(target.yt_dlp_url(25), ":ytsubs");
     }
 
     #[test]
