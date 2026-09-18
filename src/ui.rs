@@ -1,10 +1,14 @@
 use crate::app::{App, Mode, format_time};
+use crate::display::DisplayMode;
 use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+
+/// 別ウィンドウ再生中に映像領域へ出す案内。
+const WINDOW_PLACEHOLDER: &str = "別ウィンドウで再生中  w: 埋め込みに戻す";
 
 /// 再生中は [映像, シークバー, ステータス, ヘルプ] の4段。映像に残り全体を渡す。
 fn playing_areas(area: Rect) -> [Rect; 4] {
@@ -97,11 +101,32 @@ fn draw_search(frame: &mut Frame, app: &App) {
     }
 }
 
-/// 映像領域には何も描かない。画像は draw の後にメインループが APC で重ねる。
+/// 埋め込み中の映像領域には何も描かない。画像は draw の後にメインループが APC で重ねる。
 fn draw_playing(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    if app.display == DisplayMode::Window {
+        draw_window_placeholder(frame, video_area(area));
+    }
     draw_seek_bar(frame, app, area);
     draw_footer(frame, app, status_area(area), help_area(area));
+}
+
+/// 別ウィンドウ中は映像が来ないので、どこで再生しているかを映像領域に出す。
+fn draw_window_placeholder(frame: &mut Frame, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let row = Rect {
+        y: area.y + area.height / 2,
+        height: 1,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(WINDOW_PLACEHOLDER)
+            .style(Style::default().fg(Color::DarkGray))
+            .centered(),
+        row,
+    );
 }
 
 /// ポインタが指す列と時刻。duration が無いとシークできないので、印もラベルも出さない。
@@ -140,7 +165,8 @@ fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
         status,
     );
     frame.render_widget(
-        Paragraph::new(help_text(app.mode)).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(help_text(app.mode, app.display))
+            .style(Style::default().fg(Color::DarkGray)),
         help,
     );
 }
@@ -155,15 +181,20 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
         .min(input_area.right().saturating_sub(2))
 }
 
-fn help_text(mode: Mode) -> &'static str {
+fn help_text(mode: Mode, display: DisplayMode) -> &'static str {
     match mode {
         Mode::Input => {
             "Enter:検索  :ytrec/:ythis/:ytsubs/:ytwatchlater:ログイン連動の一覧  Esc:結果へ/終了"
         }
         Mode::Results => "↑↓:選択  Enter:再生  /またはEsc:検索入力へ  q:終了",
-        Mode::Playing => {
-            "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  Esc:停止  q:終了"
-        }
+        Mode::Playing => match display {
+            DisplayMode::Embedded => {
+                "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  w:別ウィンドウ  Esc:停止  q:終了"
+            }
+            DisplayMode::Window => {
+                "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  w:埋め込みへ  Esc:停止  q:終了"
+            }
+        },
     }
 }
 
@@ -216,12 +247,26 @@ mod tests {
 
     #[test]
     fn results_help_mentions_esc() {
-        assert!(help_text(Mode::Results).contains("Esc"));
+        assert!(help_text(Mode::Results, DisplayMode::Embedded).contains("Esc"));
+    }
+
+    #[test]
+    fn help_text_names_the_other_display_mode() {
+        assert!(help_text(Mode::Playing, DisplayMode::Embedded).contains("w:別ウィンドウ"));
+        assert!(help_text(Mode::Playing, DisplayMode::Window).contains("w:埋め込みへ"));
+    }
+
+    #[test]
+    fn video_area_layout_is_unchanged_by_the_display_mode() {
+        // プレースホルダは映像と同じ矩形に描くので、割り付けはモードで変わらない。
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
+        assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
     }
 
     #[test]
     fn input_help_mentions_feed_keywords() {
-        let help = help_text(Mode::Input);
+        let help = help_text(Mode::Input, DisplayMode::Embedded);
         for keyword in [":ytrec", ":ythis", ":ytsubs", ":ytwatchlater"] {
             assert!(help.contains(keyword), "{keyword} がない: {help}");
         }
@@ -239,6 +284,6 @@ mod tests {
 
     #[test]
     fn playing_help_mentions_the_mouse() {
-        assert!(help_text(Mode::Playing).contains("シーク"));
+        assert!(help_text(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
     }
 }

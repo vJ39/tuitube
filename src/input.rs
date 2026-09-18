@@ -2,7 +2,7 @@
 
 use crate::actions::{
     SEEK_STEP_SECS, Session, seek_absolute, seek_relative, send_to_player, start_playback,
-    start_search, stop_playback,
+    start_search, stop_playback, toggle_display_mode,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::mpv::{self, MpvCommand};
@@ -81,6 +81,10 @@ async fn handle_key_playing(app: &mut App, key: KeyEvent, session: &mut Session)
     }
     if let Some(command) = playing_command(key.code) {
         send_to_player(app, session, &command).await;
+    }
+    // 複数コマンドと App の状態更新を伴うので playing_command には入れない。
+    if key.code == KeyCode::Char('w') {
+        toggle_display_mode(app, session).await;
     }
     if key.code == KeyCode::Char('q') {
         app.should_quit = true;
@@ -309,6 +313,31 @@ mod tests {
         assert_eq!(playing_command(KeyCode::Char('q')), Some(mpv::quit()));
         assert_eq!(playing_command(KeyCode::Char('x')), None);
         assert_eq!(playing_command(KeyCode::Enter), None);
+    }
+
+    #[test]
+    fn w_is_not_a_plain_mpv_command() {
+        // 表示モードの切替は複数コマンドなので、シークと同じく別経路。
+        assert_eq!(playing_command(KeyCode::Char('w')), None);
+    }
+
+    #[tokio::test]
+    async fn w_toggles_only_while_playing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char('w')), &tx, &mut session).await;
+        assert_eq!(app.display, crate::display::DisplayMode::Embedded);
+
+        let mut app = App::default();
+        handle_key(&mut app, key(KeyCode::Char('w')), &tx, &mut session).await;
+        assert_eq!(app.display, crate::display::DisplayMode::Embedded);
+        assert_eq!(app.query, "w", "入力モードでは文字として入る");
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 use crate::cookies::{CookieState, Target};
+use crate::display::DisplayMode;
 use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
+use crate::settings::Settings;
 use crate::video::VideoSink;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
@@ -68,6 +70,8 @@ pub struct Playback {
     pub duration: Option<f64>,
     pub volume: Option<f64>,
     pub pending_seek: Option<PendingSeek>,
+    /// mpv が実際に使っている VO。要求した表示モードが通ったかはこれで見る。
+    pub current_vo: Option<String>,
 }
 
 impl Playback {
@@ -112,8 +116,10 @@ pub struct App {
     /// ブラウザ cookie 連携の状態。検索・再生・表示がここを見る。
     pub cookies: CookieState,
     pub playback: Playback,
-    /// mpv に適用する fps 上限。None は制限なし。
-    pub fps_limit: Option<u32>,
+    /// 起動時に読んだ設定。
+    pub settings: Settings,
+    /// 要求中の表示モード。実際にどちらで出ているかは playback.current_vo。
+    pub display: DisplayMode,
     /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
     pub video: Option<VideoSink>,
     /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
@@ -134,7 +140,8 @@ impl Default for App {
             notice: None,
             cookies: CookieState::default(),
             playback: Playback::default(),
-            fps_limit: crate::mpv::FpsLimit::default().limit,
+            settings: Settings::default(),
+            display: DisplayMode::default(),
             video: None,
             screen: Rect::default(),
             seek_bar: SeekBarState::default(),
@@ -181,6 +188,10 @@ impl App {
             crate::mpv::REQ_DURATION => self.playback.duration = data.and_then(|v| v.as_f64()),
             crate::mpv::REQ_PAUSE => self.playback.paused = data.and_then(|v| v.as_bool()),
             crate::mpv::REQ_VOLUME => self.playback.volume = data.and_then(|v| v.as_f64()),
+            crate::mpv::REQ_CURRENT_VO => {
+                self.playback.current_vo =
+                    data.as_ref().and_then(|v| v.as_str()).map(str::to_string);
+            }
             _ => {}
         }
     }
@@ -224,6 +235,27 @@ impl App {
         }
     }
 
+    /// 要求と mpv の実際が食い違う間は切替中と出す。切替は数秒かかることがある。
+    pub fn display_label(&self) -> String {
+        let detail = match self.display {
+            DisplayMode::Embedded => {
+                let fps = self
+                    .settings
+                    .fps_cap
+                    .map(|cap| format!(" {}fps", cap.get()))
+                    .unwrap_or_default();
+                format!("{fps} {}", self.settings.display.quality.label())
+            }
+            DisplayMode::Window => String::new(),
+        };
+        let actual = DisplayMode::from_current_vo(self.playback.current_vo.as_deref());
+        let transition = match actual {
+            Some(actual) if actual != self.display => " (切替中)",
+            _ => "",
+        };
+        format!("[{}{detail}{transition}]", self.display.label())
+    }
+
     fn playback_line(&self) -> String {
         let state = match self.playback.paused {
             Some(true) => "PAUSED",
@@ -236,10 +268,11 @@ impl App {
             .map(|v| format!("  vol {v:.0}"))
             .unwrap_or_default();
         format!(
-            "{state}  {}  {} / {}{volume}",
+            "{state}  {}  {} / {}{volume}  {}",
             self.playback.title,
             format_time(self.playback.time_pos),
-            format_time(self.playback.duration)
+            format_time(self.playback.duration),
+            self.display_label()
         )
     }
 }
@@ -454,11 +487,64 @@ mod tests {
     }
 
     #[test]
-    fn the_default_fps_limit_is_the_one_the_mpv_module_defines() {
-        assert_eq!(
-            App::default().fps_limit,
-            Some(crate::mpv::DEFAULT_FPS_LIMIT)
+    fn current_vo_is_applied_from_the_poll() {
+        let mut app = App::default();
+        app.apply_property(crate::mpv::REQ_CURRENT_VO, Some(json!("gpu-next")));
+        assert_eq!(app.playback.current_vo.as_deref(), Some("gpu-next"));
+        // kitty VO では取れないプロパティもあるので、値が消えることも通常の経過。
+        app.apply_property(crate::mpv::REQ_CURRENT_VO, None);
+        assert_eq!(app.playback.current_vo, None);
+    }
+
+    #[test]
+    fn display_label_marks_the_transition_until_mpv_confirms() {
+        let mut app = App {
+            display: DisplayMode::Window,
+            playback: Playback {
+                current_vo: Some("kitty".to_string()),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        assert_eq!(app.display_label(), "[別ウィンドウ (切替中)]");
+
+        app.playback.current_vo = Some("gpu-next".to_string());
+        assert_eq!(app.display_label(), "[別ウィンドウ]");
+
+        app.display = DisplayMode::Embedded;
+        app.playback.current_vo = Some("kitty".to_string());
+        assert_eq!(app.display_label(), "[埋め込み 15fps medium]");
+
+        // 制限なしなら fps は出さない。
+        app.settings.fps_cap = None;
+        assert_eq!(app.display_label(), "[埋め込み medium]");
+
+        // 値が来ていない間は切替中と決めつけない。
+        app.playback.current_vo = None;
+        assert_eq!(app.display_label(), "[埋め込み medium]");
+    }
+
+    #[test]
+    fn the_status_line_ends_with_the_display_label_while_playing() {
+        let app = App {
+            mode: Mode::Playing,
+            playback: Playback {
+                title: "song".to_string(),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        assert!(
+            app.status_line().ends_with(&app.display_label()),
+            "{}",
+            app.status_line()
         );
+    }
+
+    #[test]
+    fn default_app_takes_the_display_mode_from_settings() {
+        assert_eq!(App::default().display, Settings::default().display.mode);
+        assert_eq!(App::default().settings, Settings::default());
     }
 
     #[test]

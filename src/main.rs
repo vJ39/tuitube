@@ -1,18 +1,18 @@
 mod actions;
 mod app;
 mod cookies;
+mod display;
 mod geometry;
 mod input;
 mod kitty;
 mod mpv;
 mod search;
 mod seekbar;
+mod settings;
 mod ui;
 mod video;
 
-use actions::{
-    Session, apply_fps_limit, apply_resize, end_playback, schedule_resize, stop_playback,
-};
+use actions::{Session, apply_resize, end_playback, poll_player, schedule_resize, stop_playback};
 use anyhow::Result;
 use app::{App, AppEvent, Mode};
 use cookies::{CookieOutcome, CookieState, Target};
@@ -72,10 +72,11 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     spawn_input_reader(tx.clone());
 
     // 設定は起動時に一度だけ読む。読み替えたときは notice がステータス行に出る。
-    let fps = mpv::FpsLimit::from_env();
+    let loaded = settings::load();
     let mut app = App {
-        fps_limit: fps.limit,
-        notice: fps.notice,
+        display: loaded.settings.display.mode,
+        settings: loaded.settings,
+        notice: loaded.notice,
         // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
         cookies: CookieState::from_env(),
         ..App::default()
@@ -101,15 +102,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     handle_event(&mut app, event, &tx, &mut session).await;
                 }
             }
-            _ = ticker.tick() => {
-                if let Some(p) = session.player.as_mut() {
-                    match p.controller.poll_properties().await {
-                        // 一過性の失敗で再生状況が隠れ続けないよう、成功したらエラーを消す。
-                        Ok(()) => app.error = None,
-                        Err(e) => app.error = Some(e),
-                    }
-                }
-            }
+            _ = ticker.tick() => poll_player(&mut app, &mut session).await,
             _ = wait_until(session.resize_at) => {
                 session.resize_at = None;
                 apply_resize(&mut app, &mut session).await;
@@ -215,12 +208,7 @@ async fn handle_event(
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
-                // fps 上限は表示でなく mpv への指示なので、App でなく player へ渡す。
-                if id == mpv::REQ_CONTAINER_FPS {
-                    apply_fps_limit(app, session, data.and_then(|v| v.as_f64())).await;
-                } else {
-                    app.apply_property(id, data);
-                }
+                app.apply_property(id, data);
             }
         }
         AppEvent::VideoFrame { nonce } => {

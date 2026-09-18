@@ -190,9 +190,10 @@ pub enum FrameEvent {
     /// a=d を見た。未完成フレームは捨てる。
     Clear,
 }
-#[derive(Default)]
-pub struct FrameAssembler { /* open frame */ }
+pub struct FrameAssembler { /* open frame, 上限バイト数 */ }
 impl FrameAssembler {
+    /// 1 フレームのピクセル予算から溜め込みの上限を決める (f=24 の base64 で 1 px = 4 バイト)。
+    pub fn new(pixels: u64) -> Self;
     pub fn push(&mut self, cmd: GraphicsCommand) -> Option<FrameEvent>;
 }
 ```
@@ -304,6 +305,7 @@ lavfi の `fps` フィルタは上限ではなく定レート変換で、指定�
 | `m=0` 継続 | 追記して完成 → `FrameEvent::Frame` |
 | `a=d` | 未完成フレームを捨てて `FrameEvent::Clear` |
 | `s/v` が無い・数値でない `a=T` | 無視(フレームを開かない) |
+| 開いているフレームがピクセル予算ぶんの長さを超えた | 捨てる。`MAX_APC_LEN` は APC 1 個しか縛らないので、`m=0` が来ないストリームで累積側が伸び続けないようにする。上限は予算 (画質設定) から決める。固定値にすると予算を上げたときに毎フレーム捨てることになる |
 
 ### 3-6. ratatui との統合手順
 

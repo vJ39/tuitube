@@ -1,4 +1,5 @@
 use crate::app::AppEvent;
+use crate::display::LaunchPlan;
 use crate::video::{Geometry, VideoSink};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -20,124 +21,13 @@ pub const REQ_TIME_POS: u64 = 1;
 pub const REQ_DURATION: u64 = 2;
 pub const REQ_PAUSE: u64 = 3;
 pub const REQ_VOLUME: u64 = 4;
-/// ソースの fps。上限を超えるときだけフィルタを足すので、値が取れるまで聞き続ける。
-pub const REQ_CONTAINER_FPS: u64 = 5;
+/// 実際に使われている VO。5 は container-fps に使っていたので再利用しない。
+pub const REQ_CURRENT_VO: u64 = 6;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 /// quit を送ってから SIGKILL に切り替えるまでの猶予。
 const QUIT_GRACE: Duration = Duration::from_secs(2);
-/// fps 上限の既定値。kitty 出力は 1 フレームごとに画素を CPU で作るため、
-/// 制限しないと再生が重くなる (実測 CPU 122% → 40%)。
-pub const DEFAULT_FPS_LIMIT: u32 = 15;
-/// 受け付ける上限値。桁を打ち間違えた値をそのまま渡すと、複製フレームで端末とパイプが詰まる。
-const MAX_FPS_LIMIT: u32 = 120;
-/// fps 上限を指定する環境変数。0 か unlimited で制限を外す。
-const FPS_LIMIT_VAR: &str = "TUITUBE_FPS_LIMIT";
-
-/// 環境変数 TUITUBE_FPS_LIMIT の解釈結果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FpsLimit {
-    /// None は制限なし。
-    pub limit: Option<u32>,
-    /// 指定値をそのまま採らなかったときだけ入る、利用者への表示文。
-    pub notice: Option<String>,
-}
-
-impl Default for FpsLimit {
-    fn default() -> Self {
-        Self {
-            limit: Some(DEFAULT_FPS_LIMIT),
-            notice: None,
-        }
-    }
-}
-
-impl FpsLimit {
-    pub fn from_env() -> Self {
-        Self::parse(std::env::var(FPS_LIMIT_VAR).ok().as_deref())
-    }
-
-    /// 壊れた値で再生できなくなる方が困るので、起動は止めず既定値に倒す。
-    /// 黙って倒すと「設定したのに効かない」に気づけないので、理由を notice に残す。
-    fn parse(raw: Option<&str>) -> Self {
-        let raw = raw.unwrap_or_default().trim();
-        if raw.is_empty() {
-            return Self::default();
-        }
-        if raw.eq_ignore_ascii_case("unlimited") {
-            return Self::unlimited();
-        }
-        match raw.parse::<u32>() {
-            Ok(0) => Self::unlimited(),
-            Ok(fps) if fps <= MAX_FPS_LIMIT => Self {
-                limit: Some(fps),
-                notice: None,
-            },
-            Ok(fps) => Self {
-                limit: Some(MAX_FPS_LIMIT),
-                notice: Some(format!(
-                    "{FPS_LIMIT_VAR}={fps} は上限の {MAX_FPS_LIMIT} に丸めました"
-                )),
-            },
-            Err(_) => Self {
-                limit: Some(DEFAULT_FPS_LIMIT),
-                notice: Some(format!(
-                    "{FPS_LIMIT_VAR}={raw} を数値として読めません。{DEFAULT_FPS_LIMIT} fps で再生します"
-                )),
-            },
-        }
-    }
-
-    fn unlimited() -> Self {
-        Self {
-            limit: None,
-            notice: None,
-        }
-    }
-}
-
-/// fps 上限の適用状態。ソースの fps が分かるまで判定を持ち越し、判定は 1 回だけ行う。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FpsFilter {
-    limit: Option<u32>,
-    decided: bool,
-}
-
-impl FpsFilter {
-    fn new(limit: Option<u32>) -> Self {
-        Self {
-            limit,
-            decided: limit.is_none(),
-        }
-    }
-
-    /// ソースの fps をまだ聞く必要があるか。
-    fn wants_source_fps(&self) -> bool {
-        !self.decided
-    }
-
-    /// ソースの fps が分かった時点で、足すべきコマンドがあれば返す。
-    fn decide(&mut self, source_fps: f64) -> Option<MpvCommand> {
-        if self.decided {
-            return None;
-        }
-        self.decided = true;
-        let limit = self.limit?;
-        // fps フィルタは上限ではなく定レート変換で、上限より遅いソースではフレームを複製する
-        // (実測: 2fps のソースを 2 秒再生して 5 → 25 フレーム)。速いソースにだけ付ける。
-        (source_fps > f64::from(limit)).then(|| add_fps_filter(limit))
-    }
-}
-
-/// 利用者の mpv.conf にある vf 設定を消さないよう、置換 (--vf=) ではなく追加で入れる。
-fn add_fps_filter(fps: u32) -> MpvCommand {
-    MpvCommand {
-        command: vec![json!("vf"), json!("add"), json!(format!("fps={fps}"))],
-        request_id: None,
-    }
-}
-
 #[derive(Debug, Serialize, PartialEq)]
 pub struct MpvCommand {
     command: Vec<Value>,
@@ -190,21 +80,58 @@ pub fn quit() -> MpvCommand {
     }
 }
 
-fn set_property(name: &str, value: Value) -> MpvCommand {
+pub fn set_property(name: &str, value: Value) -> MpvCommand {
     MpvCommand {
         command: vec![json!("set_property"), json!(name), value],
         request_id: None,
     }
 }
 
+/// ラベル付きで足したフィルタは、同じラベルで外せる。
+pub fn vf_add(spec: &str) -> MpvCommand {
+    MpvCommand {
+        command: vec![json!("vf"), json!("add"), json!(spec)],
+        request_id: None,
+    }
+}
+
+pub fn vf_remove(label: &str) -> MpvCommand {
+    MpvCommand {
+        command: vec![json!("vf"), json!("remove"), json!(format!("@{label}"))],
+        request_id: None,
+    }
+}
+
+/// 毎秒のポーリングで聞くプロパティ。
+pub fn poll_commands() -> Vec<MpvCommand> {
+    [
+        ("time-pos", REQ_TIME_POS),
+        ("duration", REQ_DURATION),
+        ("pause", REQ_PAUSE),
+        ("volume", REQ_VOLUME),
+        ("current-vo", REQ_CURRENT_VO),
+    ]
+    .iter()
+    .map(|(name, id)| get_property(name, *id))
+    .collect()
+}
+
+/// kitty VO のオプションは、起動引数 (--vo-kitty-cols) とプロパティ名 (vo-kitty-cols) が同じ綴り。
+pub fn set_kitty_option(key: &str, value: Value) -> MpvCommand {
+    set_property(&format!("vo-kitty-{key}"), value)
+}
+
 /// VO のオプションは生成時にしか読まれないので、書き換えるだけでは反映されない (実測)。
 /// 映像トラックを外して入れ直すと VO が作り直され、新しい寸法で描き始める。
 pub fn resize_video(geometry: Geometry) -> [MpvCommand; 6] {
+    let [cols, rows, width, height] = geometry
+        .size_options()
+        .map(|(key, value)| set_kitty_option(key, value));
     [
-        set_property("vo-kitty-cols", json!(geometry.area.width.max(1))),
-        set_property("vo-kitty-rows", json!(geometry.area.height.max(1))),
-        set_property("vo-kitty-width", json!(geometry.frame_px.0)),
-        set_property("vo-kitty-height", json!(geometry.frame_px.1)),
+        cols,
+        rows,
+        width,
+        height,
         set_property("vid", json!("no")),
         set_property("vid", json!("auto")),
     ]
@@ -370,25 +297,16 @@ fn failure_detail(stderr_tail: String, log_path: &Path) -> String {
     }
 }
 
-/// 起動引数の組み立て。extra は URL の直前に入る (cookie 指定など)。
-pub fn launch_args(
-    socket: &Path,
-    log: &Path,
-    geometry: Geometry,
-    extra: &[String],
-    url: &str,
-) -> Vec<String> {
+/// 起動引数の組み立て。表示モードで変わるぶんは plan が持つ。
+pub fn launch_args(socket: &Path, log: &Path, plan: &LaunchPlan, url: &str) -> Vec<String> {
     // --no-terminal: mpv shares this terminal and its status line would corrupt the TUI.
     // --log-file: そのぶん失われる失敗理由の受け皿。
-    // --vo-kitty-*: stdout がパイプだと端末サイズを取得できず既定値に落ちるため全て明示する。
     let mut args = vec![
         format!("--input-ipc-server={}", socket.display()),
         format!("--log-file={}", log.display()),
         "--no-terminal".to_string(),
-        "--vo=kitty".to_string(),
     ];
-    args.extend(geometry.mpv_args());
-    args.extend_from_slice(extra);
+    args.extend(plan.args());
     args.push(url.to_string());
     args
 }
@@ -397,7 +315,6 @@ pub struct MpvController {
     writer: OwnedWriteHalf,
     socket_path: PathBuf,
     log_path: PathBuf,
-    fps: FpsFilter,
     /// 送信側を落とすと終了待ちタスクが猶予後に mpv を kill する。
     _kill: oneshot::Sender<()>,
 }
@@ -408,8 +325,7 @@ impl MpvController {
         nonce: u64,
         events: UnboundedSender<AppEvent>,
         video: VideoSink,
-        fps_limit: Option<u32>,
-        extra: &[String],
+        plan: &LaunchPlan,
     ) -> Result<Self, String> {
         let dir = socket_dir()?;
         let socket_path = socket_path(&dir, nonce);
@@ -418,13 +334,7 @@ impl MpvController {
         let _ = fs::remove_file(&log_path);
 
         let mut child = Command::new("mpv")
-            .args(launch_args(
-                &socket_path,
-                &log_path,
-                video.geometry(),
-                extra,
-                url,
-            ))
+            .args(launch_args(&socket_path, &log_path, plan, url))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -506,7 +416,6 @@ impl MpvController {
             writer,
             socket_path,
             log_path,
-            fps: FpsFilter::new(fps_limit),
             _kill: kill_tx,
         })
     }
@@ -516,45 +425,6 @@ impl MpvController {
             .write_all(command.to_line().as_bytes())
             .await
             .map_err(|e| format!("mpv への送信に失敗しました: {e}"))
-    }
-
-    pub async fn poll_properties(&mut self) -> Result<(), String> {
-        for (name, id) in [
-            ("time-pos", REQ_TIME_POS),
-            ("duration", REQ_DURATION),
-            ("pause", REQ_PAUSE),
-            ("volume", REQ_VOLUME),
-        ] {
-            self.send(&get_property(name, id)).await?;
-        }
-        // 読み込み前は値が返らないので、決まるまで毎回聞く。決まったら聞かない。
-        if self.fps.wants_source_fps() {
-            self.send(&get_property("container-fps", REQ_CONTAINER_FPS))
-                .await?;
-        }
-        Ok(())
-    }
-
-    /// ソースの fps が分かった時点で、上限を超えるときだけ fps フィルタを足す。
-    /// 判定は 1 回だけなので、二重に足さない。
-    pub async fn limit_fps(&mut self, source_fps: f64) -> Result<(), String> {
-        let Some(command) = self.fps.decide(source_fps) else {
-            return Ok(());
-        };
-        self.send(&command).await
-    }
-
-    /// 端末リサイズに合わせて映像の寸法を作り直す。
-    pub async fn resize_video(&mut self, geometry: Geometry) -> Result<(), String> {
-        for command in resize_video(geometry) {
-            self.send(&command).await?;
-        }
-        Ok(())
-    }
-
-    /// quit を送って手放す。届かなくても終了待ちタスクが猶予後に kill するので取り残さない。
-    pub async fn shutdown(mut self) {
-        let _ = self.send(&quit()).await;
     }
 }
 
@@ -661,6 +531,7 @@ async fn connect_with_retry(path: &Path, child: &mut Child) -> Result<UnixStream
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::{DisplayMode, FpsCap, WindowOptions};
     use crate::kitty::fixtures::frame;
     use crate::video::{CellSize, MAX_FRAME_PIXELS};
     use ratatui::layout::Rect;
@@ -744,98 +615,6 @@ mod tests {
                 "{\"command\":[\"set_property\",\"vid\",\"auto\"]}\n",
             ]
         );
-    }
-
-    #[test]
-    fn fps_limit_defaults_when_the_variable_is_unset_or_empty() {
-        assert_eq!(DEFAULT_FPS_LIMIT, 15);
-        for raw in [None, Some(""), Some("   ")] {
-            assert_eq!(FpsLimit::parse(raw), FpsLimit::default());
-        }
-        assert_eq!(FpsLimit::default().limit, Some(DEFAULT_FPS_LIMIT));
-        assert!(FpsLimit::default().notice.is_none());
-    }
-
-    #[test]
-    fn fps_limit_reads_an_explicit_value_without_a_notice() {
-        for (raw, fps) in [("30", 30), (" 24 ", 24), ("120", MAX_FPS_LIMIT)] {
-            let parsed = FpsLimit::parse(Some(raw));
-            assert_eq!(parsed.limit, Some(fps));
-            assert_eq!(parsed.notice, None, "{raw} で注意書きは要らない");
-        }
-    }
-
-    #[test]
-    fn fps_limit_is_disabled_by_zero_or_unlimited() {
-        for raw in ["0", "unlimited", "UNLIMITED"] {
-            let parsed = FpsLimit::parse(Some(raw));
-            assert_eq!(parsed.limit, None, "{raw} は制限なしのはず");
-            assert_eq!(parsed.notice, None);
-        }
-    }
-
-    #[test]
-    fn fps_limit_clamps_a_value_above_the_maximum_and_says_so() {
-        // 桁を打ち間違えた値を素通しすると、複製フレームで端末とパイプが飽和する。
-        for raw in ["121", "4294967295"] {
-            let parsed = FpsLimit::parse(Some(raw));
-            assert_eq!(parsed.limit, Some(MAX_FPS_LIMIT), "{raw} は丸めるはず");
-            let notice = parsed.notice.expect("丸めた旨を出す");
-            assert!(notice.contains(raw), "指定値が読み取れない: {notice}");
-            assert!(notice.contains("120"), "丸めた先が読み取れない: {notice}");
-        }
-    }
-
-    #[test]
-    fn fps_limit_falls_back_to_the_default_on_invalid_values_and_says_so() {
-        // 3O のような打ち間違いが黙って既定値になると、効かない理由に気づけない。
-        for raw in ["abc", "3O", "-5", "12.5", "99999999999999999999"] {
-            let parsed = FpsLimit::parse(Some(raw));
-            assert_eq!(
-                parsed.limit,
-                Some(DEFAULT_FPS_LIMIT),
-                "{raw} は既定値に落ちるはず"
-            );
-            let notice = parsed.notice.expect("読めなかった旨を出す");
-            assert!(notice.contains(raw), "指定値が読み取れない: {notice}");
-            assert!(notice.contains("15"), "採用値が読み取れない: {notice}");
-        }
-    }
-
-    #[test]
-    fn fps_filter_is_added_only_for_sources_faster_than_the_limit() {
-        // fps フィルタは定レート変換なので、上限より遅いソースに付けるとフレームが増える。
-        let mut slow = FpsFilter::new(Some(15));
-        assert!(slow.wants_source_fps());
-        assert_eq!(slow.decide(2.0), None);
-        assert!(!slow.wants_source_fps());
-
-        // ちょうど上限も付けない (複製は起きないが変換を挟む意味がない)。
-        assert_eq!(FpsFilter::new(Some(15)).decide(15.0), None);
-
-        let command = FpsFilter::new(Some(15)).decide(30.0).expect("足すはず");
-        assert_eq!(
-            command.to_line(),
-            "{\"command\":[\"vf\",\"add\",\"fps=15\"]}\n"
-        );
-    }
-
-    #[test]
-    fn fps_filter_replaces_nothing_and_decides_only_once() {
-        let mut filter = FpsFilter::new(Some(15));
-        assert!(filter.decide(60.0).is_some());
-        // 2 回目の container-fps で二重に足さない。
-        assert_eq!(filter.decide(60.0), None);
-        assert!(!filter.wants_source_fps());
-        // vf add は追加なので、利用者の mpv.conf の vf 設定を置き換えない。
-        assert!(add_fps_filter(15).to_line().contains("\"add\""));
-    }
-
-    #[test]
-    fn fps_filter_never_asks_for_the_source_fps_without_a_limit() {
-        let mut unlimited = FpsFilter::new(None);
-        assert!(!unlimited.wants_source_fps());
-        assert_eq!(unlimited.decide(240.0), None);
     }
 
     #[test]
@@ -942,36 +721,47 @@ mod tests {
     }
 
     #[test]
-    fn launch_args_place_extra_once_right_before_the_url() {
+    fn launch_args_put_the_plan_between_the_fixed_options_and_the_url() {
         let extra = ["--ytdl-raw-options-append=cookies-from-browser=chrome:Profile 1".to_string()];
+        let plan = LaunchPlan {
+            mode: DisplayMode::Embedded,
+            geometry: test_geometry(80, 22),
+            fps_cap: FpsCap::new(15),
+            window: WindowOptions::default(),
+            extra_args: extra.to_vec(),
+        };
         let args = launch_args(
             Path::new("/tmp/mpv-1.sock"),
             Path::new("/tmp/mpv-1.log"),
-            test_geometry(80, 22),
-            &extra,
+            &plan,
             "https://www.youtube.com/watch?v=abc",
         );
 
         assert_eq!(args[0], "--input-ipc-server=/tmp/mpv-1.sock");
         assert_eq!(args[1], "--log-file=/tmp/mpv-1.log");
-        assert!(args.contains(&"--vo=kitty".to_string()));
-        assert!(args.contains(&"--vo-kitty-cols=80".to_string()));
-        let url = args.len() - 1;
-        assert_eq!(args[url], "https://www.youtube.com/watch?v=abc");
-        assert_eq!(args[url - 1], extra[0]);
-        assert_eq!(args.iter().filter(|a| *a == &extra[0]).count(), 1);
-
-        // extra が無ければ従来の引数のまま。
-        let plain = launch_args(
-            Path::new("/tmp/mpv-1.sock"),
-            Path::new("/tmp/mpv-1.log"),
-            test_geometry(80, 22),
-            &[],
-            "url",
+        assert_eq!(args[2], "--no-terminal");
+        assert_eq!(args[3..args.len() - 1], plan.args()[..]);
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://www.youtube.com/watch?v=abc")
         );
-        assert_eq!(plain.len(), args.len() - 1);
-        assert_eq!(plain.last().map(String::as_str), Some("url"));
-        assert!(!plain.iter().any(|a| a.contains("cookies-from-browser")));
+        // cookie 連携の引数は plan 経由で 1 回だけ入る。
+        assert_eq!(args.iter().filter(|a| *a == &extra[0]).count(), 1);
+    }
+
+    #[test]
+    fn poll_asks_for_current_vo_every_time() {
+        let lines: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
+        assert!(
+            lines.contains(
+                &"{\"command\":[\"get_property\",\"current-vo\"],\"request_id\":6}\n".to_string()
+            ),
+            "{lines:?}"
+        );
+        // 判定を持ち越すプロパティは無くなったので、毎回同じ列になる。
+        let again: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
+        assert_eq!(lines, again);
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]

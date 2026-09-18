@@ -2,13 +2,21 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 /// APC 1 個の上限。壊れたストリームを延々と溜め込まないための足切り。
 const MAX_APC_LEN: usize = 8192;
-/// 組み立て中フレームの上限。MAX_APC_LEN は APC 1 個しか縛らないので、
-/// m=0 が来ないストリームで累積側が伸び続けないよう同じ足切りを入れる。
-/// MAX_FRAME_PIXELS を f=24(3 バイト/px)で base64 化した長さの 2 倍。
-const MAX_FRAME_LEN: usize = crate::video::MAX_FRAME_PIXELS as usize * 3 * 4 / 3 * 2;
+/// 組み立て中フレームの上限の下限。予算が小さくても APC 数個ぶんは受け取れるようにする。
+const MIN_FRAME_LEN: usize = MAX_APC_LEN * 2;
 const APC_INTRO: &[u8] = b"\x1b_G";
 /// APC の終端 (String Terminator)。チャンクの切れ目でもある。
 pub const ST: &[u8] = b"\x1b\\";
+
+/// 組み立て中フレームの上限。MAX_APC_LEN は APC 1 個しか縛らないので、
+/// m=0 が来ないストリームで累積側が伸び続けないよう同じ足切りを入れる。
+/// mpv の kitty VO は f=24(3 バイト/px)を base64 で送るので 1 px = 4 バイト。
+/// チャンクの制御部と端数のぶんを見て 2 倍を上限にする。
+pub fn max_frame_len(pixels: u64) -> usize {
+    usize::try_from(pixels.saturating_mul(8))
+        .unwrap_or(usize::MAX)
+        .max(MIN_FRAME_LEN)
+}
 
 /// 完結した APC G コマンド 1 個。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,12 +177,20 @@ pub enum FrameEvent {
     Clear,
 }
 
-#[derive(Default)]
 pub struct FrameAssembler {
     open: Option<VideoFrame>,
+    /// 1 フレームぶんのピクセル予算から決まる上限。予算は設定の画質で変わる。
+    max_frame_len: usize,
 }
 
 impl FrameAssembler {
+    pub fn new(pixels: u64) -> Self {
+        Self {
+            open: None,
+            max_frame_len: max_frame_len(pixels),
+        }
+    }
+
     pub fn push(&mut self, cmd: GraphicsCommand) -> Option<FrameEvent> {
         match cmd.get('a') {
             Some("T") => {
@@ -203,8 +219,9 @@ impl FrameAssembler {
             Some(_) => None,
             None => {
                 let last = cmd.get('m')? == "0";
+                let max_frame_len = self.max_frame_len;
                 let open = self.open.as_mut()?;
-                if open.bytes.len() + cmd.raw.len() > MAX_FRAME_LEN {
+                if open.bytes.len() + cmd.raw.len() > max_frame_len {
                     self.open = None;
                     return None;
                 }
@@ -270,6 +287,12 @@ mod tests {
     }
 
     const SINGLE: &[u8] = b"\x1b_Ga=T,f=24,s=2,v=1,C=1,q=2,m=0;AAAAAAAA\x1b\\";
+    /// 既定の画質 (640x360) の予算で組み立てる。
+    const MEDIUM_PIXELS: u64 = 640 * 360;
+
+    fn assembler() -> FrameAssembler {
+        FrameAssembler::new(MEDIUM_PIXELS)
+    }
 
     fn mixed_stream() -> Vec<u8> {
         [
@@ -323,7 +346,7 @@ mod tests {
         assert_eq!(commands.len(), 3);
         let joined: Vec<u8> = commands.iter().flat_map(|c| c.raw.clone()).collect();
 
-        let mut assembler = FrameAssembler::default();
+        let mut assembler = assembler();
         let mut events: Vec<Option<FrameEvent>> = Vec::new();
         for cmd in commands {
             events.push(assembler.push(cmd));
@@ -345,7 +368,7 @@ mod tests {
     #[test]
     fn bare_esc_terminated_delete_becomes_clear_without_eating_the_next_sequence() {
         let commands = parse(&[KITTY_UNINIT, &frame(2, 1, b"AAAAAAAA")].concat());
-        let mut assembler = FrameAssembler::default();
+        let mut assembler = assembler();
         let mut events = commands.into_iter().filter_map(|c| assembler.push(c));
         assert_eq!(events.next(), Some(FrameEvent::Clear));
         let Some(FrameEvent::Frame(frame)) = events.next() else {
@@ -362,7 +385,7 @@ mod tests {
         let mut stream = b"\x1b_Ga=T,f=24,s=4,v=2,C=1,q=2,m=1;XXXXXXXX\x1b\\".to_vec();
         stream.extend_from_slice(&frame(2, 1, b"YYYY"));
 
-        let mut assembler = FrameAssembler::default();
+        let mut assembler = assembler();
         let events: Vec<FrameEvent> = parse(&stream)
             .into_iter()
             .filter_map(|c| assembler.push(c))
@@ -391,14 +414,15 @@ mod tests {
         let head = parse(b"\x1b_Ga=T,f=24,s=320,v=176,C=1,q=2,m=1;AAAA\x1b\\")
             .pop()
             .expect("先頭チャンク");
-        let mut assembler = FrameAssembler::default();
+        let mut assembler = assembler();
         assert_eq!(assembler.push(head), None);
 
         // m=0 が来ないまま 8.2MB ぶんの継続チャンクが届いても、上限までしか溜めない。
+        let limit = max_frame_len(MEDIUM_PIXELS);
         for _ in 0..2000 {
             assert_eq!(assembler.push(continuation(false)), None);
             let held = assembler.open.as_ref().map_or(0, |f| f.bytes.len());
-            assert!(held <= MAX_FRAME_LEN, "{held} バイト溜め込んでいる");
+            assert!(held <= limit, "{held} バイト溜め込んでいる");
         }
         assert!(assembler.open.is_none(), "上限超過のフレームが残っている");
         // 捨てた後の m=0 は開いていないフレームへの継続なので何も生まない。
@@ -406,8 +430,38 @@ mod tests {
     }
 
     #[test]
+    fn the_limit_follows_the_pixel_budget_instead_of_a_fixed_size() {
+        // quality = "high" / "native" や max_frame_pixels で予算を上げたぶん、上限も上がる。
+        assert_eq!(max_frame_len(MEDIUM_PIXELS), 1_843_200);
+        assert!(max_frame_len(960 * 540) > max_frame_len(MEDIUM_PIXELS));
+        // 予算が小さくても APC 数個ぶんは受け取れる。
+        assert_eq!(max_frame_len(0), MIN_FRAME_LEN);
+        assert_eq!(max_frame_len(u64::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn a_full_frame_is_assembled_at_every_quality_budget() {
+        // 予算いっぱいのフレームは 1 px = 4 バイト (f=24 の 3 バイト/px を base64 化)。
+        // 上限が固定値だと high 以上でフレームごと捨てていた。
+        for (width, height) in [(640u32, 360u32), (960, 540), (1112, 544)] {
+            let pixels = u64::from(width) * u64::from(height);
+            let data = vec![b'Q'; pixels as usize * 4];
+            let mut assembler = FrameAssembler::new(pixels);
+            let events: Vec<FrameEvent> = parse(&frame(width, height, &data))
+                .into_iter()
+                .filter_map(|c| assembler.push(c))
+                .collect();
+            assert_eq!(events.len(), 1, "{width}x{height} が組み立てられていない");
+            let FrameEvent::Frame(frame) = &events[0] else {
+                panic!("{width}x{height} がフレームになっていない");
+            };
+            assert_eq!((frame.width_px, frame.height_px), (width, height));
+        }
+    }
+
+    #[test]
     fn continuation_without_an_open_frame_is_ignored() {
-        let mut assembler = FrameAssembler::default();
+        let mut assembler = assembler();
         let events: Vec<FrameEvent> = parse(b"\x1b_Gm=1;AAAA\x1b\\\x1b_Gm=0;BBBB\x1b\\")
             .into_iter()
             .filter_map(|c| assembler.push(c))
@@ -429,7 +483,7 @@ mod tests {
 
     #[test]
     fn a_frame_opened_without_a_size_is_ignored() {
-        let mut assembler = FrameAssembler::default();
+        let mut assembler = assembler();
         let events: Vec<FrameEvent> = parse(b"\x1b_Ga=T,f=24,C=1,q=2,m=0;AAAA\x1b\\")
             .into_iter()
             .filter_map(|c| assembler.push(c))

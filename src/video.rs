@@ -1,5 +1,6 @@
 use crate::kitty::{ApcParser, FrameAssembler, FrameEvent, GraphicsCommand, ST, VideoFrame};
 use ratatui::layout::Rect;
+use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -46,18 +47,50 @@ impl Geometry {
         }
     }
 
-    pub fn mpv_args(&self) -> Vec<String> {
-        vec![
-            format!("--vo-kitty-cols={}", self.area.width.max(1)),
-            format!("--vo-kitty-rows={}", self.area.height.max(1)),
-            format!("--vo-kitty-width={}", self.frame_px.0),
-            format!("--vo-kitty-height={}", self.frame_px.1),
-            // 位置決めは tuitube が行う。mpv の自動計算は 1 行ズレるので 1 に固定する。
-            "--vo-kitty-left=1".to_string(),
-            "--vo-kitty-top=1".to_string(),
-            "--vo-kitty-alt-screen=no".to_string(),
-            "--vo-kitty-config-clear=no".to_string(),
+    /// 1 フレームのピクセル数。
+    pub fn pixels(&self) -> u64 {
+        u64::from(self.frame_px.0) * u64::from(self.frame_px.1)
+    }
+
+    /// 描画先の寸法。端末のリサイズで変わるのはここだけ。
+    pub fn size_options(&self) -> [(&'static str, Value); 4] {
+        [
+            ("cols", json!(self.area.width.max(1))),
+            ("rows", json!(self.area.height.max(1))),
+            ("width", json!(self.frame_px.0)),
+            ("height", json!(self.frame_px.1)),
         ]
+    }
+
+    /// kitty VO に渡す設定。起動引数と、別ウィンドウから埋め込みへ戻すときの
+    /// set_property が同じ組を使う (片方だけに足すと経路ごとに構成が変わる)。
+    pub fn kitty_options(&self) -> Vec<(&'static str, Value)> {
+        let mut options = self.size_options().to_vec();
+        options.extend([
+            // 位置決めは tuitube が行う。mpv の自動計算は 1 行ズレるので 1 に固定する。
+            ("left", json!(1)),
+            ("top", json!(1)),
+            // 画面の切替と消去も tuitube 側で持つ。
+            ("alt-screen", json!(false)),
+            ("config-clear", json!(false)),
+        ]);
+        options
+    }
+
+    pub fn mpv_args(&self) -> Vec<String> {
+        self.kitty_options()
+            .iter()
+            .map(|(key, value)| format!("--vo-kitty-{key}={}", option_arg(value)))
+            .collect()
+    }
+}
+
+/// mpv のコマンドラインは真偽値を yes / no で書く。
+fn option_arg(value: &Value) -> String {
+    match value.as_bool() {
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
+        None => value.to_string(),
     }
 }
 
@@ -186,7 +219,7 @@ impl VideoSink {
             sink: Arc::new(Mutex::new(Sink {
                 geometry,
                 parser: ApcParser::default(),
-                assembler: FrameAssembler::default(),
+                assembler: FrameAssembler::new(geometry.pixels()),
                 pending: Pending::default(),
                 commands: Vec::new(),
             })),
@@ -245,7 +278,8 @@ impl VideoSink {
         // 組み立て途中のものを残すと旧 s/v のまま完成して 1 枚だけずれて出るので、
         // 読み取り中のバイト列ごと捨てる。次の a=T から新しい寸法で組み直す。
         sink.parser = ApcParser::default();
-        sink.assembler = FrameAssembler::default();
+        // 予算は画質設定と端末寸法で変わるので、上限も新しい寸法で取り直す。
+        sink.assembler = FrameAssembler::new(geometry.pixels());
         sink.pending.clear = true;
         sink.pending.frame = None;
     }
@@ -451,6 +485,24 @@ mod tests {
         assert!(!sink.feed(shm));
         assert!(!sink.feed(shm));
         assert!(sink.take().is_none(), "shm のフレームは完成しない");
+    }
+
+    #[test]
+    fn a_frame_at_a_larger_budget_is_not_dropped_as_oversized() {
+        // quality = "high" 相当。上限が 640x360 固定だと、このフレームは毎回捨てられていた。
+        let geometry = Geometry::new(Rect::new(0, 0, 240, 68), CELL, 960 * 540);
+        let sink = VideoSink::new(geometry);
+        let (width, height) = geometry.frame_px;
+        assert!(geometry.pixels() > u64::from(MAX_FRAME_PIXELS));
+
+        let data = vec![b'Q'; geometry.pixels() as usize * 4];
+        assert!(
+            sink.feed(&frame(width, height, &data)),
+            "フレームが完成しない"
+        );
+        let pending = sink.take().expect("フレームがあるはず");
+        let frame = pending.frame.expect("フレームがあるはず");
+        assert_eq!((frame.width_px, frame.height_px), (width, height));
     }
 
     #[test]
