@@ -7,6 +7,7 @@ use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::Settings;
 use crate::speed::{Polled, Speed};
+use crate::subtitles::SubtitleState;
 use crate::thumbs::Thumbs;
 use crate::video::VideoSink;
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -150,6 +151,8 @@ pub struct App {
     pub speed: Speed,
     /// 速度を送った時刻。ここから SPEED_HOLD の間は、食い違うポーリング値を捨てる。
     pub speed_sent_at: Option<Instant>,
+    /// 字幕の表示状態。速度と同じく動画をまたいで持ち越す。
+    pub subtitles: SubtitleState,
     /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
     pub video: Option<VideoSink>,
     /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
@@ -165,6 +168,7 @@ pub struct App {
 
 impl Default for App {
     fn default() -> Self {
+        let settings = Settings::default();
         Self {
             mode: Mode::Input,
             query: String::new(),
@@ -177,10 +181,11 @@ impl Default for App {
             notice_until: None,
             cookies: CookieState::default(),
             playback: Playback::default(),
-            settings: Settings::default(),
             display: DisplayMode::default(),
             speed: Speed::NORMAL,
             speed_sent_at: None,
+            subtitles: SubtitleState::from_settings(&settings.subtitles),
+            settings,
             video: None,
             screen: Rect::default(),
             seek_bar: SeekBarState::default(),
@@ -301,9 +306,16 @@ impl App {
             crate::mpv::REQ_TIME_POS => self
                 .playback
                 .reconcile_time_pos(data.and_then(|v| v.as_f64()), Instant::now()),
-            crate::mpv::REQ_DURATION => self.playback.duration = data.and_then(|v| v.as_f64()),
+            crate::mpv::REQ_DURATION => {
+                self.playback.duration = data.and_then(|v| v.as_f64());
+                // 字幕が「無い」と言い出すのは、長さが取れてから数秒後。
+                self.subtitles
+                    .observe_loaded(self.playback.duration.is_some(), Instant::now());
+            }
             crate::mpv::REQ_PAUSE => self.playback.paused = data.and_then(|v| v.as_bool()),
             crate::mpv::REQ_VOLUME => self.playback.volume = data.and_then(|v| v.as_f64()),
+            crate::mpv::REQ_SID => self.subtitles.observe_sid(data.as_ref()),
+            crate::mpv::REQ_SUB_LANG => self.subtitles.observe_sub_lang(data.as_ref()),
             crate::mpv::REQ_CURRENT_VO => {
                 self.playback.current_vo =
                     data.as_ref().and_then(|v| v.as_str()).map(str::to_string);
@@ -427,8 +439,14 @@ impl App {
             .volume
             .map(|v| format!("  vol {v:.0}"))
             .unwrap_or_default();
+        // 狭い端末では末尾から切れるので、字幕の印は行の前方に置く。
+        let subtitles = self
+            .subtitles
+            .marker(&self.settings.subtitles, Instant::now())
+            .map(|marker| format!("  {marker}"))
+            .unwrap_or_default();
         format!(
-            "{state}  {}  {} / {}{volume}  {}  {}",
+            "{state}{subtitles}  {}  {} / {}{volume}  {}  {}",
             self.playback.title,
             format_time(self.playback.time_pos),
             format_time(self.playback.duration),
@@ -456,6 +474,7 @@ mod tests {
     use super::*;
     use crate::cookies::{CookieSource, Feed};
     use crate::speed::Speed;
+    use crate::subtitles::{SELECT_GRACE, SubtitleStatus};
     use serde_json::json;
 
     fn search_target() -> Target {
@@ -485,6 +504,99 @@ mod tests {
             speed,
             clamped: false,
         }
+    }
+
+    fn playing_subtitle_app(title: &str) -> App {
+        App {
+            mode: Mode::Playing,
+            playback: Playback {
+                title: title.to_string(),
+                paused: Some(false),
+                ..Playback::default()
+            },
+            ..App::default()
+        }
+    }
+
+    #[test]
+    fn the_polled_sid_tells_whether_a_subtitle_track_is_selected() {
+        let mut app = playing_subtitle_app("song");
+        assert!(app.subtitles.wanted(), "[subtitles] enabled の既定は true");
+        let now = Instant::now();
+        app.subtitles.begin_playback(now);
+        poll(&mut app, crate::mpv::REQ_DURATION, Some(json!(60.0)));
+
+        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
+        assert_eq!(
+            app.subtitles.status(&app.settings.subtitles, now),
+            SubtitleStatus::Shown
+        );
+
+        // false は「トラックが選ばれていない」。猶予を過ぎたら字幕なしと判定する。
+        // 長さを取り込んだ時刻は実時計なので、判定はその分だけ後ろで見る。
+        poll(&mut app, crate::mpv::REQ_SID, Some(json!(false)));
+        assert_eq!(
+            app.subtitles
+                .status(&app.settings.subtitles, now + SELECT_GRACE * 2),
+            SubtitleStatus::Missing
+        );
+        // 応答が取れなかった回は「選ばれていない」と読まない。
+        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
+        poll(&mut app, crate::mpv::REQ_SID, None);
+        assert_eq!(
+            app.subtitles.status(&app.settings.subtitles, now),
+            SubtitleStatus::Shown
+        );
+    }
+
+    #[test]
+    fn a_playback_without_a_duration_still_reports_a_missing_subtitle() {
+        // ライブ配信のように長さが取れない再生でも、いつまでも「字幕...」で止めない。
+        let mut app = playing_subtitle_app("live");
+        let now = Instant::now();
+        app.subtitles.begin_playback(now);
+        poll(&mut app, crate::mpv::REQ_DURATION, None);
+
+        assert_eq!(
+            app.subtitles
+                .status(&app.settings.subtitles, now + crate::subtitles::LOAD_GRACE),
+            SubtitleStatus::Missing
+        );
+    }
+
+    #[test]
+    fn the_status_line_names_the_track_that_mpv_chose() {
+        // lang="ja-orig,ja" でも ja が選ばれることがある (実測)。印は選ばれた方を出す。
+        let mut app = playing_subtitle_app("song");
+        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
+        poll(&mut app, crate::mpv::REQ_SUB_LANG, Some(json!("ja")));
+        assert!(app.status_line().starts_with("PLAYING  字幕ja  song"));
+    }
+
+    #[test]
+    fn the_status_line_puts_the_subtitle_marker_right_after_the_state() {
+        let mut app = playing_subtitle_app("song");
+        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
+        let line = app.status_line();
+        assert!(line.starts_with("PLAYING  字幕ja-orig  song"), "{line}");
+
+        // 消しているときは桁を使わない。
+        app.subtitles.set_wanted(false, Instant::now());
+        let line = app.status_line();
+        assert!(line.starts_with("PLAYING  song"), "{line}");
+        assert!(!line.contains("字幕"), "{line}");
+    }
+
+    #[test]
+    fn the_subtitle_marker_stays_ahead_of_a_long_title() {
+        // 狭い端末では行の末尾から切れるので、印は必ずタイトルより前に出す。
+        let mut app = playing_subtitle_app(&"長いタイトル".repeat(20));
+        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
+        let line = app.status_line();
+        let marker_at = line.find("字幕").expect("印がある");
+        let title_at = line.find("長いタイトル").expect("タイトルがある");
+        assert!(marker_at < title_at, "{line}");
+        assert!(marker_at < 10, "{line}");
     }
 
     #[test]
@@ -1001,7 +1113,8 @@ mod tests {
             ..App::default()
         };
         let line = app.status_line();
-        assert!(line.starts_with("PAUSED  song  00:30 / 01:00  vol 70"));
+        assert!(line.starts_with("PAUSED"), "{line}");
+        assert!(line.contains("song  00:30 / 01:00  vol 70"), "{line}");
         assert!(line.ends_with("エラー: boom"));
     }
 

@@ -335,6 +335,7 @@ fn playing_hints(display: DisplayMode) -> Vec<String> {
         format!("w:{}", display.next().label()),
         "Esc:停止".to_string(),
         "q:終了".to_string(),
+        "s:字幕".to_string(),
         "[ ]:速度±0.1".to_string(),
         "BS:等速".to_string(),
         "クリック:シーク".to_string(),
@@ -604,6 +605,17 @@ mod tests {
         let narrow = help_text(Mode::Playing, DisplayMode::Embedded, 30);
         assert_eq!(narrow, "space:一時停止 ←→:シーク");
         assert_eq!(help_text(Mode::Playing, DisplayMode::Embedded, 0), "");
+    }
+
+    #[test]
+    fn playing_help_mentions_the_subtitle_key() {
+        // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, 200);
+        assert!(wide.contains("s:字幕"), "{wide}");
+        // 幅に入らないぶんは丸ごと落ちる。途中で切れた案内は出さない。
+        let narrow = help_80(Mode::Playing, DisplayMode::Text);
+        assert!(grid::display_width(&narrow) <= 80, "{narrow}");
+        assert!(!narrow.contains("s:字"), "{narrow}");
     }
 
     #[test]

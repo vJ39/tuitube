@@ -16,6 +16,7 @@ mod search;
 mod seekbar;
 mod settings;
 mod speed;
+mod subtitles;
 mod tct;
 mod thumbs;
 mod ui;
@@ -37,6 +38,7 @@ use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
 use std::io::Write;
 use std::time::Duration;
+use subtitles::SubtitleState;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::Instant;
 use video::VideoSink;
@@ -90,6 +92,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
         cookies: CookieState::from_source(loaded.settings.cookies.clone()),
         tabs: Tabs::with_categories(loaded.settings.categories.clone()),
+        subtitles: SubtitleState::from_settings(&loaded.settings.subtitles),
         settings: loaded.settings,
         notice: loaded.notice,
         ..App::default()

@@ -4,6 +4,7 @@ use crate::category::{Category, default_categories};
 use crate::cookies::{self, CookieSource};
 use crate::display::{DisplayMode, FocusOn, FpsCap, Quality, WindowOptions};
 use crate::grid::LayoutMode;
+use crate::subtitles::{SubLang, SubtitleSettings};
 use crate::thumbs;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -39,6 +40,7 @@ const APP_DIR: &str = "tuitube";
 pub struct RawConfig {
     pub display: Option<RawDisplay>,
     pub playback: Option<RawPlayback>,
+    pub subtitles: Option<RawSubtitles>,
     pub window: Option<RawWindow>,
     pub mpv: Option<RawMpv>,
     pub cookies: Option<RawCookies>,
@@ -91,6 +93,13 @@ pub struct RawWindow {
 pub struct RawPlayback {
     /// 0 は制限なし。負値・120 超は丸めて notice を出す。
     pub fps_cap: Option<i64>,
+}
+
+/// 自動生成字幕の要求。lang は yt-dlp の sub-langs と mpv の --slang の両方へ渡る。
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawSubtitles {
+    pub enabled: Option<bool>,
+    pub lang: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
@@ -180,6 +189,7 @@ pub struct Settings {
     pub display: DisplaySettings,
     /// None は制限なし。
     pub fps_cap: Option<FpsCap>,
+    pub subtitles: SubtitleSettings,
     pub window: WindowOptions,
     pub extra_args: Vec<String>,
     /// None は cookie 連携 Off。
@@ -195,6 +205,7 @@ impl Default for Settings {
         Self {
             display: DisplaySettings::default(),
             fps_cap: FpsCap::new(DEFAULT_FPS_CAP),
+            subtitles: SubtitleSettings::default(),
             window: WindowOptions::default(),
             extra_args: Vec::new(),
             cookies: None,
@@ -264,6 +275,8 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
     }
     notices.extend(env_notice);
 
+    let subtitles = validate_subtitles(raw.subtitles.unwrap_or_default(), &mut notices);
+
     let mut cookies = validate_cookies(raw.cookies.unwrap_or_default(), &mut notices);
     if let Some(from_env) = parse_cookies_env(env.cookies) {
         cookies = from_env;
@@ -291,6 +304,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
         Settings {
             display,
             fps_cap,
+            subtitles,
             window,
             extra_args,
             cookies,
@@ -300,6 +314,24 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> (Settings, Vec<String>) {
         },
         notices,
     )
+}
+
+/// lang は言語コードのカンマ区切りだけ。--slang は yt-dlp の記法 (all・正規表現) を読めない。
+fn validate_subtitles(raw: RawSubtitles, notices: &mut Vec<String>) -> SubtitleSettings {
+    // 網羅分解。キーを足すとここで止まる。
+    let RawSubtitles { enabled, lang } = raw;
+    let defaults = SubtitleSettings::default();
+    SubtitleSettings {
+        enabled: enabled.unwrap_or(defaults.enabled),
+        lang: parse_choice(
+            "[subtitles] lang",
+            lang.as_deref(),
+            SubLang::parse,
+            &format!("{} で取得します", SubLang::DEFAULT),
+            notices,
+        )
+        .unwrap_or(defaults.lang),
+    }
 }
 
 fn validate_search(raw: RawSearch, notices: &mut Vec<String>) -> SearchSettings {
@@ -577,6 +609,22 @@ pub fn render(settings: &Settings) -> String {
     out.push_str(&format!(
         "fps_cap = {}\n",
         settings.fps_cap.map(FpsCap::get).unwrap_or(0)
+    ));
+
+    out.push_str("\n[subtitles]\n");
+    out.push_str(
+        "# YouTube の自動生成字幕を要求するか。false のときは再生中に s を押しても出せない。\n",
+    );
+    out.push_str(&format!("enabled = {}\n", settings.subtitles.enabled));
+    out.push_str("# 取得する字幕の言語。カンマ区切りで複数書ける。\n");
+    out.push_str("# 例: \"ja-orig\" (原語の文字起こし) / \"ja\" (自動翻訳) / \"ja-orig,ja\"\n");
+    out.push_str(
+        "# 複数書いたときにどれを出すかは mpv が決める。先頭が選ばれるとは限らない (実測)。\n",
+    );
+    out.push_str("# yt-dlp の sub-langs と mpv の --slang に同じ値を渡すので、言語コード以外 (\"all\" や正規表現) は書けない。\n");
+    out.push_str(&format!(
+        "lang = \"{}\"\n",
+        escape(settings.subtitles.lang.as_str())
     ));
 
     out.push_str("\n[window]\n");
@@ -1367,6 +1415,67 @@ mod tests {
             text.contains("[search]") && text.contains("[thumbnails]"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn subtitles_default_to_enabled_japanese_without_a_notice() {
+        let defaults = settings_of("");
+        assert!(defaults.subtitles.enabled);
+        assert_eq!(defaults.subtitles.lang, SubLang::default());
+        assert_eq!(defaults.subtitles, SubtitleSettings::default());
+        assert!(notices_of("").is_empty());
+    }
+
+    #[test]
+    fn subtitles_can_be_turned_off_and_given_a_language() {
+        let text = "[subtitles]\nenabled = false\nlang = \"en\"\n";
+        let settings = settings_of(text);
+        assert!(!settings.subtitles.enabled);
+        assert_eq!(settings.subtitles.lang.as_str(), "en");
+        assert!(notices_of(text).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_subtitle_language_falls_back_without_touching_other_sections() {
+        // all は yt-dlp の全言語指定で、渡すと字幕トラックが 157 本載る。
+        for raw in ["all", "", "ja*"] {
+            let text = format!("[subtitles]\nlang = \"{raw}\"\n[search]\nlimit = 20\n");
+            let settings = settings_of(&text);
+            assert_eq!(settings.subtitles.lang, SubLang::default(), "{text}");
+            assert!(settings.subtitles.enabled, "{text}");
+            // 読めないキーだけを落とす。
+            assert_eq!(settings.search.limit, 20, "{text}");
+
+            let notice = notices_of(&text).join(" / ");
+            assert!(notice.contains("[subtitles] lang"), "{notice}");
+            assert!(notice.contains(SubLang::DEFAULT), "{notice}");
+        }
+    }
+
+    #[test]
+    fn render_round_trips_the_subtitle_section() {
+        let custom = Settings {
+            subtitles: SubtitleSettings {
+                enabled: false,
+                lang: SubLang::parse("ja,en").expect("言語コード"),
+            },
+            ..Settings::default()
+        };
+        assert_eq!(settings_of(&render(&custom)), custom);
+        assert_eq!(
+            settings_of(&render(&Settings::default())),
+            Settings::default()
+        );
+
+        let text = render(&Settings::default());
+        assert!(text.contains("[subtitles]"), "{text}");
+        assert!(text.contains("enabled = true"), "{text}");
+        assert!(
+            text.contains(&format!("lang = \"{}\"", SubLang::DEFAULT)),
+            "{text}"
+        );
+        // 書き方の例を出す。lang は言語コードしか受け付けない。
+        assert!(text.contains("カンマ区切り"), "{text}");
     }
 
     #[test]

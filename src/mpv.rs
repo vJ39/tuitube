@@ -25,6 +25,11 @@ pub const REQ_VOLUME: u64 = 4;
 pub const REQ_CURRENT_VO: u64 = 6;
 /// 再生速度。mpv ウィンドウ側で変えられた値もこれで取り込む。
 pub const REQ_SPEED: u64 = 7;
+/// 選ばれている字幕トラック。数値なら表示中、false なら無い。
+pub const REQ_SID: u64 = 8;
+/// 選ばれている字幕トラックの言語。--slang の先頭が選ばれるとは限らない (実測)。
+/// 選ばれていない間は property unavailable になる。
+pub const REQ_SUB_LANG: u64 = 9;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -113,6 +118,8 @@ pub fn poll_commands() -> Vec<MpvCommand> {
         ("volume", REQ_VOLUME),
         ("current-vo", REQ_CURRENT_VO),
         ("speed", REQ_SPEED),
+        ("sid", REQ_SID),
+        ("current-tracks/sub/lang", REQ_SUB_LANG),
     ]
     .iter()
     .map(|(name, id)| get_property(name, *id))
@@ -768,6 +775,10 @@ mod tests {
             fps_cap: FpsCap::new(15),
             window: WindowOptions::default(),
             speed: crate::speed::Speed::NORMAL,
+            subtitles: crate::subtitles::SubtitleLaunch::new(
+                &crate::subtitles::SubtitleSettings::default(),
+                false,
+            ),
             extra_args: extra.to_vec(),
         };
         let args = launch_args(
@@ -801,7 +812,32 @@ mod tests {
         // 判定を持ち越すプロパティは無くなったので、毎回同じ列になる。
         let again: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
         assert_eq!(lines, again);
-        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.len(), 8);
+    }
+
+    #[test]
+    fn poll_asks_for_the_subtitle_track_every_time() {
+        // sid が数値なら字幕が選ばれている。false なら無い (または自分で消した)。
+        let lines: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
+        assert!(
+            lines.contains(
+                &"{\"command\":[\"get_property\",\"sid\"],\"request_id\":8}\n".to_string()
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn poll_asks_which_language_was_chosen() {
+        // --slang の先頭が選ばれるとは限らないので、実際の言語を mpv に聞く。
+        let lines: Vec<String> = poll_commands().iter().map(|c| c.to_line()).collect();
+        assert!(
+            lines.contains(
+                &"{\"command\":[\"get_property\",\"current-tracks/sub/lang\"],\"request_id\":9}\n"
+                    .to_string()
+            ),
+            "{lines:?}"
+        );
     }
 
     #[test]

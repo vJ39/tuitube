@@ -3,7 +3,7 @@
 use crate::actions::{
     SEEK_STEP_SECS, Session, change_speed, copy_url_with, cycle_display_mode, move_selection,
     reload_tab, reset_speed, seek_absolute, seek_relative, send_to_player, start_playback,
-    start_search, stop_playback, switch_tab,
+    start_search, stop_playback, switch_tab, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -115,6 +115,9 @@ async fn handle_key_playing_with<C: Clipboard>(
     if key.code == KeyCode::Char('c') {
         copy_url_with(app, clipboard, std::time::Instant::now()).await;
     }
+    if key.code == KeyCode::Char('s') {
+        toggle_subtitles(app, session, std::time::Instant::now()).await;
+    }
     if key.code == KeyCode::Char('q') {
         app.should_quit = true;
     }
@@ -191,6 +194,7 @@ mod tests {
     use super::*;
     use crate::app::Playback;
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
+    use crate::display::DisplayMode;
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
     use crossterm::event::MouseButton;
@@ -530,6 +534,95 @@ mod tests {
             Some(crate::actions::COPIED_NOTICE),
             "コピーできたことを伝える"
         );
+    }
+
+    const SID_AUTO: &str = "{\"command\":[\"set_property\",\"sid\",\"auto\"]}\n";
+    const SID_NO: &str = "{\"command\":[\"set_property\",\"sid\",\"no\"]}\n";
+
+    #[tokio::test]
+    async fn s_toggles_the_subtitle_while_playing() {
+        let mut session = Session::default();
+        let sent = record(&mut session);
+        let mut app = playing_app();
+        assert!(app.subtitles.wanted(), "[subtitles] enabled の既定は true");
+
+        handle_key_playing(&mut app, key(KeyCode::Char('s')), &mut session).await;
+        assert!(!app.subtitles.wanted());
+        handle_key_playing(&mut app, key(KeyCode::Char('s')), &mut session).await;
+        assert!(app.subtitles.wanted());
+
+        assert_eq!(*sent.lock().expect("溜め込み先"), [SID_NO, SID_AUTO]);
+    }
+
+    #[tokio::test]
+    async fn s_does_nothing_else_while_playing() {
+        // s は既存のキーと重なっていない。
+        assert_eq!(playing_command(KeyCode::Char('s')), None);
+        assert_eq!(seek_step(KeyCode::Char('s')), None);
+        assert_eq!(speed_step(KeyCode::Char('s')), None);
+
+        let mut session = Session::default();
+        let sent = record(&mut session);
+        let mut app = playing_app();
+        let clipboard = FakeClipboard::new(CopyResult::Ok);
+        handle_key_playing_with(
+            &mut app,
+            key(KeyCode::Char('s')),
+            &mut session,
+            clipboard.clone(),
+        )
+        .await;
+
+        assert_eq!(*sent.lock().expect("溜め込み先"), [SID_NO]);
+        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
+        assert_eq!(app.display, DisplayMode::Embedded);
+        assert!(clipboard.copied().is_empty());
+        assert!(!app.should_quit);
+        assert_eq!(app.mode, Mode::Playing);
+    }
+
+    #[tokio::test]
+    async fn the_other_playing_keys_do_not_toggle_the_subtitle() {
+        let mut session = Session::default();
+        let _sent = record(&mut session);
+        let mut app = playing_app();
+        for code in [
+            KeyCode::Char(' '),
+            KeyCode::Char('w'),
+            KeyCode::Char('['),
+            KeyCode::Char(']'),
+            KeyCode::Backspace,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Up,
+            KeyCode::Down,
+        ] {
+            handle_key_playing(&mut app, key(code), &mut session).await;
+            assert!(app.subtitles.wanted(), "{code:?} で字幕が動いた");
+        }
+    }
+
+    #[tokio::test]
+    async fn s_is_a_plain_character_outside_of_playback() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        // 検索入力中は検索語の文字として入る。
+        let mut app = App::default();
+        handle_key(&mut app, key(KeyCode::Char('s')), &tx, &mut session).await;
+        assert_eq!(app.query, "s");
+        assert!(app.subtitles.wanted());
+
+        // 結果一覧では何も起きない。
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char('s')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Results);
+        assert!(app.subtitles.wanted());
+        assert!(app.notice.is_none());
     }
 
     #[tokio::test]

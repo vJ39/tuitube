@@ -11,6 +11,7 @@ use crate::mpv::{self, MpvCommand, MpvController};
 use crate::search::{self, RealYtDlp, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::speed::Speed;
+use crate::subtitles::{self, SubtitleLaunch, SubtitleStatus};
 use crate::thumbs;
 use crate::ui;
 use crate::video::{DecoderKind, VideoSink};
@@ -371,6 +372,8 @@ fn playback_plan(app: &App) -> (VideoSink, LaunchPlan) {
     let video = VideoSink::with_kind(kind, video_geometry(app.settings.display.max_pixels()));
     let mut plan = LaunchPlan::new(app.display, video.geometry(), &app.settings);
     plan.speed = app.speed;
+    // 非表示で始めてもトラックは用意される。再生中に s で出せる。
+    plan.subtitles = SubtitleLaunch::new(&app.settings.subtitles, app.subtitles.wanted());
     // 検索で cookie が効くと確かめた後だけ再生にも渡す (再生側では劣化を検知できない)。
     plan.extra_args
         .extend(app.cookies.for_playback().map(|source| source.mpv_arg()));
@@ -394,6 +397,8 @@ pub fn enter_playback(
     app.video = Some(video);
     app.mode = Mode::Playing;
     app.set_error(None);
+    // 表示の希望は持ち越し、前の動画の選択だけ捨てる。
+    app.subtitles.begin_playback(std::time::Instant::now());
     // 貼ってあるサムネイルは ratatui の差分描画では消えない。end_playback と対称に剥がす。
     session.owe_clear = true;
 }
@@ -442,6 +447,41 @@ async fn set_speed(app: &mut App, session: &mut Session, next: Speed) {
     match player.sink.send(&next.command()).await {
         // 送信前に発行されたポーリングが古い値を返しても、ここで送った値を保つ。
         Ok(()) => app.set_speed_sent(next, std::time::Instant::now()),
+        Err(e) => app.set_error(Some(e)),
+    }
+}
+
+/// s の字幕トグル。mpv は再起動せず sid を auto / no で入れ替える。
+/// 数値の sid は無いトラックでも success が返るので使わない。
+pub async fn toggle_subtitles(app: &mut App, session: &mut Session, now: std::time::Instant) {
+    let settings = app.settings.subtitles.clone();
+    // 字幕なしは推定なので、押されたら止めずに送る。取り違えても次のポーリングで直る。
+    // 止めると、無い動画で消せないまま次の動画へ要求を持ち越してしまう。
+    let missing = app.subtitles.status(&settings, now) == SubtitleStatus::Missing;
+    let (wanted, command) = match app.subtitles.toggle_command(&settings) {
+        Ok(next) => next,
+        Err(reason) => {
+            app.set_temporary_notice(reason, now);
+            return;
+        }
+    };
+    let Some(player) = session.player.as_mut() else {
+        return;
+    };
+    match player.sink.send(&command).await {
+        Ok(()) => {
+            app.subtitles.set_wanted(wanted, now);
+            // tct では mpv が字幕を描かない (実測)。押しても何も起きない画面にしない。
+            let notice = if wanted && app.display == DisplayMode::Text {
+                subtitles::text_mode_notice()
+            } else if missing {
+                // 出ないまま消したので、出なかった理由を返す。
+                subtitles::missing_notice(&settings.lang)
+            } else {
+                subtitles::toggle_notice(wanted, &settings.lang)
+            };
+            app.set_temporary_notice(notice, now);
+        }
         Err(e) => app.set_error(Some(e)),
     }
 }
@@ -1551,6 +1591,211 @@ mod tests {
         assert_eq!(app.playback.title, "song");
         // 貼ってあるサムネイルは 2J でしか消えない。終了側と同じく持ち越して消す。
         assert!(session.owe_clear, "再生画面の上にサムネイルを残さない");
+    }
+
+    const SID_AUTO: &str = "{\"command\":[\"set_property\",\"sid\",\"auto\"]}\n";
+    const SID_NO: &str = "{\"command\":[\"set_property\",\"sid\",\"no\"]}\n";
+
+    fn subtitles_off_app() -> App {
+        let mut app = playing_app();
+        app.subtitles.set_wanted(false, std::time::Instant::now());
+        app
+    }
+
+    #[tokio::test]
+    async fn toggling_subtitles_sends_sid_auto_then_sid_no() {
+        let mut app = subtitles_off_app();
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        let now = std::time::Instant::now();
+
+        toggle_subtitles(&mut app, &mut session, now).await;
+        assert!(app.subtitles.wanted());
+        assert_eq!(app.notice.as_deref(), Some("字幕を出します (ja-orig)"));
+
+        toggle_subtitles(&mut app, &mut session, now).await;
+        assert!(!app.subtitles.wanted());
+        assert_eq!(app.notice.as_deref(), Some("字幕を消しました"));
+
+        // mpv は再起動しない。sub-visibility は起動引数だけで足りる。
+        assert_eq!(lines(&sent), [SID_AUTO, SID_NO]);
+    }
+
+    #[tokio::test]
+    async fn toggling_subtitles_keeps_the_state_when_sending_fails() {
+        let mut app = subtitles_off_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Err("パイプが閉じました".to_string()));
+
+        toggle_subtitles(&mut app, &mut session, std::time::Instant::now()).await;
+        assert!(!app.subtitles.wanted());
+        assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
+    }
+
+    #[tokio::test]
+    async fn toggling_subtitles_without_a_player_changes_nothing() {
+        let mut app = subtitles_off_app();
+        let mut session = Session::default();
+
+        toggle_subtitles(&mut app, &mut session, std::time::Instant::now()).await;
+        assert!(!app.subtitles.wanted());
+        assert!(app.error.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_setting_only_says_why_nothing_happens() {
+        let mut app = playing_app();
+        app.settings.subtitles.enabled = false;
+        app.subtitles = crate::subtitles::SubtitleState::from_settings(&app.settings.subtitles);
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        toggle_subtitles(&mut app, &mut session, std::time::Instant::now()).await;
+        assert!(lines(&sent).is_empty(), "mpv へは何も送らない");
+        let notice = app.notice.as_deref().unwrap_or_default();
+        assert!(notice.contains("[subtitles] enabled"), "{notice}");
+        assert!(!app.subtitles.wanted());
+    }
+
+    /// 長さが取れた後、猶予を過ぎても sid が数値にならない = この動画に字幕が無い。
+    fn missing_subtitle_app(now: std::time::Instant) -> App {
+        let mut app = playing_app();
+        app.playback.duration = Some(60.0);
+        app.subtitles.begin_playback(now);
+        app.subtitles.observe_loaded(true, now);
+        app
+    }
+
+    #[tokio::test]
+    async fn a_video_without_the_language_can_still_be_turned_off() {
+        let now = std::time::Instant::now();
+        let mut app = missing_subtitle_app(now);
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        toggle_subtitles(&mut app, &mut session, now + crate::subtitles::SELECT_GRACE).await;
+        // 止めると要求が次の動画へ持ち越され、設定ファイルを直すまで消せなくなる。
+        assert_eq!(lines(&sent), [SID_NO]);
+        assert!(!app.subtitles.wanted());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("この動画に ja-orig,ja の字幕がありません")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subtitle_dropped_outside_tuitube_comes_back_with_two_presses() {
+        // 別ウィンドウで mpv 側の j / v を押されると sid が外れ、字幕なしと同じ見え方になる。
+        let now = std::time::Instant::now();
+        let mut app = missing_subtitle_app(now);
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        let late = now + crate::subtitles::SELECT_GRACE;
+
+        toggle_subtitles(&mut app, &mut session, late).await;
+        toggle_subtitles(&mut app, &mut session, late).await;
+        assert_eq!(lines(&sent), [SID_NO, SID_AUTO]);
+        assert!(app.subtitles.wanted());
+    }
+
+    #[tokio::test]
+    async fn the_text_mode_says_that_mpv_does_not_draw_the_subtitle() {
+        let mut app = subtitles_off_app();
+        app.display = DisplayMode::Text;
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        toggle_subtitles(&mut app, &mut session, std::time::Instant::now()).await;
+        // トラックは選ぶ (w で埋め込みへ戻れば出る)。
+        assert_eq!(lines(&sent), [SID_AUTO]);
+        assert!(app.subtitles.wanted());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("テキスト表示では映像に字幕が出ません")
+        );
+    }
+
+    #[test]
+    fn the_launch_plan_starts_hidden_when_the_subtitle_is_off() {
+        let mut app = grid_app(1);
+        let (_video, shown) = playback_plan(&app);
+        assert_eq!(
+            shown.subtitles,
+            crate::subtitles::SubtitleLaunch::new(&app.settings.subtitles, true)
+        );
+        assert!(
+            !shown.args().iter().any(|a| a == "--sid=no"),
+            "{:?}",
+            shown.args()
+        );
+
+        app.subtitles.set_wanted(false, std::time::Instant::now());
+        let (_video, hidden) = playback_plan(&app);
+        assert!(
+            hidden.args().iter().any(|a| a == "--sid=no"),
+            "{:?}",
+            hidden.args()
+        );
+        // 非表示でもトラックは用意させる。
+        assert!(
+            hidden
+                .args()
+                .iter()
+                .any(|a| a == "--ytdl-raw-options-append=write-auto-subs="),
+            "{:?}",
+            hidden.args()
+        );
+    }
+
+    #[test]
+    fn entering_playback_drops_the_selection_and_keeps_the_wish() {
+        let mut app = grid_app(4);
+        let mut session = Session::default();
+        app.subtitles.observe_sid(Some(&serde_json::json!(1)));
+        enter_playback(
+            &mut app,
+            &mut session,
+            "song".to_string(),
+            URL.to_string(),
+            sink(),
+        );
+
+        assert!(app.subtitles.wanted(), "表示の希望は動画をまたいで持ち越す");
+        assert_eq!(
+            app.subtitles
+                .status(&app.settings.subtitles, std::time::Instant::now()),
+            crate::subtitles::SubtitleStatus::Loading,
+            "前の動画の選択は捨てる"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_subtitle_state_carries_over_to_the_next_video() {
+        // 起動 → s で消す → 次の動画も消えたまま始まる。
+        let mut app = grid_app(4);
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        let now = std::time::Instant::now();
+        enter_playback(
+            &mut app,
+            &mut session,
+            "song".to_string(),
+            URL.to_string(),
+            sink(),
+        );
+        assert!(!playback_plan(&app).1.args().iter().any(|a| a == "--sid=no"));
+
+        toggle_subtitles(&mut app, &mut session, now).await;
+        let (_video, next) = playback_plan(&app);
+        assert!(
+            next.args().iter().any(|a| a == "--sid=no"),
+            "{:?}",
+            next.args()
+        );
+
+        toggle_subtitles(&mut app, &mut session, now).await;
+        assert_eq!(lines(&sent), [SID_NO, SID_AUTO]);
     }
 
     #[tokio::test]

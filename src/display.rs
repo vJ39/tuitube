@@ -3,6 +3,7 @@
 use crate::mpv::{self, MpvCommand};
 use crate::settings::{MAX_FPS_CAP, Settings};
 use crate::speed::Speed;
+use crate::subtitles::SubtitleLaunch;
 use crate::video::{DecoderKind, Geometry, MAX_FRAME_PIXELS};
 use serde_json::json;
 
@@ -225,6 +226,8 @@ pub struct LaunchPlan {
     pub window: WindowOptions,
     /// 直前の再生から持ち越した速度。等速なら引数に出さない。
     pub speed: Speed,
+    /// 字幕の要求。設定で無効なら引数を一切出さない。
+    pub subtitles: SubtitleLaunch,
     /// [mpv] extra_args と cookie 連携の追加引数。
     pub extra_args: Vec<String>,
 }
@@ -237,6 +240,8 @@ impl LaunchPlan {
             fps_cap: settings.fps_cap,
             window: settings.window.clone(),
             speed: Speed::NORMAL,
+            // 表示するかは持ち越しの状態で決まるので、呼び出し側が差し替える。
+            subtitles: SubtitleLaunch::new(&settings.subtitles, true),
             extra_args: settings.extra_args.clone(),
         }
     }
@@ -262,8 +267,9 @@ impl LaunchPlan {
             // 上限フィルタは GPU VO には効く意味がないので付けない。
             DisplayMode::Window => args.extend(self.window.args()),
         }
-        // 速度は VO と独立。表示モードによらず同じ引数で渡す。
+        // 速度と字幕は VO と独立。表示モードによらず同じ引数で渡す。
         args.extend(self.speed.launch_arg());
+        args.extend(self.subtitles.args());
         args.extend_from_slice(&self.extra_args);
         args
     }
@@ -324,6 +330,7 @@ mod tests {
     use super::*;
     use crate::settings::Settings;
     use crate::speed::Speed;
+    use crate::subtitles::{SubLang, SubtitleSettings};
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
     use ratatui::layout::Rect;
 
@@ -443,6 +450,7 @@ mod tests {
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
+            subtitles: SubtitleLaunch::Disabled,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -467,6 +475,7 @@ mod tests {
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
             speed: Speed::from_tenths(15).expect("1.5x"),
+            subtitles: SubtitleLaunch::Disabled,
             extra_args: extra.clone(),
         };
         let args = plan.args();
@@ -506,6 +515,7 @@ mod tests {
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
+            subtitles: SubtitleLaunch::Disabled,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -527,6 +537,7 @@ mod tests {
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
+            subtitles: SubtitleLaunch::Disabled,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -589,6 +600,7 @@ mod tests {
             fps_cap: Some(cap(15)),
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
+            subtitles: SubtitleLaunch::Disabled,
             extra_args: extra.clone(),
         };
         let args = plan.args();
@@ -603,6 +615,125 @@ mod tests {
         assert_eq!(plan.fps_cap, settings.fps_cap);
         assert_eq!(plan.window, settings.window);
         assert_eq!(plan.extra_args, settings.extra_args);
+    }
+
+    fn subtitle_settings(enabled: bool) -> Settings {
+        Settings {
+            subtitles: SubtitleSettings {
+                enabled,
+                lang: SubLang::parse("ja").expect("言語コード"),
+            },
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn the_plan_takes_the_subtitle_request_from_the_settings() {
+        let plan = LaunchPlan::new(
+            DisplayMode::Embedded,
+            geometry(80, 22),
+            &subtitle_settings(true),
+        );
+        assert_eq!(
+            plan.subtitles,
+            SubtitleLaunch::new(&subtitle_settings(true).subtitles, true)
+        );
+
+        let off = LaunchPlan::new(
+            DisplayMode::Embedded,
+            geometry(80, 22),
+            &subtitle_settings(false),
+        );
+        assert_eq!(off.subtitles, SubtitleLaunch::Disabled);
+    }
+
+    #[test]
+    fn subtitle_args_come_after_the_speed_and_before_the_extra_args() {
+        let extra = vec!["--hwdec=no".to_string()];
+        let plan = LaunchPlan {
+            mode: DisplayMode::Embedded,
+            geometry: geometry(80, 22),
+            fps_cap: Some(cap(15)),
+            window: WindowOptions::default(),
+            speed: Speed::from_tenths(15).expect("1.5x"),
+            subtitles: SubtitleLaunch::new(&subtitle_settings(true).subtitles, true),
+            extra_args: extra.clone(),
+        };
+        let args = plan.args();
+        let speed_at = args
+            .iter()
+            .position(|a| a == "--speed=1.5")
+            .unwrap_or_else(|| panic!("--speed がない: {args:?}"));
+        let subs = plan.subtitles.args();
+        assert_eq!(args[speed_at + 1..speed_at + 1 + subs.len()], subs[..]);
+        // 利用者の指定が後勝ちで上書きできる位置を保つ。
+        assert_eq!(args[args.len() - extra.len()..], extra[..]);
+    }
+
+    #[test]
+    fn a_disabled_subtitle_plan_mentions_no_subtitle_option() {
+        let plan = LaunchPlan::new(
+            DisplayMode::Embedded,
+            geometry(80, 22),
+            &subtitle_settings(false),
+        );
+        for key in [
+            "slang",
+            "sub-langs",
+            "sid",
+            "sub-visibility",
+            "write-auto-subs",
+        ] {
+            assert!(
+                !plan.args().iter().any(|a| a.contains(key)),
+                "{key} が入っている: {:?}",
+                plan.args()
+            );
+        }
+    }
+
+    #[test]
+    fn subtitle_args_are_the_same_in_every_display_mode() {
+        // 字幕は VO と独立。埋め込みでも別ウィンドウでも同じ引数で渡す。
+        let subs = SubtitleLaunch::new(&subtitle_settings(true).subtitles, false);
+        for mode in [
+            DisplayMode::Embedded,
+            DisplayMode::Text,
+            DisplayMode::Window,
+        ] {
+            let plan = LaunchPlan {
+                subtitles: subs.clone(),
+                ..LaunchPlan::new(mode, geometry(80, 22), &subtitle_settings(true))
+            };
+            let args = plan.args();
+            for expected in subs.args() {
+                assert!(args.contains(&expected), "{expected} がない: {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn subtitle_args_and_the_cookie_argument_both_survive() {
+        let cookie = "--ytdl-raw-options-append=cookies-from-browser=chrome".to_string();
+        let plan = LaunchPlan {
+            extra_args: vec![cookie.clone()],
+            ..LaunchPlan::new(
+                DisplayMode::Embedded,
+                geometry(80, 22),
+                &subtitle_settings(true),
+            )
+        };
+        let args = plan.args();
+        let cookie_at = args
+            .iter()
+            .position(|a| a == &cookie)
+            .unwrap_or_else(|| panic!("cookie がない: {args:?}"));
+        let langs_at = args
+            .iter()
+            .position(|a| a.starts_with("--ytdl-raw-options-append=sub-langs="))
+            .unwrap_or_else(|| panic!("sub-langs がない: {args:?}"));
+        // -append は key-value の追加なので両方そのまま yt-dlp へ届く。
+        assert!(langs_at < cookie_at, "{args:?}");
     }
 
     fn switch(from: DisplayMode, to: DisplayMode, cap: Option<FpsCap>) -> Vec<String> {
