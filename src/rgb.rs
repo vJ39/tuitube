@@ -108,7 +108,8 @@ pub fn base64_into(bytes: &[u8], out: &mut String) {
 }
 
 /// CUP で左上へ寄せてから、raw RGB を base64 でチャンク分割して送る。
-/// 先頭チャンクだけが制御キーを持ち、c=/r= で端末側にセル矩形へ拡大させる。
+/// 先頭チャンクだけが寸法キーを持ち、c=/r= で端末側にセル矩形へ拡大させる。
+/// q=2 は端末が跨いで覚えないので全チャンクに要る (無いと OK 応答が stdin に入る)。
 pub fn encode_image(image: &RgbImage, at: Placement, out: &mut Vec<u8>) {
     if image.width == 0 || image.height == 0 || !image.is_consistent() {
         return;
@@ -126,7 +127,7 @@ pub fn encode_image(image: &RgbImage, at: Placement, out: &mut Vec<u8>) {
                 image.width, image.height, at.cols, at.rows
             )
         } else {
-            format!("\x1b_Gm={more};")
+            format!("\x1b_Gm={more},q=2;")
         };
         out.extend_from_slice(head.as_bytes());
         out.extend_from_slice(chunk);
@@ -285,6 +286,31 @@ mod tests {
         assert!(text.contains("q=2"), "{}", &text[..80]);
     }
 
+    /// 送出列のチャンクごとの制御部 (ESC _ G と最初の ";" の間)。
+    fn control_sections(out: &[u8]) -> Vec<&str> {
+        std::str::from_utf8(out)
+            .expect("base64 と制御列だけ")
+            .split("\x1b_G")
+            .skip(1)
+            .map(|part| part.split(';').next().expect("制御部"))
+            .collect()
+    }
+
+    #[test]
+    fn encode_image_carries_q2_on_every_chunk() {
+        // 端末はチャンクを跨いで quiet を覚えないので、継続チャンクにも要る。
+        // 1 チャンクで済む画像に 2 個目を足さないことも同時に見る。
+        for image in [checkerboard(2, 2), checkerboard(64, 64)] {
+            let mut out = Vec::new();
+            encode_image(&image, placement(), &mut out);
+            let controls = control_sections(&out);
+            assert!(!controls.is_empty());
+            for control in &controls {
+                assert_eq!(control.matches("q=2").count(), 1, "{control}");
+            }
+        }
+    }
+
     #[test]
     fn encode_image_splits_the_payload_into_4096_byte_chunks() {
         // 64x64 px = 12288 バイト → base64 16384 バイト → 4 チャンク。
@@ -301,9 +327,9 @@ mod tests {
             heads,
             [
                 "a=T,f=24,s=64,v=64,C=1,q=2,c=1,r=1,m=1",
-                "m=1",
-                "m=1",
-                "m=0",
+                "m=1,q=2",
+                "m=1,q=2",
+                "m=0,q=2",
             ]
         );
     }

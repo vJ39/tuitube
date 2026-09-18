@@ -55,7 +55,7 @@ mpv の `--vo=kitty` 出力(Kitty graphics protocol の APC `G` コマンド)を
 |---|---|---|---|---|
 | (a) 分離して素通し | APC `G` は生のまま実端末へ、CSI 等は捨てる | 実装が薄い | mpv の HVP は画面原点基準かつ 1 行ズレる(§1-1)ので座標を捨てると位置が決まらず、使うと壊れる。ST 欠落 `a=d` を素通しすると後続の解釈が端末実装依存 | 不採用 |
 | (b) mpv の座標を信頼 | `left/top` を固定し mpv の HVP をそのまま使う | 座標書き換え不要 | 固定できるのは画面原点基準の値だけで、ratatui の映像領域 (x,y) への平行移動は結局 tuitube が行う。信頼しても得るものがない | 不採用 |
-| (c) 意味解釈して再送(採用) | APC `G` を「フレーム先頭 / 継続チャンク / 全削除」の 3 種として解釈し、APC 以外は全て捨てる。位置決め(CUP)は tuitube が打ち、画像チャンクのバイト列は無変換で流す | mpv の座標・画面制御に一切依存しない。base64 のデコード不要。ST 欠落・分断 read・ゴミ列を一箇所で正規化できる | パーサと組み立て器が要る(ただし純粋関数でテストしやすい) | **採用** |
+| (c) 意味解釈して再送(採用) | APC `G` を「フレーム先頭 / 継続チャンク / 全削除」の 3 種として解釈し、APC 以外は全て捨てる。位置決め(CUP)は tuitube が打ち、画像データ(base64)は無変換で流して制御部にだけキーを足す | mpv の座標・画面制御に一切依存しない。base64 のデコード不要。ST 欠落・分断 read・ゴミ列を一箇所で正規化できる | パーサと組み立て器が要る(ただし純粋関数でテストしやすい) | **採用** |
 
 mpv 側は `--vo-kitty-left=1 --vo-kitty-top=1` に固定し、出てくる HVP は常に同じ値(=読み捨て)。
 
@@ -184,6 +184,12 @@ pub struct VideoFrame {
     pub height_px: u32,
     /// 先頭チャンクから m=0 チャンクまでの raw を連結したもの。
     pub bytes: Vec<u8>,
+    /// bytes 内の各チャンクの終端。連結時に分かるので、送出側は ST を探し直さない。
+    chunk_ends: Vec<usize>,
+}
+impl VideoFrame {
+    /// 連結前のチャンクへ切り直す。
+    pub fn chunks(&self) -> impl Iterator<Item = &[u8]>;
 }
 pub enum FrameEvent {
     Frame(VideoFrame),
@@ -228,7 +234,8 @@ pub fn placement(area: Rect, cell: CellSize, image_px: (u32, u32)) -> Option<Pla
 pub struct Pending { pub clear: bool, pub frame: Option<VideoFrame> }
 /// clear なら ESC_Ga=d;ESC\ を、frame があり placement が取れれば
 /// CUP + c=/r= を差し込んだ frame.bytes を out に積む。戻り値はフレームを書いたか
-/// (収まらず捨てた場合 false)。c=/r= は先頭チャンクの制御部にだけ足す。
+/// (収まらず捨てた場合 false)。c=/r= は先頭チャンクの制御部にだけ、
+/// q=2 は全チャンクの制御部に足す(端末はチャンクを跨いで quiet を覚えない)。
 pub fn encode(pending: &Pending, area: Rect, cell: CellSize, out: &mut Vec<u8>) -> bool;
 pub fn encode_clear(out: &mut Vec<u8>);
 

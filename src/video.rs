@@ -1,4 +1,6 @@
-use crate::kitty::{ApcParser, FrameAssembler, FrameEvent, GraphicsCommand, ST, VideoFrame};
+use crate::kitty::{
+    ApcParser, FrameAssembler, FrameEvent, GraphicsCommand, VideoFrame, key_value, push_with_keys,
+};
 use crate::tct::TextScreen;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -189,25 +191,27 @@ pub fn encode(pending: &Pending, area: Rect, cell: CellSize, out: &mut Vec<u8>) 
         return false;
     };
     out.extend_from_slice(format!("\x1b[{};{}H", at.row, at.col).as_bytes());
-    push_scaled(&frame.bytes, at.cols, at.rows, out);
+    push_scaled(frame, at.cols, at.rows, out);
     true
 }
 
-/// 先頭チャンクの制御部に c=/r= を足し、端末側でセル矩形いっぱいに拡大させる。
-/// 制御部の終端は最初の ";" (後続の base64 データに ";" は現れない)。
-/// 継続チャンクは m と q しか持てないので、探索は先頭チャンク (最初の ST まで) に限る。
-fn push_scaled(bytes: &[u8], cols: u16, rows: u16, out: &mut Vec<u8>) {
-    let head = bytes
-        .windows(ST.len())
-        .position(|w| w == ST)
-        .unwrap_or(bytes.len());
-    let Some(end) = bytes[..head].iter().position(|b| *b == b';') else {
-        out.extend_from_slice(bytes);
-        return;
-    };
-    out.extend_from_slice(&bytes[..end]);
-    out.extend_from_slice(format!(",c={cols},r={rows}").as_bytes());
-    out.extend_from_slice(&bytes[end..]);
+/// フレームを組み立て時のチャンクへ戻し、制御部にキーを足して送り直す。
+/// c=/r= は先頭チャンクだけ (継続チャンクは m と q しか持てない)。
+/// q=2 は端末が跨いで覚えないので全チャンクに要る (mpv は継続チャンクに付けない)。
+fn push_scaled(frame: &VideoFrame, cols: u16, rows: u16, out: &mut Vec<u8>) {
+    let scale = format!(",c={cols},r={rows}");
+    let mut keys = String::with_capacity(scale.len() + 4);
+    for (index, chunk) in frame.chunks().enumerate() {
+        keys.clear();
+        if index == 0 {
+            keys.push_str(&scale);
+        }
+        // 同じキーは後勝ちなので、q=1 (エラー応答は返す) が付いていても足すだけでよい。
+        if key_value(chunk, b'q') != Some(b"2".as_slice()) {
+            keys.push_str(",q=2");
+        }
+        push_with_keys(chunk, &keys, out);
+    }
 }
 
 /// q=2 が無いと端末の応答が tuitube の stdin に入りキーイベントとして誤読される (§1-2)。
@@ -399,6 +403,7 @@ impl VideoSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kitty::ST;
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
     use ratatui::buffer::Buffer;
 
@@ -607,11 +612,11 @@ mod tests {
     fn encode_writes_clear_then_cup_then_frame_bytes() {
         let pending = Pending {
             clear: true,
-            frame: Some(VideoFrame {
-                width_px: 16,
-                height_px: 16,
-                bytes: b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=0;DATA\x1b\\".to_vec(),
-            }),
+            frame: Some(VideoFrame::from_bytes(
+                16,
+                16,
+                b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=0;DATA\x1b\\".to_vec(),
+            )),
         };
         let mut out = Vec::new();
         assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
@@ -648,7 +653,137 @@ mod tests {
             out,
             b"\x1b[1;1H\
               \x1b_Ga=T,f=24,s=640,v=352,C=1,q=2,m=1,c=80,r=22;DATA\x1b\\\
-              \x1b_Gm=0;\x1b\\"
+              \x1b_Gm=0,q=2;\x1b\\"
+        );
+    }
+
+    /// 送出列のチャンクごとの制御部 (ESC _ G と最初の ";" の間)。
+    fn control_sections(out: &[u8]) -> Vec<String> {
+        String::from_utf8_lossy(out)
+            .split("\x1b_G")
+            .skip(1)
+            .map(|part| part.split(';').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn encode_carries_q2_on_every_chunk() {
+        // 端末はチャンクを跨いで quiet を覚えないので、q=2 の無い継続チャンクには
+        // OK 応答が返る。応答は tuitube の stdin に入りキー入力として読まれる。
+        let sink = VideoSink::new(geometry(80, 22));
+        assert!(sink.feed(&frame(640, 352, &vec![b'Q'; 9000])));
+        let pending = sink.take().expect("フレームがあるはず");
+
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        let controls = control_sections(&out);
+        assert_eq!(controls.len(), 3);
+        for control in &controls {
+            assert_eq!(control.matches("q=2").count(), 1, "{control}");
+        }
+        // 拡大は先頭チャンクだけ。
+        assert!(controls[0].contains("c=80,r=22"), "{}", controls[0]);
+        assert!(!controls[1..].iter().any(|c| c.contains("c=")));
+    }
+
+    /// 各チャンクのデータ部 (最初の ";" 以降・終端 ST の手前)。
+    fn payloads(commands: &[GraphicsCommand]) -> Vec<Vec<u8>> {
+        commands
+            .iter()
+            .map(|command| {
+                let body = command.raw.strip_suffix(ST).unwrap_or(&command.raw);
+                match body.iter().position(|b| *b == b';') {
+                    Some(at) => body[at + 1..].to_vec(),
+                    None => Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encoded_chunks_keep_the_data_and_rebuild_into_the_same_frame() {
+        // 4096 バイト刻みで 8 チャンクに割れるフレームを送出列にし、端末と同じ手順で読み直す。
+        let data = vec![b'Q'; 30_000];
+        let sink = VideoSink::new(geometry(80, 22));
+        assert!(sink.feed(&frame(640, 352, &data)));
+        let pending = sink.take().expect("フレームがあるはず");
+        let source = pending.frame.clone().expect("フレームがあるはず");
+
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+
+        let mut parser = ApcParser::default();
+        let mut commands = Vec::new();
+        parser.feed(&out, &mut commands);
+        // チャンク数は変えず、データ部はバイト単位で無変換。
+        assert_eq!(commands.len(), source.chunks().count());
+        assert_eq!(payloads(&commands), payloads_of(&source));
+        assert_eq!(payloads(&commands).concat(), data);
+        for command in &commands {
+            assert_eq!(command.get('q'), Some("2"), "{:?}", command.keys);
+        }
+
+        let mut assembler = FrameAssembler::new(geometry(80, 22).pixels());
+        let events: Vec<FrameEvent> = commands
+            .into_iter()
+            .filter_map(|command| assembler.push(command))
+            .collect();
+        assert_eq!(events.len(), 1);
+        let FrameEvent::Frame(rebuilt) = &events[0] else {
+            panic!("フレームのはず");
+        };
+        assert_eq!(
+            (rebuilt.width_px, rebuilt.height_px),
+            (source.width_px, source.height_px)
+        );
+        assert_eq!(rebuilt.chunks().count(), source.chunks().count());
+    }
+
+    /// mpv が出したままのフレームのデータ部。
+    fn payloads_of(frame: &VideoFrame) -> Vec<Vec<u8>> {
+        let mut parser = ApcParser::default();
+        let mut commands = Vec::new();
+        parser.feed(&frame.bytes, &mut commands);
+        payloads(&commands)
+    }
+
+    #[test]
+    fn encode_does_not_add_a_second_q2_to_a_chunk_that_has_one() {
+        let pending = Pending {
+            clear: false,
+            frame: Some(VideoFrame::from_bytes(
+                16,
+                16,
+                b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=1;DATA\x1b\\\x1b_Gm=0,q=2;MORE\x1b\\".to_vec(),
+            )),
+        };
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        let controls = control_sections(&out);
+        assert_eq!(controls.len(), 2);
+        for control in &controls {
+            assert_eq!(control.matches("q=2").count(), 1, "{control}");
+        }
+    }
+
+    #[test]
+    fn encode_overrides_a_quiet_level_that_still_answers() {
+        // q=1 は OK 応答だけを抑えエラー応答は返す。q=2 は後勝ちなので末尾に足すだけでよい。
+        let pending = Pending {
+            clear: false,
+            frame: Some(VideoFrame::from_bytes(
+                16,
+                16,
+                b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=1,m=1;DATA\x1b\\\x1b_Gm=0,q=0;MORE\x1b\\".to_vec(),
+            )),
+        };
+        let mut out = Vec::new();
+        assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
+        assert_eq!(
+            out,
+            b"\x1b[1;19H\
+              \x1b_Ga=T,f=24,s=16,v=16,C=1,q=1,m=1,c=44,r=22,q=2;DATA\x1b\\\
+              \x1b_Gm=0,q=0,q=2;MORE\x1b\\"
         );
     }
 
@@ -656,11 +791,7 @@ mod tests {
     fn encode_leaves_bytes_alone_when_there_is_no_control_section() {
         let pending = Pending {
             clear: false,
-            frame: Some(VideoFrame {
-                width_px: 640,
-                height_px: 352,
-                bytes: b"<apc>".to_vec(),
-            }),
+            frame: Some(VideoFrame::from_bytes(640, 352, b"<apc>".to_vec())),
         };
         let mut out = Vec::new();
         assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
@@ -670,21 +801,24 @@ mod tests {
     #[test]
     fn encode_never_scales_a_continuation_chunk() {
         // 先頭チャンクが ";" の手前で切れた列 (素の ESC で打ち切られ ApcParser が正規化した形)。
-        // 継続チャンクは m と q しか持てないので c=/r= を足さず、そのまま流す。
-        let bytes = b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=1\x1b\\\x1b_Gm=0;DATA\x1b\\".to_vec();
+        // 継続チャンクは m と q しか持てないので c=/r= は足さず、q=2 だけ足す。
+        // 先頭チャンクはペイロードが無くても終端 ST の手前へ挿せる。
         let pending = Pending {
             clear: false,
-            frame: Some(VideoFrame {
-                width_px: 16,
-                height_px: 16,
-                bytes: bytes.clone(),
-            }),
+            frame: Some(VideoFrame::from_bytes(
+                16,
+                16,
+                b"\x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=1\x1b\\\x1b_Gm=0;DATA\x1b\\".to_vec(),
+            )),
         };
         let mut out = Vec::new();
         assert!(encode(&pending, Rect::new(0, 0, 80, 22), CELL, &mut out));
-        let mut expected = b"\x1b[1;19H".to_vec();
-        expected.extend_from_slice(&bytes);
-        assert_eq!(out, expected);
+        assert_eq!(
+            out,
+            b"\x1b[1;19H\
+              \x1b_Ga=T,f=24,s=16,v=16,C=1,q=2,m=1,c=44,r=22\x1b\\\
+              \x1b_Gm=0,q=2;DATA\x1b\\"
+        );
     }
 
     #[test]

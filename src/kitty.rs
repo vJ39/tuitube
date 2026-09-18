@@ -139,6 +139,42 @@ impl ApcParser {
     }
 }
 
+/// チャンクの制御部 (ESC _ G と最初の ";" の間)。ペイロードが無いチャンクでは終端 ST の手前まで。
+/// base64 データに ";" は現れないので、最初の 1 個で切ってよい。
+fn control(chunk: &[u8]) -> Option<&[u8]> {
+    let body = chunk.strip_prefix(APC_INTRO)?;
+    let body = body.strip_suffix(ST).unwrap_or(body);
+    Some(match body.iter().position(|b| *b == b';') {
+        Some(end) => &body[..end],
+        None => body,
+    })
+}
+
+/// 制御部の key= の値。APC でない列では None。
+/// 同じキーが複数あるときは kitty の解釈に合わせて後勝ち。
+pub fn key_value(chunk: &[u8], key: u8) -> Option<&[u8]> {
+    control(chunk)?
+        .split(|b| *b == b',')
+        .filter_map(|pair| pair.strip_prefix(&[key])?.strip_prefix(b"="))
+        .next_back()
+}
+
+/// 制御部の末尾へ keys を挿し込んで out へ積む。末尾は最初の ";"、
+/// ペイロードが無いチャンク (mpv が制御部の途中で打ち切った形) では終端 ST の手前。
+/// APC でない列は挿す場所が無いのでそのまま流す。
+pub fn push_with_keys(chunk: &[u8], keys: &str, out: &mut Vec<u8>) {
+    let end = chunk.iter().position(|b| *b == b';').or_else(|| {
+        (chunk.starts_with(APC_INTRO) && chunk.ends_with(ST)).then(|| chunk.len() - ST.len())
+    });
+    let Some(end) = end else {
+        out.extend_from_slice(chunk);
+        return;
+    };
+    out.extend_from_slice(&chunk[..end]);
+    out.extend_from_slice(keys.as_bytes());
+    out.extend_from_slice(&chunk[end..]);
+}
+
 /// raw から ESC _ G と ST を外し、";" より手前の制御部を (キー, 値) へ分解する。
 fn parse_keys(raw: &[u8]) -> Vec<(char, String)> {
     let body = &raw[APC_INTRO.len()..raw.len() - ST.len()];
@@ -168,6 +204,55 @@ pub struct VideoFrame {
     pub height_px: u32,
     /// 先頭チャンクから m=0 チャンクまでの raw を連結したもの。
     pub bytes: Vec<u8>,
+    /// bytes 内の各チャンクの終端。連結時に分かるので、送出側は ST を探し直さない。
+    chunk_ends: Vec<usize>,
+}
+
+impl VideoFrame {
+    fn new(width_px: u32, height_px: u32, bytes: Vec<u8>) -> Self {
+        Self {
+            width_px,
+            height_px,
+            chunk_ends: vec![bytes.len()],
+            bytes,
+        }
+    }
+
+    /// 継続チャンクを連結し、境界を覚える。
+    fn extend(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        self.chunk_ends.push(self.bytes.len());
+    }
+
+    /// 連結前のチャンクへ切り直す。
+    pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        let mut start = 0;
+        self.chunk_ends.iter().map_while(move |&end| {
+            let chunk = self.bytes.get(start..end)?;
+            start = end;
+            Some(chunk)
+        })
+    }
+
+    /// 連結済みのバイト列から作る。境界は ST で数え直す。
+    #[cfg(test)]
+    pub fn from_bytes(width_px: u32, height_px: u32, bytes: Vec<u8>) -> Self {
+        let mut chunk_ends = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            at = bytes[at..]
+                .windows(ST.len())
+                .position(|w| w == ST)
+                .map_or(bytes.len(), |found| at + found + ST.len());
+            chunk_ends.push(at);
+        }
+        Self {
+            width_px,
+            height_px,
+            bytes,
+            chunk_ends,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,11 +286,7 @@ impl FrameAssembler {
                 };
                 // チャンク分割されない 1 個だけのコマンドはその場で 1 フレーム。
                 let done = matches!(cmd.get('m'), None | Some("0"));
-                let frame = VideoFrame {
-                    width_px,
-                    height_px,
-                    bytes: cmd.raw,
-                };
+                let frame = VideoFrame::new(width_px, height_px, cmd.raw);
                 if done {
                     return Some(FrameEvent::Frame(frame));
                 }
@@ -225,7 +306,7 @@ impl FrameAssembler {
                     self.open = None;
                     return None;
                 }
-                open.bytes.extend_from_slice(&cmd.raw);
+                open.extend(&cmd.raw);
                 if last {
                     self.open.take().map(FrameEvent::Frame)
                 } else {
@@ -353,13 +434,10 @@ mod tests {
         }
         assert_eq!(events[0], None);
         assert_eq!(events[1], None);
+        // 連結時に数えた境界は、後から ST で数え直したものと一致する。
         assert_eq!(
             events[2],
-            Some(FrameEvent::Frame(VideoFrame {
-                width_px: 320,
-                height_px: 180,
-                bytes: joined,
-            }))
+            Some(FrameEvent::Frame(VideoFrame::from_bytes(320, 180, joined)))
         );
         // HVP は取り込まない。
         assert!(!matches!(&events[2], Some(FrameEvent::Frame(f)) if f.bytes.starts_with(b"\x1b[")));
@@ -479,6 +557,61 @@ mod tests {
         let commands = parse(&stream);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].raw, SINGLE);
+    }
+
+    #[test]
+    fn key_value_looks_only_at_the_control_section() {
+        let quiet = |chunk: &[u8]| key_value(chunk, b'q').map(<[u8]>::to_vec);
+        let value = |v: &str| Some(v.as_bytes().to_vec());
+
+        // 先頭・途中・末尾のどこにあっても見つける (先頭は ESC _ G が付く)。
+        assert_eq!(quiet(b"\x1b_Ga=T,f=24,C=1,q=2,m=1;DATA\x1b\\"), value("2"));
+        assert_eq!(quiet(b"\x1b_Gq=2,m=0;DATA\x1b\\"), value("2"));
+        assert_eq!(quiet(b"\x1b_Gm=0,q=2;DATA\x1b\\"), value("2"));
+        assert_eq!(quiet(b"\x1b_Gm=0;DATA\x1b\\"), None);
+        // 値まで返す。q=1 は OK 応答だけを抑え、エラー応答は返す。
+        assert_eq!(quiet(b"\x1b_Gm=0,q=1;DATA\x1b\\"), value("1"));
+        // 同じキーが複数あるときは後勝ち。
+        assert_eq!(quiet(b"\x1b_Gq=2,m=0,q=1;DATA\x1b\\"), value("1"));
+        // データ部の "q=2" は制御部ではない。
+        assert_eq!(quiet(b"\x1b_Gm=0;q=2\x1b\\"), None);
+        // ペイロードが無いチャンクは終端 ST の手前までが制御部。
+        assert_eq!(quiet(b"\x1b_Ga=T,q=2\x1b\\"), value("2"));
+        // APC でない列は読まない。
+        assert_eq!(quiet(b"q=2"), None);
+        assert_eq!(quiet(b""), None);
+        // キーは大小を区別する (カーソル据え置きの C=1 と表示セル数の c= は別キー)。
+        let chunk = b"\x1b_Ga=T,C=1,m=1;DATA\x1b\\";
+        assert_eq!(key_value(chunk, b'C'), Some(b"1".as_slice()));
+        assert_eq!(key_value(chunk, b'c'), None);
+    }
+
+    #[test]
+    fn push_with_keys_inserts_at_the_end_of_the_control_section() {
+        let mut out = Vec::new();
+        push_with_keys(b"\x1b_Gm=0;DATA\x1b\\", ",q=2", &mut out);
+        assert_eq!(out, b"\x1b_Gm=0,q=2;DATA\x1b\\");
+
+        // ペイロードが無いチャンクでも、終端 ST の手前になら挿せる。
+        let mut out = Vec::new();
+        push_with_keys(b"\x1b_Ga=T,m=1\x1b\\", ",q=2", &mut out);
+        assert_eq!(out, b"\x1b_Ga=T,m=1,q=2\x1b\\");
+
+        // 足すキーが無いときと、APC でない列はそのまま流す。
+        let mut out = Vec::new();
+        push_with_keys(b"\x1b_Gm=0;DATA\x1b\\", "", &mut out);
+        push_with_keys(b"<apc>", ",q=2", &mut out);
+        assert_eq!(out, b"\x1b_Gm=0;DATA\x1b\\<apc>");
+    }
+
+    #[test]
+    fn a_chunk_with_injected_keys_still_parses_the_same_way() {
+        let mut out = Vec::new();
+        push_with_keys(b"\x1b_Gm=0;DATA\x1b\\", ",q=2", &mut out);
+        let commands = parse(&out);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].get('m'), Some("0"));
+        assert_eq!(commands[0].get('q'), Some("2"));
     }
 
     #[test]
