@@ -349,9 +349,15 @@ fn log_detail(path: &Path) -> String {
     if file.read_to_end(&mut buffer).is_err() {
         return String::new();
     }
-    String::from_utf8_lossy(&buffer)
-        .lines()
-        .rfind(|line| line.contains("][e][") || line.contains("][fatal]["))
+    let text = String::from_utf8_lossy(&buffer);
+    // ytdl_hook の失敗は最後に「Failed to recognize file format.」へ化けるので、
+    // 原因が書かれている最初の ERROR 行を先に探す。
+    text.lines()
+        .find(|line| line.contains("][ytdl_hook]") && strip_log_prefix(line).starts_with("ERROR:"))
+        .or_else(|| {
+            text.lines()
+                .rfind(|line| line.contains("][e][") || line.contains("][fatal]["))
+        })
         .map(|line| strip_log_prefix(line).to_string())
         .unwrap_or_default()
 }
@@ -362,6 +368,29 @@ fn failure_detail(stderr_tail: String, log_path: &Path) -> String {
     } else {
         stderr_tail
     }
+}
+
+/// 起動引数の組み立て。extra は URL の直前に入る (cookie 指定など)。
+pub fn launch_args(
+    socket: &Path,
+    log: &Path,
+    geometry: Geometry,
+    extra: &[String],
+    url: &str,
+) -> Vec<String> {
+    // --no-terminal: mpv shares this terminal and its status line would corrupt the TUI.
+    // --log-file: そのぶん失われる失敗理由の受け皿。
+    // --vo-kitty-*: stdout がパイプだと端末サイズを取得できず既定値に落ちるため全て明示する。
+    let mut args = vec![
+        format!("--input-ipc-server={}", socket.display()),
+        format!("--log-file={}", log.display()),
+        "--no-terminal".to_string(),
+        "--vo=kitty".to_string(),
+    ];
+    args.extend(geometry.mpv_args());
+    args.extend_from_slice(extra);
+    args.push(url.to_string());
+    args
 }
 
 pub struct MpvController {
@@ -380,6 +409,7 @@ impl MpvController {
         events: UnboundedSender<AppEvent>,
         video: VideoSink,
         fps_limit: Option<u32>,
+        extra: &[String],
     ) -> Result<Self, String> {
         let dir = socket_dir()?;
         let socket_path = socket_path(&dir, nonce);
@@ -387,16 +417,14 @@ impl MpvController {
         let _ = fs::remove_file(&socket_path);
         let _ = fs::remove_file(&log_path);
 
-        // --no-terminal: mpv shares this terminal and its status line would corrupt the TUI.
-        // --log-file: そのぶん失われる失敗理由の受け皿。
-        // --vo-kitty-*: stdout がパイプだと端末サイズを取得できず既定値に落ちるため全て明示する。
         let mut child = Command::new("mpv")
-            .arg(format!("--input-ipc-server={}", socket_path.display()))
-            .arg(format!("--log-file={}", log_path.display()))
-            .arg("--no-terminal")
-            .arg("--vo=kitty")
-            .args(video.geometry().mpv_args())
-            .arg(url)
+            .args(launch_args(
+                &socket_path,
+                &log_path,
+                video.geometry(),
+                extra,
+                url,
+            ))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -909,6 +937,58 @@ mod tests {
         assert_eq!(
             failure_detail(String::new(), &path),
             "Failed to open /x.mkv."
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn launch_args_place_extra_once_right_before_the_url() {
+        let extra = ["--ytdl-raw-options-append=cookies-from-browser=chrome:Profile 1".to_string()];
+        let args = launch_args(
+            Path::new("/tmp/mpv-1.sock"),
+            Path::new("/tmp/mpv-1.log"),
+            test_geometry(80, 22),
+            &extra,
+            "https://www.youtube.com/watch?v=abc",
+        );
+
+        assert_eq!(args[0], "--input-ipc-server=/tmp/mpv-1.sock");
+        assert_eq!(args[1], "--log-file=/tmp/mpv-1.log");
+        assert!(args.contains(&"--vo=kitty".to_string()));
+        assert!(args.contains(&"--vo-kitty-cols=80".to_string()));
+        let url = args.len() - 1;
+        assert_eq!(args[url], "https://www.youtube.com/watch?v=abc");
+        assert_eq!(args[url - 1], extra[0]);
+        assert_eq!(args.iter().filter(|a| *a == &extra[0]).count(), 1);
+
+        // extra が無ければ従来の引数のまま。
+        let plain = launch_args(
+            Path::new("/tmp/mpv-1.sock"),
+            Path::new("/tmp/mpv-1.log"),
+            test_geometry(80, 22),
+            &[],
+            "url",
+        );
+        assert_eq!(plain.len(), args.len() - 1);
+        assert_eq!(plain.last().map(String::as_str), Some("url"));
+        assert!(!plain.iter().any(|a| a.contains("cookies-from-browser")));
+    }
+
+    #[test]
+    fn log_detail_prefers_the_ytdl_hook_error_line() {
+        let base = temp_base("log-ytdl");
+        let path = base.join("mpv-1.log");
+        fs::write(
+            &path,
+            "[   0.03][v][cplayer] mpv v0.41.0\n\
+             [   0.50][e][ytdl_hook] ERROR: could not find firefox cookies database in '/x/Profiles'\n\
+             [   0.50][e][ytdl_hook] youtube-dl failed: unexpected error occurred\n\
+             [   0.51][e][cplayer] Failed to recognize file format.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            log_detail(&path),
+            "ERROR: could not find firefox cookies database in '/x/Profiles'"
         );
         let _ = fs::remove_dir_all(&base);
     }

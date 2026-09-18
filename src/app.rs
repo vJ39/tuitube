@@ -1,4 +1,5 @@
-use crate::search::SearchResult;
+use crate::cookies::{CookieState, Target};
+use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::video::VideoSink;
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -21,7 +22,8 @@ pub enum AppEvent {
     // nonce identifies the search, so results of a superseded query are ignored.
     SearchDone {
         nonce: u64,
-        result: Result<Vec<SearchResult>, String>,
+        target: Target,
+        report: SearchReport,
     },
     // nonce identifies the mpv instance, so events from an already replaced player are ignored.
     MpvProperty {
@@ -107,6 +109,8 @@ pub struct App {
     pub error: Option<String>,
     /// 設定を読み替えたときなど、エラーではないが一度伝えたいこと。
     pub notice: Option<String>,
+    /// ブラウザ cookie 連携の状態。検索・再生・表示がここを見る。
+    pub cookies: CookieState,
     pub playback: Playback,
     /// mpv に適用する fps 上限。None は制限なし。
     pub fps_limit: Option<u32>,
@@ -128,6 +132,7 @@ impl Default for App {
             searching: false,
             error: None,
             notice: None,
+            cookies: CookieState::default(),
             playback: Playback::default(),
             fps_limit: crate::mpv::FpsLimit::default().limit,
             video: None,
@@ -157,11 +162,11 @@ impl App {
         self.results.get(self.selected)
     }
 
-    pub fn set_results(&mut self, results: Vec<SearchResult>) {
+    pub fn set_results(&mut self, results: Vec<SearchResult>, target: &Target) {
         self.results = results;
         self.selected = 0;
         if self.results.is_empty() {
-            self.error = Some("検索結果が0件でした".to_string());
+            self.error = Some(target.empty_message());
             self.mode = Mode::Input;
         } else {
             self.mode = Mode::Results;
@@ -207,10 +212,16 @@ impl App {
         if let Some(error) = &self.error {
             return format!("エラー: {error}");
         }
-        if self.searching {
-            return "検索中...".to_string();
+        let line = if self.searching {
+            "検索中...".to_string()
+        } else {
+            idle
+        };
+        // cookie 連携は GUI 側の事情で黙って効かなくなるので、常に現状を出しておく。
+        match self.cookies.label() {
+            Some(label) => format!("{line}  |  {label}"),
+            None => line,
         }
-        idle
     }
 
     fn playback_line(&self) -> String {
@@ -249,7 +260,16 @@ pub fn format_time(seconds: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::{CookieSource, Feed};
     use serde_json::json;
+
+    fn search_target() -> Target {
+        Target::Search("q".to_string())
+    }
+
+    fn source() -> CookieSource {
+        CookieSource::from_env_value(Some("chrome")).expect("spec")
+    }
 
     fn result(id: &str) -> SearchResult {
         SearchResult {
@@ -295,7 +315,7 @@ mod tests {
     #[test]
     fn empty_results_set_error_and_stay_in_input() {
         let mut app = App::default();
-        app.set_results(Vec::new());
+        app.set_results(Vec::new(), &search_target());
         assert_eq!(app.mode, Mode::Input);
         assert!(app.error.is_some());
     }
@@ -306,10 +326,72 @@ mod tests {
             selected: 5,
             ..App::default()
         };
-        app.set_results(vec![result("a")]);
+        app.set_results(vec![result("a")], &search_target());
         assert_eq!(app.mode, Mode::Results);
         assert_eq!(app.selected, 0);
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn empty_search_results_keep_the_current_message() {
+        let mut app = App::default();
+        app.set_results(Vec::new(), &search_target());
+        assert_eq!(app.error.as_deref(), Some("検索結果が0件でした"));
+    }
+
+    #[test]
+    fn empty_feed_results_explain_the_login_requirement() {
+        // フィードが空なのは件数の問題ではなく、ログインが効いていない疑いが濃い。
+        let mut app = App::default();
+        app.set_results(Vec::new(), &Target::Feed(Feed::Recommended));
+        let error = app.error.expect("理由を出す");
+        assert!(error.starts_with("おすすめ"), "{error}");
+        assert!(error.contains("ログイン"), "{error}");
+    }
+
+    #[test]
+    fn idle_and_searching_status_show_the_cookie_label() {
+        let mut app = App {
+            cookies: CookieState::Armed(source()),
+            ..App::default()
+        };
+        assert!(
+            app.status_line().ends_with("cookies: chrome"),
+            "{}",
+            app.status_line()
+        );
+        assert!(app.status_line().starts_with("検索したい語句"));
+
+        app.searching = true;
+        assert!(app.status_line().starts_with("検索中..."));
+        assert!(app.status_line().ends_with("cookies: chrome"));
+
+        // 停止中はその旨まで出す。
+        app.searching = false;
+        app.cookies = CookieState::Suspended {
+            source: source(),
+            reason: "読めませんでした".to_string(),
+        };
+        assert!(app.status_line().ends_with("cookies: chrome (停止)"));
+
+        // 環境変数が無ければ従来どおり何も足さない。
+        app.cookies = CookieState::Off;
+        assert_eq!(app.status_line(), "検索したい語句を入力して Enter");
+    }
+
+    #[test]
+    fn notice_shows_when_there_is_no_error_and_error_wins() {
+        let mut app = App {
+            cookies: CookieState::Armed(source()),
+            notice: Some("cookie を読めませんでした".to_string()),
+            ..App::default()
+        };
+        let line = app.status_line();
+        assert!(line.contains("cookies: chrome"), "{line}");
+        assert!(line.ends_with("cookie を読めませんでした"), "{line}");
+
+        app.error = Some("boom".to_string());
+        assert_eq!(app.status_line(), "エラー: boom");
     }
 
     #[test]

@@ -1,17 +1,17 @@
 //! Session を動かすアクション。キー入力もイベント処理もここを通して player を触る。
 
 use crate::app::{App, AppEvent, Mode, Playback};
+use crate::cookies::Target;
 use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::mpv::{self, MpvCommand, MpvController};
-use crate::search;
+use crate::search::{self, RealYtDlp, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::video::VideoSink;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, timeout};
+use tokio::time::Instant;
 
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// ドラッグ中は Resize が連続して届くので、落ち着くまで mpv の作り直しを待つ。
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
 /// ←→ 1 回あたりのシーク幅。
@@ -90,29 +90,58 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
 }
 
 pub fn start_search(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    start_search_with(app, tx, session, RealYtDlp);
+}
+
+/// yt-dlp の実行者を差し替えられる形。テストはここに偽物を渡して外部プロセスへ届かせない。
+pub fn start_search_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
     let query = app.query.trim().to_string();
     if query.is_empty() {
         return;
     }
-    // 連打しても yt-dlp が並走しないよう、先行の検索は打ち切る (kill_on_drop で子プロセスも落ちる)。
+    let target = Target::for_query(&query);
+    // 断る場合も先に打ち切る。生き残った先行検索の結果が後から画面を塗り替えないため。
+    cancel_search(app, session);
+    // cookie が無いフィードは yt-dlp を 10 秒待たせても結果が出ないので、その場で断る。
+    if target.requires_login()
+        && app.cookies.for_search().is_none()
+        && let Target::Feed(feed) = &target
+    {
+        app.error = Some(app.cookies.refusal(*feed));
+        app.mode = Mode::Input;
+        return;
+    }
+    let nonce = session.search_nonce;
+    app.searching = true;
+    app.error = None;
+    let cookies = app.cookies.for_search().cloned();
+    let tx = tx.clone();
+    session.search_task = Some(tokio::spawn(async move {
+        let report = search::run_search(&runner, &target, cookies.as_ref()).await;
+        let _ = tx.send(AppEvent::SearchDone {
+            nonce,
+            target,
+            report,
+        });
+    }));
+}
+
+/// 先行の検索を打ち切る。nonce を進めるので、届いてしまった結果は捨てられる
+/// (kill_on_drop で子プロセスも落ちる)。
+fn cancel_search(app: &mut App, session: &mut Session) {
     if let Some(task) = session.search_task.take() {
         task.abort();
     }
     session.search_nonce += 1;
-    let nonce = session.search_nonce;
-    app.searching = true;
-    app.error = None;
-    let tx = tx.clone();
-    session.search_task = Some(tokio::spawn(async move {
-        let result = match timeout(SEARCH_TIMEOUT, search::search(&query)).await {
-            Ok(result) => result,
-            Err(_) => Err(format!(
-                "検索がタイムアウトしました ({} 秒)",
-                SEARCH_TIMEOUT.as_secs()
-            )),
-        };
-        let _ = tx.send(AppEvent::SearchDone { nonce, result });
-    }));
+    app.searching = false;
+    app.notice = None;
 }
 
 pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
@@ -123,12 +152,19 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     session.player_nonce += 1;
     let nonce = session.player_nonce;
     let video = VideoSink::new(video_geometry());
+    // 検索で cookie が効くと確かめた後だけ再生にも渡す (再生側では劣化を検知できない)。
+    let extra: Vec<String> = app
+        .cookies
+        .for_playback()
+        .map(|source| vec![source.mpv_arg()])
+        .unwrap_or_default();
     match MpvController::launch(
         &result.url(),
         nonce,
         tx.clone(),
         video.clone(),
         app.fps_limit,
+        &extra,
     )
     .await
     {
@@ -198,15 +234,27 @@ pub async fn stop_playback(session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::{CookieSource, CookieState};
     use crate::search::SearchResult;
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
     use ratatui::layout::Rect;
+    use std::future::Future;
+    use std::process::Output;
     use tokio::sync::mpsc;
 
     const CELL: CellSize = CellSize {
         width_px: 8,
         height_px: 16,
     };
+
+    /// 応答を返さない偽の yt-dlp。タスクは積まれるが外部プロセスは起動しない。
+    struct StubYtDlp;
+
+    impl YtDlp for StubYtDlp {
+        fn run(&self, _args: Vec<String>) -> impl Future<Output = std::io::Result<Output>> + Send {
+            std::future::pending()
+        }
+    }
 
     fn result(id: &str) -> SearchResult {
         SearchResult {
@@ -298,17 +346,94 @@ mod tests {
             error: Some("boom".to_string()),
             ..App::default()
         };
-        start_search(&mut app, &tx, &mut session);
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        // 積んだタスクを一度動かす。偽のランナーなので外部プロセスには届かない。
+        tokio::task::yield_now().await;
 
         assert_eq!(session.search_nonce, 1);
         assert!(app.searching);
         assert!(app.error.is_none());
-        // yt-dlp を実際に走らせないよう、一度も polled されないうちに畳む。
-        session
-            .search_task
-            .take()
-            .expect("検索タスクが積まれている")
-            .abort();
+        assert!(session.search_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn feed_requiring_login_is_refused_before_spawning_when_cookies_are_off() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: ":ytrec".to_string(),
+            ..App::default()
+        };
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none(), "yt-dlp を起動しない");
+        // 断った試行も世代を1つ進める (先行の結果を無効にするため)。
+        assert_eq!(session.search_nonce, 1);
+        assert!(!app.searching);
+        let error = app.error.expect("理由を出す");
+        assert!(error.contains(crate::cookies::ENV_VAR), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_feed_cancels_the_search_in_flight() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: "ラーメン".to_string(),
+            notice: Some("前の検索の知らせ".to_string()),
+            ..App::default()
+        };
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        tokio::task::yield_now().await;
+        assert!(app.searching);
+
+        // 検索中に cookie 無しのフィードを要求する。
+        app.query = ":ytrec".to_string();
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        // 先行タスクは残さず、その結果が後から採用されないよう nonce も進める。
+        assert!(session.search_task.is_none());
+        assert_eq!(session.search_nonce, 2);
+        assert!(!app.searching);
+        assert!(app.notice.is_none());
+        assert_eq!(app.mode, Mode::Input);
+        let error = app.error.expect("理由を出す");
+        assert!(error.contains(crate::cookies::ENV_VAR), "{error}");
+    }
+
+    #[tokio::test]
+    async fn feed_requiring_login_is_refused_when_suspended() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: ":ythis".to_string(),
+            cookies: CookieState::Suspended {
+                source: CookieSource::from_env_value(Some("chrome")).expect("spec"),
+                reason: "cookie を読めませんでした".to_string(),
+            },
+            ..App::default()
+        };
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none());
+        let error = app.error.expect("理由を出す");
+        assert!(error.contains("停止中"), "{error}");
+        assert!(error.contains("cookie を読めませんでした"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn start_search_clears_the_notice() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: "ラーメン".to_string(),
+            notice: Some("前の検索の知らせ".to_string()),
+            ..App::default()
+        };
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(app.notice.is_none());
+        assert!(session.search_task.is_some());
     }
 
     #[tokio::test]

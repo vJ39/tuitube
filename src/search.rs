@@ -1,6 +1,14 @@
+use crate::cookies::{CookieOutcome, CookieSource, FEED_LIMIT, Target, classify};
 use serde_json::Value;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::process::Output;
+use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::timeout;
+
+/// yt-dlp 1 回の実行ごとの上限。cookie 付きの失敗から再試行すると最大 2 回分待つ。
+pub const YT_DLP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -33,9 +41,11 @@ fn parse_line(line: &str) -> Option<SearchResult> {
         .unwrap_or("(title unknown)")
         .to_string();
     let duration = value.get("duration").and_then(Value::as_f64);
+    // フィードの行は uploader を欠くことがあるので channel でも拾う。
     let uploader = value
         .get("uploader")
         .and_then(Value::as_str)
+        .or_else(|| value.get("channel").and_then(Value::as_str))
         .map(str::to_string);
     Some(SearchResult {
         id,
@@ -45,38 +55,193 @@ fn parse_line(line: &str) -> Option<SearchResult> {
     })
 }
 
-pub async fn search(query: &str) -> Result<Vec<SearchResult>, String> {
-    let output = Command::new("yt-dlp")
-        .arg(format!("ytsearch10:{query}"))
-        .arg("--flat-playlist")
-        .arg("--dump-json")
-        // 検索中にアプリを終了しても yt-dlp を孤児にしない。
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|e| {
-            if e.kind() == ErrorKind::NotFound {
-                "yt-dlp が見つかりません (PATH を確認してください)".to_string()
-            } else {
-                format!("yt-dlp の起動に失敗しました: {e}")
-            }
-        })?;
+/// 本番は tokio Command、テストは台本どおりの Output を返す偽物。
+pub trait YtDlp {
+    fn run(&self, args: Vec<String>) -> impl Future<Output = std::io::Result<Output>> + Send;
+}
 
-    let results = parse_lines(&String::from_utf8_lossy(&output.stdout));
-    if results.is_empty() && !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.lines().last().unwrap_or("").trim();
-        return Err(format!("yt-dlp が失敗しました: {detail}"));
+pub struct RealYtDlp;
+
+impl YtDlp for RealYtDlp {
+    fn run(&self, args: Vec<String>) -> impl Future<Output = std::io::Result<Output>> + Send {
+        // 検索中にアプリを終了しても yt-dlp を孤児にしない。
+        Command::new("yt-dlp")
+            .args(args)
+            .kill_on_drop(true)
+            .output()
     }
-    Ok(results)
+}
+
+pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>) -> Vec<String> {
+    let mut args = vec![
+        target.yt_dlp_url(),
+        "--flat-playlist".to_string(),
+        "--dump-json".to_string(),
+    ];
+    if let Target::Feed(_) = target {
+        args.push("--playlist-end".to_string());
+        args.push(FEED_LIMIT.to_string());
+    }
+    if let Some(cookies) = cookies {
+        args.extend(cookies.yt_dlp_args());
+    }
+    args
+}
+
+#[derive(Debug)]
+pub struct SearchReport {
+    pub results: Result<Vec<SearchResult>, String>,
+    pub outcome: CookieOutcome,
+    /// cookie 無しで再実行した。
+    pub fell_back: bool,
+}
+
+struct Attempt {
+    results: Result<Vec<SearchResult>, String>,
+    outcome: CookieOutcome,
+}
+
+pub async fn run_search(
+    runner: &impl YtDlp,
+    target: &Target,
+    cookies: Option<&CookieSource>,
+) -> SearchReport {
+    let first = attempt(runner, target, cookies).await;
+    // 読めないときは検索そのものが実行されないので、同じ target を cookie 無しで出し直す。
+    if let CookieOutcome::Unreadable(_) = &first.outcome {
+        let retry = attempt(runner, target, None).await;
+        return SearchReport {
+            results: retry.results,
+            outcome: first.outcome,
+            fell_back: true,
+        };
+    }
+    SearchReport {
+        results: first.results,
+        outcome: first.outcome,
+        fell_back: false,
+    }
+}
+
+async fn attempt(runner: &impl YtDlp, target: &Target, cookies: Option<&CookieSource>) -> Attempt {
+    let used_cookies = cookies.is_some();
+    let output = match timeout(YT_DLP_TIMEOUT, runner.run(yt_dlp_args(target, cookies))).await {
+        Err(_) => {
+            return Attempt {
+                results: Err(format!(
+                    "検索がタイムアウトしました ({} 秒)",
+                    YT_DLP_TIMEOUT.as_secs()
+                )),
+                outcome: outcome_of(used_cookies, CookieOutcome::TimedOut),
+            };
+        }
+        Ok(Err(e)) => {
+            return Attempt {
+                results: Err(launch_error(&e)),
+                outcome: outcome_of(used_cookies, CookieOutcome::Unknown),
+            };
+        }
+        Ok(Ok(output)) => output,
+    };
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let outcome = if used_cookies {
+        classify(output.status.code(), &stderr)
+    } else {
+        CookieOutcome::NotUsed
+    };
+    let results = parse_lines(&String::from_utf8_lossy(&output.stdout));
+    let results = if results.is_empty() && !output.status.success() {
+        let detail = stderr.lines().last().unwrap_or("").trim();
+        Err(format!("yt-dlp が失敗しました: {detail}"))
+    } else {
+        Ok(results)
+    };
+    Attempt { results, outcome }
+}
+
+fn outcome_of(used_cookies: bool, outcome: CookieOutcome) -> CookieOutcome {
+    if used_cookies {
+        outcome
+    } else {
+        CookieOutcome::NotUsed
+    }
+}
+
+fn launch_error(e: &std::io::Error) -> String {
+    if e.kind() == ErrorKind::NotFound {
+        "yt-dlp が見つかりません (PATH を確認してください)".to_string()
+    } else {
+        format!("yt-dlp の起動に失敗しました: {e}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::Feed;
+    use std::collections::VecDeque;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Mutex;
 
     const LINE_FULL: &str =
         r#"{"id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
+
+    fn source(spec: &str) -> CookieSource {
+        CookieSource::from_env_value(Some(spec)).expect("spec")
+    }
+
+    enum Step {
+        Done(std::io::Result<Output>),
+        /// 応答が返らない状況 (キーチェーンのダイアログ待ち等)。
+        Hang,
+    }
+
+    fn done(code: i32, stdout: &str, stderr: &str) -> Step {
+        Step::Done(Ok(Output {
+            // ExitStatus は生の wait ステータスから作る (下位 8 bit はシグナル用)。
+            status: ExitStatusExt::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }))
+    }
+
+    #[derive(Default)]
+    struct FakeYtDlp {
+        script: Mutex<VecDeque<Step>>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl FakeYtDlp {
+        fn new(steps: impl IntoIterator<Item = Step>) -> Self {
+            Self {
+                script: Mutex::new(steps.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().expect("lock").clone()
+        }
+    }
+
+    impl YtDlp for FakeYtDlp {
+        fn run(&self, args: Vec<String>) -> impl Future<Output = std::io::Result<Output>> + Send {
+            self.calls.lock().expect("lock").push(args);
+            let step = self.script.lock().expect("lock").pop_front();
+            async move {
+                match step {
+                    Some(Step::Done(result)) => result,
+                    Some(Step::Hang) => std::future::pending().await,
+                    None => panic!("台本に無い呼び出し"),
+                }
+            }
+        }
+    }
+
+    fn has_cookie_flag(args: &[String]) -> bool {
+        args.iter().any(|a| a == "--cookies-from-browser")
+    }
 
     #[test]
     fn parses_full_lines() {
@@ -132,5 +297,184 @@ mod tests {
     fn builds_watch_url() {
         let results = parse_lines(LINE_FULL);
         assert_eq!(results[0].url(), "https://www.youtube.com/watch?v=abc123");
+    }
+
+    #[test]
+    fn parse_line_falls_back_to_channel_when_uploader_is_missing() {
+        let line = r#"{"id":"a","title":"t","channel":"Some Channel"}"#;
+        assert_eq!(
+            parse_lines(line)[0].uploader.as_deref(),
+            Some("Some Channel")
+        );
+        // uploader が入っていればそちらを優先する。
+        let both = r#"{"id":"a","title":"t","uploader":"Up","channel":"Ch"}"#;
+        assert_eq!(parse_lines(both)[0].uploader.as_deref(), Some("Up"));
+        // 履歴の行は両方とも無いので埋まらない。
+        let neither = r#"{"id":"a","title":"t"}"#;
+        assert_eq!(parse_lines(neither)[0].uploader, None);
+    }
+
+    #[test]
+    fn yt_dlp_args_without_cookies_match_the_current_command() {
+        assert_eq!(
+            yt_dlp_args(&Target::Search("q".to_string()), None),
+            ["ytsearch10:q", "--flat-playlist", "--dump-json"]
+        );
+    }
+
+    #[test]
+    fn yt_dlp_args_append_cookie_flags_after_the_fixed_part() {
+        let args = yt_dlp_args(
+            &Target::Search("q".to_string()),
+            Some(&source("chrome:P 1")),
+        );
+        assert_eq!(
+            args,
+            [
+                "ytsearch10:q",
+                "--flat-playlist",
+                "--dump-json",
+                "--cookies-from-browser",
+                "chrome:P 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn yt_dlp_args_limit_feeds() {
+        let args = yt_dlp_args(&Target::Feed(Feed::Recommended), Some(&source("chrome")));
+        assert_eq!(
+            args,
+            [
+                ":ytrec",
+                "--flat-playlist",
+                "--dump-json",
+                "--playlist-end",
+                "30",
+                "--cookies-from-browser",
+                "chrome",
+            ]
+        );
+        assert!(
+            !yt_dlp_args(&Target::Search("q".to_string()), None)
+                .iter()
+                .any(|a| a == "--playlist-end")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_search_retries_without_cookies_when_the_store_is_unreadable() {
+        let runner = FakeYtDlp::new([
+            done(
+                1,
+                "",
+                "ERROR: could not find firefox cookies database in '/x/Profiles'",
+            ),
+            done(0, LINE_FULL, ""),
+        ]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            Some(&source("firefox")),
+        )
+        .await;
+
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(has_cookie_flag(&calls[0]));
+        assert!(!has_cookie_flag(&calls[1]));
+        assert_eq!(report.results.expect("2 回目の結果").len(), 1);
+        assert!(report.fell_back);
+        assert!(matches!(report.outcome, CookieOutcome::Unreadable(_)));
+    }
+
+    #[tokio::test]
+    async fn run_search_does_not_retry_on_unrelated_failure() {
+        let runner = FakeYtDlp::new([done(
+            1,
+            "",
+            "ERROR: [youtube:search] Unable to download webpage",
+        )]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            Some(&source("chrome")),
+        )
+        .await;
+
+        assert_eq!(runner.calls().len(), 1);
+        assert!(report.results.is_err());
+        assert_eq!(report.outcome, CookieOutcome::Unknown);
+        assert!(!report.fell_back);
+    }
+
+    #[tokio::test]
+    async fn run_search_keeps_results_but_reports_degradation() {
+        let runner = FakeYtDlp::new([done(
+            0,
+            LINE_FULL,
+            "WARNING: find-generic-password failed\nWARNING: cannot decrypt v10 cookies: no key found\n",
+        )]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            Some(&source("chrome")),
+        )
+        .await;
+
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(report.results.expect("結果は返る").len(), 1);
+        assert!(matches!(report.outcome, CookieOutcome::Degraded(_)));
+        assert!(!report.fell_back);
+    }
+
+    #[tokio::test]
+    async fn run_search_reports_login_required_without_retry() {
+        let runner = FakeYtDlp::new([done(
+            1,
+            "",
+            "ERROR: [youtube:history] Login details are needed to download this content.",
+        )]);
+        let report = run_search(
+            &runner,
+            &Target::Feed(Feed::History),
+            Some(&source("safari")),
+        )
+        .await;
+
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(report.outcome, CookieOutcome::LoginRequired);
+        assert!(!report.fell_back);
+    }
+
+    #[tokio::test]
+    async fn run_search_reports_not_used_without_cookies() {
+        let runner = FakeYtDlp::new([done(
+            1,
+            "",
+            "ERROR: could not find chrome cookies database in '/x'",
+        )]);
+        let report = run_search(&runner, &Target::Search("q".to_string()), None).await;
+
+        // cookie を渡していない実行の stderr は cookie の判定材料にしない。
+        assert_eq!(runner.calls().len(), 1);
+        assert_eq!(report.outcome, CookieOutcome::NotUsed);
+        assert!(!report.fell_back);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_search_times_out_per_attempt() {
+        let runner = FakeYtDlp::new([Step::Hang]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            Some(&source("chrome")),
+        )
+        .await;
+
+        assert_eq!(runner.calls().len(), 1, "タイムアウトでは再試行しない");
+        let error = report.results.expect_err("結果は返らない");
+        assert!(error.contains("タイムアウト"), "{error}");
+        assert_eq!(report.outcome, CookieOutcome::TimedOut);
     }
 }

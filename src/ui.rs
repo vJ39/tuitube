@@ -157,7 +157,9 @@ fn cursor_x(input_area: Rect, query: &str) -> u16 {
 
 fn help_text(mode: Mode) -> &'static str {
     match mode {
-        Mode::Input => "Enter:検索  Esc:結果へ/終了",
+        Mode::Input => {
+            "Enter:検索  :ytrec/:ythis/:ytsubs/:ytwatchlater:ログイン連動の一覧  Esc:結果へ/終了"
+        }
         Mode::Results => "↑↓:選択  Enter:再生  /またはEsc:検索入力へ  q:終了",
         Mode::Playing => {
             "space:一時停止  ←→:5秒シーク  クリック/ドラッグ:シーク  ↑↓:音量±5  Esc:停止  q:終了"
@@ -215,6 +217,15 @@ mod tests {
     #[test]
     fn results_help_mentions_esc() {
         assert!(help_text(Mode::Results).contains("Esc"));
+    }
+
+    #[test]
+    fn input_help_mentions_feed_keywords() {
+        let help = help_text(Mode::Input);
+        for keyword in [":ytrec", ":ythis", ":ytsubs", ":ytwatchlater"] {
+            assert!(help.contains(keyword), "{keyword} がない: {help}");
+        }
+        assert!(help.contains("Enter:検索"));
     }
 
     #[test]

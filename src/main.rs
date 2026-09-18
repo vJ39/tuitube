@@ -1,5 +1,6 @@
 mod actions;
 mod app;
+mod cookies;
 mod geometry;
 mod input;
 mod kitty;
@@ -14,6 +15,7 @@ use actions::{
 };
 use anyhow::Result;
 use app::{App, AppEvent, Mode};
+use cookies::{CookieOutcome, CookieState, Target};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyEventKind,
 };
@@ -74,6 +76,8 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App {
         fps_limit: fps.limit,
         notice: fps.notice,
+        // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
+        cookies: CookieState::from_env(),
         ..App::default()
     };
     let mut session = Session::default();
@@ -197,19 +201,17 @@ async fn handle_event(
         AppEvent::Key(key) => handle_key(app, key, tx, session).await,
         AppEvent::Mouse(mouse) => handle_mouse(app, mouse, session).await,
         AppEvent::Resize { width, height } => schedule_resize(session, width, height),
-        AppEvent::SearchDone { nonce, result } => {
+        AppEvent::SearchDone {
+            nonce,
+            target,
+            report,
+        } => {
             if nonce != session.search_nonce {
                 return;
             }
             session.search_task = None;
             app.searching = false;
-            match result {
-                Ok(results) => app.set_results(results),
-                Err(e) => {
-                    app.error = Some(e);
-                    app.mode = Mode::Input;
-                }
-            }
+            apply_search_done(app, &target, report);
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
@@ -236,18 +238,73 @@ async fn handle_event(
         }
         AppEvent::MpvExited { nonce, error } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
+                let error = note_cookie_failure(app, error);
                 end_playback(app, session, error).await;
             }
         }
     }
 }
 
+/// cookie の状態を進めてから、結果かエラーを画面へ渡す。
+fn apply_search_done(app: &mut App, target: &Target, report: search::SearchReport) {
+    let armed = matches!(app.cookies, CookieState::Armed(_));
+    let source = app.cookies.for_search().cloned();
+    app.cookies.observe(&report.outcome);
+
+    if let Some(source) = &source {
+        app.notice = match &report.outcome {
+            CookieOutcome::Degraded(_) => Some(cookies::describe(&report.outcome, source)),
+            // 「cookie 無しで検索しました」は、実際に出し直せたときだけ言う。
+            CookieOutcome::Unreadable(_) if report.fell_back => {
+                Some(cookies::describe(&report.outcome, source))
+            }
+            _ => None,
+        };
+        // ログインが要るだけなら cookie 連携自体は生きている。結果は出さず理由だけ出す。
+        if let (CookieOutcome::LoginRequired, Target::Feed(feed)) = (&report.outcome, target) {
+            app.error = Some(cookies::login_required_message(*feed, source));
+            app.mode = Mode::Input;
+            return;
+        }
+    }
+
+    match report.results {
+        Ok(results) => app.set_results(results, target),
+        Err(e) => {
+            // 初回のタイムアウトはキーチェーンのダイアログ待ちの可能性があるので、そちらを案内する。
+            app.error = match (&report.outcome, &source) {
+                (CookieOutcome::TimedOut, Some(source)) if armed => {
+                    Some(cookies::describe(&report.outcome, source))
+                }
+                _ => Some(e),
+            };
+            app.mode = Mode::Input;
+        }
+    }
+}
+
+/// mpv の失敗が cookie 由来なら連携を止める。mpv の作り直しは利用者の Enter に任せる。
+fn note_cookie_failure(app: &mut App, error: Option<String>) -> Option<String> {
+    let text = error?;
+    if app.cookies.for_playback().is_none() {
+        return Some(text);
+    }
+    let Some(reason) = cookies::cookie_store_failure(&text) else {
+        return Some(text);
+    };
+    app.cookies.suspend(reason);
+    Some(format!(
+        "{text}。cookie 連携を停止しました。Enter でもう一度再生すると cookie 無しで再生します"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::Playback;
+    use crate::cookies::CookieSource;
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
-    use crate::search::SearchResult;
+    use crate::search::{SearchReport, SearchResult};
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
 
     const CELL: CellSize = CellSize {
@@ -357,6 +414,171 @@ mod tests {
         assert!(out.starts_with(&clear_bytes()));
         assert!(out.ends_with(b"\x1b\\"));
         assert!(!session.owe_clear);
+    }
+
+    fn source() -> CookieSource {
+        CookieSource::from_env_value(Some("chrome")).expect("spec")
+    }
+
+    fn search_done(
+        nonce: u64,
+        outcome: CookieOutcome,
+        results: Result<Vec<SearchResult>, String>,
+    ) -> AppEvent {
+        AppEvent::SearchDone {
+            nonce,
+            target: Target::Search("q".to_string()),
+            report: SearchReport {
+                results,
+                outcome,
+                fell_back: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn search_done_advances_the_cookie_state() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            cookies: CookieState::Armed(source()),
+            ..App::default()
+        };
+        handle_event(
+            &mut app,
+            search_done(1, CookieOutcome::Ok, Ok(vec![result("a")])),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.cookies, CookieState::Active(source()));
+        assert_eq!(app.mode, Mode::Results);
+        assert!(!app.searching);
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_done_from_a_superseded_nonce_does_not_touch_the_state() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 2,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            cookies: CookieState::Armed(source()),
+            ..App::default()
+        };
+        handle_event(
+            &mut app,
+            search_done(
+                1,
+                CookieOutcome::Unreadable("could not find chrome cookies database".to_string()),
+                Ok(Vec::new()),
+            ),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.cookies, CookieState::Armed(source()));
+        assert!(app.searching, "古い試行では検索中のままにする");
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn search_done_with_fallback_sets_the_notice() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            cookies: CookieState::Armed(source()),
+            ..App::default()
+        };
+        let event = AppEvent::SearchDone {
+            nonce: 1,
+            target: Target::Search("q".to_string()),
+            report: SearchReport {
+                results: Ok(vec![result("a")]),
+                outcome: CookieOutcome::Unreadable(
+                    "could not find chrome cookies database in '/x'".to_string(),
+                ),
+                fell_back: true,
+            },
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        // cookie 無しの結果は出しつつ、効いていない旨を伝える。
+        assert_eq!(app.mode, Mode::Results);
+        assert!(app.error.is_none());
+        let notice = app.notice.expect("説明を出す");
+        assert!(notice.contains("cookie 無しで検索しました"), "{notice}");
+        assert!(matches!(app.cookies, CookieState::Suspended { .. }));
+    }
+
+    #[test]
+    fn mpv_exit_with_an_unreadable_cookie_store_suspends() {
+        let mut app = App {
+            cookies: CookieState::Active(source()),
+            ..App::default()
+        };
+        let error = note_cookie_failure(
+            &mut app,
+            Some(
+                "mpv が異常終了しました (終了コード 2): ERROR: could not find chrome cookies database in '/x'"
+                    .to_string(),
+            ),
+        )
+        .expect("エラーは残す");
+        assert!(error.contains("cookie 連携を停止しました"), "{error}");
+        assert!(matches!(app.cookies, CookieState::Suspended { .. }));
+
+        // cookie と関係のない失敗では触らない。
+        let mut app = App {
+            cookies: CookieState::Active(source()),
+            ..App::default()
+        };
+        let error = note_cookie_failure(&mut app, Some("mpv が異常終了しました".to_string()))
+            .expect("エラーは残す");
+        assert_eq!(error, "mpv が異常終了しました");
+        assert_eq!(app.cookies, CookieState::Active(source()));
+        assert_eq!(note_cookie_failure(&mut app, None), None);
+    }
+
+    #[test]
+    fn an_unrelated_permission_error_from_mpv_keeps_the_cookie_state() {
+        // mpv はストリームやソケットの失敗でも同じ文言を出すので、cookie 連携は止めない。
+        let mut app = App {
+            cookies: CookieState::Active(source()),
+            ..App::default()
+        };
+        let text = "mpv が異常終了しました (終了コード 2): Operation not permitted: '/dev/dsp'";
+        let error = note_cookie_failure(&mut app, Some(text.to_string())).expect("エラーは残す");
+        assert_eq!(error, text);
+        assert_eq!(app.cookies, CookieState::Active(source()));
+
+        // cookie ファイルを指す権限エラーなら止める。
+        let mut app = App {
+            cookies: CookieState::Active(source()),
+            ..App::default()
+        };
+        let error = note_cookie_failure(
+            &mut app,
+            Some(
+                "mpv が異常終了しました (終了コード 2): ERROR: [Errno 1] Operation not permitted: '/Users/x/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies'"
+                    .to_string(),
+            ),
+        )
+        .expect("エラーは残す");
+        assert!(error.contains("cookie 連携を停止しました"), "{error}");
+        assert!(matches!(app.cookies, CookieState::Suspended { .. }));
     }
 
     #[tokio::test]
