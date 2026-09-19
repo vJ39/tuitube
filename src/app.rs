@@ -573,6 +573,8 @@ pub struct App {
     pub drawn_generation: u64,
     pub seek_bar: SeekBarState,
     pub should_quit: bool,
+    /// 終了確認 (y/N) を出している間 true。立っている間は他のキー/マウスを無視する。
+    pub confirm_quit: bool,
     /// 擬似カテゴリタブ。results / selected / scroll はここの写し。
     pub tabs: Tabs,
     /// チャンネル閲覧中だけ入る。入っている間は一覧の参照先がこちらへ移る。
@@ -635,6 +637,7 @@ impl Default for App {
             drawn_generation: 0,
             seek_bar: SeekBarState::default(),
             should_quit: false,
+            confirm_quit: false,
             tabs: Tabs::default(),
             channel: None,
             thumbs: Thumbs::default(),

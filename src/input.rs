@@ -37,6 +37,24 @@ pub async fn handle_key(
         return;
     }
 
+    // 終了確認中は他のキーを一切無視し、Y/N の返事だけを見る。
+    // 他のモードの処理と同じく、Ctrl 付きの文字は答えとして扱わない。
+    if app.confirm_quit {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.should_quit = true;
+                    app.confirm_quit = false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.confirm_quit = false;
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
     match app.mode {
         Mode::Input => handle_key_input(app, key, tx, session),
         Mode::Results => handle_key_results(app, key, tx, session).await,
@@ -74,7 +92,7 @@ fn handle_key_input(
         }
         KeyCode::Esc => {
             if app.results.is_empty() {
-                app.should_quit = true;
+                app.confirm_quit = true;
             } else {
                 app.mode = Mode::Results;
             }
@@ -113,7 +131,7 @@ async fn handle_key_results(
             app.mode = Mode::Input;
             app.set_error(None);
         }
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => app.confirm_quit = true,
         _ => {}
     }
 }
@@ -152,7 +170,7 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
         KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
-        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('q') => app.confirm_quit = true,
         _ => {}
     }
 }
@@ -414,6 +432,10 @@ pub async fn handle_mouse(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
+    // 終了確認中はクリックもドラッグも見ない。
+    if app.confirm_quit {
+        return;
+    }
     match app.mode {
         Mode::Playing => handle_mouse_playing(app, mouse, session).await,
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
@@ -824,13 +846,14 @@ mod tests {
     }
 
     #[test]
-    fn esc_quits_only_when_there_is_no_result_list_to_go_back_to() {
+    fn esc_asks_to_confirm_quit_only_when_there_is_no_result_list_to_go_back_to() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
 
         let mut app = App::default();
         handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session);
-        assert!(app.should_quit);
+        assert!(!app.should_quit, "即終了ではなく確認を挟む");
+        assert!(app.confirm_quit);
         assert_eq!(app.mode, Mode::Input);
 
         let mut app = App {
@@ -839,6 +862,7 @@ mod tests {
         };
         handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session);
         assert!(!app.should_quit);
+        assert!(!app.confirm_quit);
         assert_eq!(app.mode, Mode::Results);
     }
 
@@ -902,7 +926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q_quits_from_the_result_list() {
+    async fn q_asks_to_confirm_quit_from_the_result_list() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
@@ -911,7 +935,8 @@ mod tests {
             ..App::default()
         };
         handle_key_results(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
-        assert!(app.should_quit);
+        assert!(!app.should_quit, "即終了ではなく確認を挟む");
+        assert!(app.confirm_quit);
     }
 
     #[test]
@@ -1916,13 +1941,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn q_quits_from_the_channel_list() {
+    async fn q_asks_to_confirm_quit_from_the_channel_list() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = channel_app(4);
 
         handle_key(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
-        assert!(app.should_quit);
+        assert!(!app.should_quit, "即終了ではなく確認を挟む");
+        assert!(app.confirm_quit);
+    }
+
+    #[tokio::test]
+    async fn y_or_enter_confirms_the_quit() {
+        let (tx, _rx) = channel();
+        for code in [KeyCode::Char('y'), KeyCode::Char('Y'), KeyCode::Enter] {
+            let mut session = Session::default();
+            let mut app = App {
+                confirm_quit: true,
+                ..App::default()
+            };
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+            assert!(app.should_quit, "{code:?}");
+            assert!(!app.confirm_quit, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn n_or_esc_cancels_the_quit() {
+        let (tx, _rx) = channel();
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let mut session = Session::default();
+            let mut app = App {
+                confirm_quit: true,
+                ..App::default()
+            };
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+            assert!(!app.should_quit, "{code:?}");
+            assert!(!app.confirm_quit, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_keys_are_ignored_while_confirming_quit() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        // 入力モードなら本来は検索語になるキーも、確認中は一切通さない。
+        let mut app = App {
+            confirm_quit: true,
+            ..App::default()
+        };
+        handle_key(&mut app, key(KeyCode::Char('a')), &tx, &mut session).await;
+        assert!(app.confirm_quit, "確認状態のまま");
+        assert!(!app.should_quit);
+        assert!(app.query.text().is_empty(), "検索語に入ってはいけない");
+
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert!(app.confirm_quit, "他のキーで解除されない");
+
+        // Tab や Ctrl+S のようなモード遷移キーも通さない。
+        handle_key(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Input, "確認中はタブ切替も起きない");
+        handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
+        assert_ne!(app.mode, Mode::Settings, "確認中は設定も開かない");
+        assert!(app.confirm_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_y_and_ctrl_n_do_not_answer_the_quit_confirmation() {
+        let (tx, _rx) = channel();
+        for code in [KeyCode::Char('y'), KeyCode::Char('n')] {
+            let mut session = Session::default();
+            let mut app = App {
+                confirm_quit: true,
+                ..App::default()
+            };
+            handle_key(&mut app, ctrl(code), &tx, &mut session).await;
+            assert!(app.confirm_quit, "{code:?} は修飾キー付きなので無視する");
+            assert!(!app.should_quit, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_still_quits_immediately_while_confirming_quit() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            confirm_quit: true,
+            ..App::default()
+        };
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        handle_key(&mut app, ctrl_c, &tx, &mut session).await;
+        assert!(app.should_quit, "確認中でも Ctrl+C は逃げ道として残す");
+    }
+
+    #[tokio::test]
+    async fn the_mouse_does_nothing_while_confirming_quit() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(1);
+        app.confirm_quit = true;
+
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(app.confirm_quit, "確認状態のまま");
+        assert!(!app.should_quit);
     }
 
     #[tokio::test]

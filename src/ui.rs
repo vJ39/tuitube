@@ -753,7 +753,28 @@ fn draw_seek_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bar, seek_bar_area(area));
 }
 
+/// 終了確認 (y/N) の案内。エラーと同じ赤で目立たせる。
+const CONFIRM_QUIT_STATUS: &str = "終了しますか？ (y/N)";
+
+fn confirm_quit_hints() -> Vec<String> {
+    vec!["y/Enter:終了".to_string(), "n/Esc:キャンセル".to_string()]
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
+    // 終了確認中は、モード別の通知・エラー・ヒントより優先してこちらを出す。
+    if app.confirm_quit {
+        frame.render_widget(
+            Paragraph::new(grid::truncate(CONFIRM_QUIT_STATUS, status.width as usize))
+                .style(Style::default().fg(Color::Red)),
+            status,
+        );
+        frame.render_widget(
+            Paragraph::new(fit_hints(&confirm_quit_hints(), help.width as usize))
+                .style(Style::default().fg(Color::DarkGray)),
+            help,
+        );
+        return;
+    }
     let status_style = if app.error.is_some() {
         Style::default().fg(Color::Red)
     } else {
@@ -2445,5 +2466,62 @@ mod tests {
         let mut app = download_app();
         app.download_focus = DownloadField::Format;
         assert_eq!(download_cursor(Rect::new(0, 0, 80, 24), &app), None);
+    }
+
+    /// 終了確認中の下段2行。モード別のエラー・通知・ヒントより優先する。
+    fn confirm_quit_footer(app: &App) -> (String, String) {
+        let screen = rendered(app, 80, 24);
+        let mut lines: Vec<&str> = screen.lines().collect();
+        let help = lines.pop().expect("help行").trim_end().to_string();
+        let status = lines.pop().expect("status行").trim_end().to_string();
+        (status, help)
+    }
+
+    #[test]
+    fn confirm_quit_replaces_the_footer_no_matter_the_mode() {
+        let mut playing = App {
+            mode: Mode::Playing,
+            screen: Rect::new(0, 0, 80, 24),
+            playback: Playback {
+                title: "song".to_string(),
+                time_pos: Some(0.0),
+                duration: Some(60.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        playing.confirm_quit = true;
+        playing.error = Some("boom".to_string());
+        playing.notice = Some("notice".to_string());
+
+        let mut results = App {
+            mode: Mode::Results,
+            results: vec![result(0)],
+            ..App::default()
+        };
+        results.confirm_quit = true;
+        results.error = Some("boom".to_string());
+        results.notice = Some("notice".to_string());
+
+        let mut channel = channel_app(2);
+        channel.confirm_quit = true;
+        channel.error = Some("boom".to_string());
+        channel.notice = Some("notice".to_string());
+
+        let input = App {
+            confirm_quit: true,
+            notice: Some("notice".to_string()),
+            ..App::default()
+        };
+
+        for app in [playing, results, channel, input] {
+            let (status, help) = confirm_quit_footer(&app);
+            assert!(status.contains("終了しますか"), "{:?}: {status}", app.mode);
+            assert!(status.contains("(y/N)"), "{:?}: {status}", app.mode);
+            assert!(!status.contains("boom"), "{:?}: {status}", app.mode);
+            assert!(!status.contains("notice"), "{:?}: {status}", app.mode);
+            assert!(help.contains("y/Enter:終了"), "{:?}: {help}", app.mode);
+            assert!(help.contains("n/Esc:キャンセル"), "{:?}: {help}", app.mode);
+        }
     }
 }
