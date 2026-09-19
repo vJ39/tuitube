@@ -723,6 +723,8 @@ pub fn open_settings(app: &mut App, session: &mut Session) {
     app.settings_return = app.mode;
     app.mode = Mode::Settings;
     app.settings_selected = app.settings_selected.min(SETTINGS_ITEMS.len() - 1);
+    // 打ち込みかけの数字を持ち越さない。残ると開いた直後から打ち込み中になる。
+    app.settings_edit = None;
     // Esc の戻り先。保存していない編集は、この値で捨てる。
     app.settings_backup = app.settings.clone();
     // 貼ってあるサムネイルは ratatui の差分描画では消えないので、設定の行に重ならないよう剥がす。
@@ -734,6 +736,7 @@ pub fn open_settings(app: &mut App, session: &mut Session) {
 /// 「保存しなければ何も変わらない」と食い違う。
 pub fn close_settings(app: &mut App) {
     app.settings = app.settings_backup.clone();
+    app.settings_edit = None;
     app.mode = app.settings_return;
     // 開くときに剥がしたサムネイルを貼り直す。
     app.thumbs.mark_dirty();

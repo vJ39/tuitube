@@ -123,13 +123,86 @@ fn settings_action(code: KeyCode) -> Option<SettingsAction> {
     }
 }
 
+/// 数値項目へ数字を打ち込んでいる間の操作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditAction {
+    Push(char),
+    Backspace,
+    Commit,
+    Cancel,
+}
+
+/// 修飾キーの付かない数字キー。Ctrl+3 や Alt+3 は設定画面では何もしないままにする。
+fn plain_digit(key: KeyEvent) -> Option<char> {
+    let modified = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    match key.code {
+        KeyCode::Char(c) if c.is_ascii_digit() && !modified => Some(c),
+        _ => None,
+    }
+}
+
+/// 打ち込み中のキーと操作の対応表。ここに無いキーは打ち込みを邪魔しないよう捨てる。
+fn settings_edit_action(key: KeyEvent) -> Option<EditAction> {
+    if let Some(c) = plain_digit(key) {
+        return Some(EditAction::Push(c));
+    }
+    match key.code {
+        KeyCode::Backspace => Some(EditAction::Backspace),
+        KeyCode::Enter => Some(EditAction::Commit),
+        KeyCode::Esc => Some(EditAction::Cancel),
+        _ => None,
+    }
+}
+
 fn handle_key_settings(app: &mut App, key: KeyEvent) {
+    // 打ち込んでいる間は他のキーを通さない。抜けるのは Enter か Esc だけ。
+    if app.settings_edit.is_some() {
+        if let Some(action) = settings_edit_action(key) {
+            apply_settings_edit(app, action);
+        }
+        return;
+    }
+    // 数値項目での数字キーは打ち込みの始まり。選択肢の行では今までどおり効かない。
+    if let Some(c) = plain_digit(key)
+        && app.settings_item().is_numeric()
+    {
+        app.settings_edit = Some(c.to_string());
+        return;
+    }
     match settings_action(key.code) {
         Some(SettingsAction::Move(delta)) => move_settings_selection(app, delta),
         Some(SettingsAction::Adjust(delta)) => adjust_settings_value(app, delta),
         Some(SettingsAction::Save) => save_settings(app, std::time::Instant::now()),
         Some(SettingsAction::Close) => close_settings(app),
         None => {}
+    }
+}
+
+fn apply_settings_edit(app: &mut App, action: EditAction) {
+    match action {
+        // 上限の桁数で止める。それ以上はパースできず、Enter が効かないように見える。
+        EditAction::Push(c) => {
+            let digits = app.settings_item().max_digits();
+            if let Some(buffer) = app.settings_edit.as_mut()
+                && buffer.len() < digits
+            {
+                buffer.push(c);
+            }
+        }
+        EditAction::Backspace => {
+            if let Some(buffer) = app.settings_edit.as_mut() {
+                buffer.pop();
+            }
+        }
+        // 読めない入力は黙って捨てる。設定画面には知らせを消す機会が少ない。
+        EditAction::Commit => {
+            if let Some(raw) = app.settings_edit.take() {
+                app.settings_item().apply_numeric(&mut app.settings, &raw);
+            }
+        }
+        EditAction::Cancel => app.settings_edit = None,
     }
 }
 
@@ -1346,6 +1419,259 @@ mod tests {
             crate::settings::Settings::default(),
             "閉じたら編集前へ戻す"
         );
+    }
+
+    #[test]
+    fn the_typing_keys_map_to_their_actions() {
+        for c in ['0', '5', '9'] {
+            assert_eq!(
+                settings_edit_action(key(KeyCode::Char(c))),
+                Some(EditAction::Push(c))
+            );
+        }
+        assert_eq!(
+            settings_edit_action(key(KeyCode::Backspace)),
+            Some(EditAction::Backspace)
+        );
+        assert_eq!(
+            settings_edit_action(key(KeyCode::Enter)),
+            Some(EditAction::Commit)
+        );
+        assert_eq!(
+            settings_edit_action(key(KeyCode::Esc)),
+            Some(EditAction::Cancel)
+        );
+        // 打ち込んでいる間は移動も保存も終了も効かない。抜けるのは Enter か Esc。
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char(' '),
+            KeyCode::Char('s'),
+            KeyCode::Char('q'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(settings_edit_action(key(code)), None, "{code:?}");
+        }
+        // 修飾キー付きの数字は数字として扱わない。
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            let event = KeyEvent::new(KeyCode::Char('3'), modifiers);
+            assert_eq!(settings_edit_action(event), None, "{modifiers:?}");
+        }
+    }
+
+    /// 設定画面を開き、上から index 番目の行を選んだところまで進める。
+    async fn settings_at(
+        index: usize,
+        tx: &UnboundedSender<AppEvent>,
+        session: &mut Session,
+    ) -> App {
+        let mut app = App::default();
+        handle_key(&mut app, ctrl(KeyCode::Char('s')), tx, session).await;
+        for _ in 0..index {
+            handle_key(&mut app, key(KeyCode::Down), tx, session).await;
+        }
+        assert_eq!(app.settings_selected, index);
+        app
+    }
+
+    /// 数字を順に打ち込む。
+    async fn type_digits(
+        app: &mut App,
+        digits: &str,
+        tx: &UnboundedSender<AppEvent>,
+        session: &mut Session,
+    ) {
+        for c in digits.chars() {
+            handle_key(app, key(KeyCode::Char(c)), tx, session).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_digit_on_a_number_row_types_the_value_and_enter_writes_it() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(2, &tx, &mut session).await;
+        assert_eq!(app.settings_item().label(), "fps_cap");
+
+        type_digits(&mut app, "30", &tx, &mut session).await;
+        assert_eq!(app.settings_edit.as_deref(), Some("30"));
+        assert_eq!(
+            app.settings.fps_cap,
+            crate::settings::Settings::default().fps_cap,
+            "確定するまで設定は変えない"
+        );
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+        assert_eq!(app.settings.fps_cap, crate::display::FpsCap::new(30));
+        assert_eq!(app.settings_edit, None);
+        assert_eq!(app.mode, Mode::Settings, "確定しても画面は閉じない");
+    }
+
+    #[tokio::test]
+    async fn a_digit_on_a_choice_row_is_ignored() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(0, &tx, &mut session).await;
+        assert_eq!(app.settings_item().label(), "display.mode");
+
+        type_digits(&mut app, "3", &tx, &mut session).await;
+
+        assert_eq!(app.settings_edit, None);
+        assert_eq!(app.settings, crate::settings::Settings::default());
+    }
+
+    #[tokio::test]
+    async fn backspace_takes_back_a_digit_and_an_empty_enter_changes_nothing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(5, &tx, &mut session).await;
+        assert_eq!(app.settings_item().label(), "search.limit");
+
+        type_digits(&mut app, "12", &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert_eq!(app.settings_edit.as_deref(), Some("1"));
+
+        // 空になっても打ち込み中のまま。消しすぎても画面は変わらない。
+        for _ in 0..2 {
+            handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+            assert_eq!(app.settings_edit.as_deref(), Some(""));
+        }
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+        assert_eq!(app.settings_edit, None);
+        assert_eq!(
+            app.settings.search.limit,
+            crate::settings::Settings::default().search.limit
+        );
+    }
+
+    #[tokio::test]
+    async fn a_number_beyond_the_range_is_pulled_back_to_the_edge() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(5, &tx, &mut session).await;
+
+        type_digits(&mut app, "9999", &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+
+        assert_eq!(app.settings.search.limit, crate::settings::MAX_SEARCH_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn escape_while_typing_only_drops_what_was_typed() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(2, &tx, &mut session).await;
+        type_digits(&mut app, "90", &tx, &mut session).await;
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+        assert_eq!(app.settings_edit, None);
+        assert_eq!(app.mode, Mode::Settings, "1 回目は画面を閉じない");
+        assert_eq!(app.settings, crate::settings::Settings::default());
+
+        // 打ち込みを抜けた後の Esc は今までどおり設定画面を閉じる。
+        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Input);
+    }
+
+    #[tokio::test]
+    async fn the_other_keys_do_nothing_while_a_number_is_being_typed() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(5, &tx, &mut session).await;
+        type_digits(&mut app, "1", &tx, &mut session).await;
+
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char(' '),
+            KeyCode::Char('q'),
+            KeyCode::Tab,
+        ] {
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+        }
+
+        assert_eq!(app.settings_selected, 5, "行は動かさない");
+        assert_eq!(app.settings_edit.as_deref(), Some("1"));
+        assert_eq!(app.settings, crate::settings::Settings::default());
+        assert_eq!(app.mode, Mode::Settings);
+        assert!(!app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn a_digit_with_a_modifier_does_not_start_or_feed_the_typing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(5, &tx, &mut session).await;
+
+        for modifiers in [KeyModifiers::ALT, KeyModifiers::SUPER] {
+            let event = KeyEvent::new(KeyCode::Char('3'), modifiers);
+            handle_key(&mut app, event, &tx, &mut session).await;
+            assert_eq!(
+                app.settings_edit, None,
+                "{modifiers:?} で打ち込みが始まった"
+            );
+        }
+        // Ctrl+3 も同じ。Ctrl+C だけが最上位で終了に割り当ててある。
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+            &tx,
+            &mut session,
+        )
+        .await;
+        assert_eq!(app.settings_edit, None);
+
+        // 打ち込み中に来ても桁は増えない。
+        type_digits(&mut app, "1", &tx, &mut session).await;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+            &tx,
+            &mut session,
+        )
+        .await;
+        assert_eq!(app.settings_edit.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn the_typing_stops_at_the_digits_the_value_can_take() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(5, &tx, &mut session).await;
+        assert_eq!(app.settings_item().label(), "search.limit");
+
+        // 上限 1000 の 4 桁まで。キーリピートで伸び続けると Enter が効かなくなる。
+        type_digits(&mut app, "999999", &tx, &mut session).await;
+        assert_eq!(app.settings_edit.as_deref(), Some("9999"));
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+        assert_eq!(app.settings.search.limit, crate::settings::MAX_SEARCH_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn opening_and_closing_the_settings_drops_a_half_typed_number() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = settings_at(5, &tx, &mut session).await;
+        type_digits(&mut app, "12", &tx, &mut session).await;
+
+        // 打ち込み中のまま画面を離れても、次に開いたときは通常の操作から始める。
+        close_settings(&mut app);
+        assert_eq!(app.settings_edit, None);
+
+        app.settings_edit = Some("34".to_string());
+        open_settings(&mut app, &mut session);
+        assert_eq!(app.settings_edit, None);
+        assert_eq!(app.settings, crate::settings::Settings::default());
     }
 
     #[tokio::test]

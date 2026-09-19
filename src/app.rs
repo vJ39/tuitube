@@ -183,6 +183,68 @@ impl SettingsItem {
         }
     }
 
+    /// 数字キーで値を直接打ち込める項目。選択肢と bool は ←→ だけで動かす。
+    pub fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            Self::FpsCap
+                | Self::SearchLimit
+                | Self::ThumbnailsMaxCached
+                | Self::ThumbnailsTimeoutSecs
+        )
+    }
+
+    /// 上限の桁数。これを超えた入力はパースできず捨てられるので、打ち込みはここで止める。
+    /// 数値でない項目は 0 桁 = 打ち込みを受けない。
+    pub fn max_digits(self) -> usize {
+        let max: u64 = match self {
+            Self::FpsCap => u64::from(MAX_FPS_CAP),
+            Self::SearchLimit => MAX_SEARCH_LIMIT as u64,
+            // max_cached に上限は無いので、apply_numeric が受け取れる最大値で数える。
+            Self::ThumbnailsMaxCached => u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            Self::ThumbnailsTimeoutSecs => MAX_THUMB_TIMEOUT_SECS,
+            Self::DisplayMode
+            | Self::DisplayQuality
+            | Self::SubtitlesEnabled
+            | Self::SearchLayout
+            | Self::ThumbnailsEnabled => return 0,
+        };
+        max.to_string().len()
+    }
+
+    /// 打ち込んだ値の確定。範囲は ←→ と同じで、外れていれば端へ寄せる。
+    /// 数として読めない入力と数値でない項目は何もせず false を返す。
+    pub fn apply_numeric(self, settings: &mut Settings, raw: &str) -> bool {
+        let Ok(value) = raw.parse::<u64>() else {
+            return false;
+        };
+        match self {
+            Self::FpsCap => {
+                // 0 は「制限なし」。FpsCap は 1 以上しか作れない。
+                settings.fps_cap = FpsCap::new(value.min(u64::from(MAX_FPS_CAP)) as u32);
+            }
+            Self::SearchLimit => {
+                let min = MIN_SEARCH_LIMIT as u64;
+                let max = MAX_SEARCH_LIMIT as u64;
+                settings.search.limit = value.clamp(min, max) as usize;
+            }
+            Self::ThumbnailsMaxCached => {
+                settings.thumbnails.max_cached = usize::try_from(value).unwrap_or(usize::MAX);
+            }
+            Self::ThumbnailsTimeoutSecs => {
+                let secs = value.clamp(MIN_THUMB_TIMEOUT_SECS, MAX_THUMB_TIMEOUT_SECS);
+                settings.thumbnails.timeout = Duration::from_secs(secs);
+            }
+            // 選択肢と bool は打ち込みを受けない。is_numeric() と対で書き分ける。
+            Self::DisplayMode
+            | Self::DisplayQuality
+            | Self::SubtitlesEnabled
+            | Self::SearchLayout
+            | Self::ThumbnailsEnabled => return false,
+        }
+        true
+    }
+
     /// ←→ 1 回ぶんの変化。→ は次の値、← は前の値。bool はどちらでも反転する。
     /// 数値は刻みの目盛りを動き、範囲の端で止まる (ラップしない)。
     pub fn adjust(self, settings: &mut Settings, delta: i32) {
@@ -334,6 +396,9 @@ pub struct App {
     pub settings_return: Mode,
     /// 設定画面を開いた時点 (または最後に保存した時点) の設定。Esc はここへ戻す。
     pub settings_backup: Settings,
+    /// 数値項目へ打ち込んでいる途中の文字列。None なら通常表示。
+    /// settings へ書くのは確定したときだけなので、settings_backup とは別に持つ。
+    pub settings_edit: Option<String>,
     /// 環境変数が上書きしている項目。画面の断りと、保存時の書き戻しに使う。
     pub env_overridden: EnvOverridden,
 }
@@ -369,6 +434,7 @@ impl Default for App {
             scroll: 0,
             settings_selected: 0,
             settings_return: Mode::Input,
+            settings_edit: None,
             env_overridden: EnvOverridden::default(),
         }
     }
@@ -1673,6 +1739,123 @@ mod tests {
             app.settings_item(),
             SETTINGS_ITEMS[SETTINGS_ITEMS.len() - 1]
         );
+    }
+
+    #[test]
+    fn only_the_number_rows_take_a_typed_value() {
+        let numeric: Vec<&str> = SETTINGS_ITEMS
+            .iter()
+            .filter(|item| item.is_numeric())
+            .map(|item| item.label())
+            .collect();
+        assert_eq!(
+            numeric,
+            [
+                "fps_cap",
+                "search.limit",
+                "thumbnails.max_cached",
+                "thumbnails.timeout_secs",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_number_row_actually_takes_the_value_it_advertises() {
+        // is_numeric() に項目を足して apply_numeric() の腕を足し忘れると、
+        // 数字は打てるのに Enter が効かない行ができる。
+        let settings = Settings::default();
+        for item in SETTINGS_ITEMS {
+            let mut next = settings.clone();
+            assert_eq!(
+                item.apply_numeric(&mut next, "1"),
+                item.is_numeric(),
+                "{}",
+                item.label()
+            );
+            assert_eq!(item.max_digits() > 0, item.is_numeric(), "{}", item.label());
+        }
+    }
+
+    #[test]
+    fn the_digit_limit_still_lets_an_out_of_range_number_be_typed() {
+        // 端へ寄せる入力 (search.limit の 9999 等) は打てる長さに収める。
+        assert_eq!(SettingsItem::FpsCap.max_digits(), 3);
+        assert_eq!(SettingsItem::SearchLimit.max_digits(), 4);
+        assert_eq!(SettingsItem::ThumbnailsTimeoutSecs.max_digits(), 3);
+        assert_eq!(SettingsItem::ThumbnailsMaxCached.max_digits(), 20);
+    }
+
+    /// 打ち込んだ値を 1 項目だけ確定した結果。
+    fn typed(item: SettingsItem, raw: &str, settings: &Settings) -> Settings {
+        let mut next = settings.clone();
+        item.apply_numeric(&mut next, raw);
+        next
+    }
+
+    #[test]
+    fn a_typed_number_lands_inside_the_range_the_arrows_use() {
+        let settings = Settings::default();
+        let limit = |raw| {
+            typed(SettingsItem::SearchLimit, raw, &settings)
+                .search
+                .limit
+        };
+        assert_eq!(limit("250"), 250);
+        // 範囲の外は ←→ と同じ端で止める。
+        assert_eq!(limit("0"), MIN_SEARCH_LIMIT);
+        assert_eq!(limit("5000"), MAX_SEARCH_LIMIT);
+
+        let fps = |raw| typed(SettingsItem::FpsCap, raw, &settings).fps_cap;
+        assert_eq!(fps("24"), FpsCap::new(24));
+        assert_eq!(fps("999"), FpsCap::new(MAX_FPS_CAP));
+        // 0 は「制限なし」。
+        assert_eq!(fps("0"), None);
+
+        let cached = |raw| {
+            typed(SettingsItem::ThumbnailsMaxCached, raw, &settings)
+                .thumbnails
+                .max_cached
+        };
+        assert_eq!(cached("1200"), 1200);
+        assert_eq!(cached("0"), 0);
+
+        let timeout = |raw| {
+            typed(SettingsItem::ThumbnailsTimeoutSecs, raw, &settings)
+                .thumbnails
+                .timeout
+        };
+        assert_eq!(timeout("30"), Duration::from_secs(30));
+        assert_eq!(timeout("0"), Duration::from_secs(MIN_THUMB_TIMEOUT_SECS));
+        assert_eq!(timeout("999"), Duration::from_secs(MAX_THUMB_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn a_typed_value_that_is_not_a_number_leaves_the_setting_alone() {
+        let settings = Settings::default();
+        // 空入力・符号・小数・桁あふれは読めないので捨てる。
+        for raw in ["", " ", "abc", "-5", "1.5", "12 ", "99999999999999999999"] {
+            let mut next = settings.clone();
+            assert!(
+                !SettingsItem::SearchLimit.apply_numeric(&mut next, raw),
+                "{raw:?} は受け付けない"
+            );
+            assert_eq!(next, settings, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn typing_a_number_into_a_choice_row_changes_nothing() {
+        let settings = Settings::default();
+        for item in SETTINGS_ITEMS.iter().filter(|item| !item.is_numeric()) {
+            let mut next = settings.clone();
+            assert!(!item.apply_numeric(&mut next, "1"), "{}", item.label());
+            assert_eq!(next, settings, "{}", item.label());
+        }
+    }
+
+    #[test]
+    fn the_settings_screen_starts_without_a_typed_value() {
+        assert_eq!(App::default().settings_edit, None);
     }
 
     #[test]
