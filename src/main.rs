@@ -122,8 +122,9 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         // マウスの当たり判定は「ユーザーが今見ている画面」で行うので、描いた寸法を控える。
         app.screen = terminal.draw(|frame| ui::draw(frame, &app))?.area;
         app.mark_drawn();
-        let area = ui::video_area(app.screen);
-        present_video(&mut session, &app, area, terminal.backend_mut())?;
+        if let Some(area) = ui::video_target_area(&app, app.screen) {
+            present_video(&mut session, &app, area, terminal.backend_mut())?;
+        }
         // present_video が先。再生終了で持ち越した a=d が、貼ったばかりの画像を消さない順序。
         present_thumbs(&mut app, cell_size(), terminal.backend_mut())?;
         tokio::select! {

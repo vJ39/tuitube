@@ -33,6 +33,30 @@ pub fn video_area(area: Rect) -> Rect {
     playing_areas(area)[0]
 }
 
+/// 隅のミニプレイヤーの幅・高さ。設定項目にはしない固定値。
+const MINI_VIDEO_COLS: u16 = 32;
+const MINI_VIDEO_ROWS: u16 = 10;
+
+/// 結果一覧の右上に切り出す、隅のミニプレイヤー用の矩形。
+pub fn mini_video_area(screen: Rect) -> Rect {
+    let results = search_areas(screen)[2];
+    let cols = MINI_VIDEO_COLS.min(results.width / 2).max(1);
+    let rows = MINI_VIDEO_ROWS.min(results.height).max(1);
+    Rect::new(results.right().saturating_sub(cols), results.y, cols, rows)
+}
+
+/// 今のフレームで映像をどこに描くか。無ければ None (window 中・映像が無い)。
+pub fn video_target_area(app: &App, screen: Rect) -> Option<Rect> {
+    app.video.as_ref()?;
+    if app.mode == Mode::Playing {
+        return Some(video_area(screen));
+    }
+    match app.display {
+        DisplayMode::Window => None,
+        DisplayMode::Embedded | DisplayMode::Text => Some(mini_video_area(screen)),
+    }
+}
+
 /// シークバーの行。クリック桁から再生位置を求めるときもこの矩形を使う。
 pub fn seek_bar_area(area: Rect) -> Rect {
     playing_areas(area)[1]
@@ -362,10 +386,20 @@ fn draw_search(frame: &mut Frame, app: &App) {
     frame.render_widget(input, areas[0]);
     draw_tabs(frame, app, areas[1]);
 
+    // バックグラウンド中はミニプレイヤーの幅ぶんを結果一覧から空ける。
+    let video = video_target_area(app, frame.area());
+    let results_area = match video {
+        Some(video) => Rect {
+            width: areas[2].width.saturating_sub(video.width),
+            ..areas[2]
+        },
+        None => areas[2],
+    };
+
     // app.screen は直前の draw の寸法なので、割り付けは今のフレームで組み直す。
     let layout = if app.settings.search.layout == LayoutMode::Grid {
         grid::layout(
-            Block::default().borders(Borders::ALL).inner(areas[2]),
+            Block::default().borders(Borders::ALL).inner(results_area),
             cell_size(),
             app.view_results().len(),
             app.view_scroll(),
@@ -374,8 +408,16 @@ fn draw_search(frame: &mut Frame, app: &App) {
         None
     };
     match &layout {
-        Some(layout) => draw_grid(frame, app, areas[2], layout),
-        None => draw_list(frame, app, areas[2]),
+        Some(layout) => draw_grid(frame, app, results_area, layout),
+        None => draw_list(frame, app, results_area),
+    }
+
+    // embedded の画像は draw の後にメインループが APC で重ねる。text はここでしか描けない。
+    if let Some(video) = video
+        && app.display == DisplayMode::Text
+        && let Some(sink) = &app.video
+    {
+        sink.render_text(video, frame.buffer_mut());
     }
 
     draw_footer(frame, app, areas[3], areas[4]);
@@ -800,6 +842,7 @@ fn help_line(app: &App, width: u16) -> String {
         app.display,
         app.comments.visible(),
         app.can_load_more(),
+        app.background,
         width,
     )
 }
@@ -825,12 +868,13 @@ fn help_text(
     display: DisplayMode,
     comments_open: bool,
     can_load_more: bool,
+    background: bool,
     width: u16,
 ) -> String {
     let hints = match mode {
-        Mode::Input => input_hints(),
-        Mode::Results => results_hints(can_load_more),
-        Mode::Channel => channel_hints(),
+        Mode::Input => input_hints(background),
+        Mode::Results => results_hints(can_load_more, background),
+        Mode::Channel => channel_hints(background),
         Mode::Playing => playing_hints(display, comments_open),
         Mode::Settings => settings_hints(),
         Mode::Download => download_hints(),
@@ -841,8 +885,9 @@ fn help_text(
 /// 検索入力の案内。先頭 5 つで 75 桁ほどになり、80 桁端末にはそこまでが出る。
 /// 入力欄では S も検索語なので、設定は Ctrl+S で開く。
 /// 後半の編集キーは 80 桁には入らないので、幅のある端末でだけ出る。
-fn input_hints() -> Vec<String> {
-    vec![
+/// バックグラウンド中だけ末尾に Ctrl+B (前面へ戻る) を足す。
+fn input_hints(background: bool) -> Vec<String> {
+    let mut hints = vec![
         "Enter:検索".to_string(),
         "Tab:カテゴリ".to_string(),
         ":yt*:ログイン連動の一覧".to_string(),
@@ -852,13 +897,18 @@ fn input_hints() -> Vec<String> {
         "Shift+←→:選択".to_string(),
         "Home/End:先頭/末尾".to_string(),
         "クリック:カーソル".to_string(),
-    ]
+    ];
+    if background {
+        hints.push("Ctrl+B:全画面へ".to_string());
+    }
+    hints
 }
 
 /// 結果一覧の案内。ちょうど 80 桁で、80 桁端末に全部入る。
 /// h は押さないと気づけないので、矢印と Esc の言葉を削ってでも入れる。
 /// もっと見られる間だけ末尾に m を足す (狭い端末では他より先に落ちる)。
-fn results_hints(can_load_more: bool) -> Vec<String> {
+/// バックグラウンド中だけ末尾に b (前面へ戻る) を足す。
+fn results_hints(can_load_more: bool, background: bool) -> Vec<String> {
     let mut hints = vec![
         "↑↓←→".to_string(),
         "Enter:再生".to_string(),
@@ -873,14 +923,17 @@ fn results_hints(can_load_more: bool) -> Vec<String> {
     if can_load_more {
         hints.push("m:もっと見る".to_string());
     }
+    if background {
+        hints.push("b:全画面へ".to_string());
+    }
     hints
 }
 
 /// チャンネル一覧の案内。全部で 79 桁で 80 桁端末に収まる。
 /// タブの案内が長いので、矢印は結果一覧の案内に任せて落としてある。
-/// h はこのチャンネルごと隠す。
-fn channel_hints() -> Vec<String> {
-    vec![
+/// h はこのチャンネルごと隠す。バックグラウンド中だけ末尾に b (前面へ戻る) を足す。
+fn channel_hints(background: bool) -> Vec<String> {
+    let mut hints = vec![
         "Enter:再生".to_string(),
         "Tab:動画/ショート/配信".to_string(),
         "s:登録".to_string(),
@@ -889,7 +942,11 @@ fn channel_hints() -> Vec<String> {
         "Esc:戻る".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
-    ]
+    ];
+    if background {
+        hints.push("b:全画面へ".to_string());
+    }
+    hints
 }
 
 /// 設定画面の案内。全部で 71 桁ほどで 80 桁端末に収まる。
@@ -947,6 +1004,7 @@ fn playing_hints(display: DisplayMode, comments_open: bool) -> Vec<String> {
         "[ ]:速度±0.1".to_string(),
         "BS:等速".to_string(),
         "クリック:シーク".to_string(),
+        "b:検索へ".to_string(),
     ]
 }
 
@@ -975,6 +1033,7 @@ mod tests {
     use crate::category::Tabs;
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
+    use crate::video::{Geometry, VideoSink};
 
     fn result(index: usize) -> SearchResult {
         SearchResult {
@@ -1222,13 +1281,13 @@ mod tests {
 
     /// 80 桁端末のヘルプ。案内が落ちるかどうかはここで決まる。
     fn help_80(mode: Mode, display: DisplayMode) -> String {
-        help_text(mode, display, false, false, 80)
+        help_text(mode, display, false, false, false, 80)
     }
 
     #[test]
     fn input_help_mentions_the_editing_keys() {
         // 既存の案内で 80 桁が埋まっているので、編集キーは幅のある端末でだけ出る。
-        let help = help_text(Mode::Input, DisplayMode::Embedded, false, false, 140);
+        let help = help_text(Mode::Input, DisplayMode::Embedded, false, false, false, 140);
         for key in [
             "Ctrl+A:全選択",
             "Shift+←→:選択",
@@ -1270,7 +1329,14 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_speed_keys() {
         // 80 桁では入らないので、広い端末での案内で見る。
-        let help = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
+        let help = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(help.contains("[ ]"), "{help}");
         assert!(help.contains("BS"), "{help}");
         assert!(help.contains("速度"), "{help}");
@@ -1282,6 +1348,131 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
         assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
+    }
+
+    #[test]
+    fn mini_video_area_sits_at_the_top_right_of_the_results_block() {
+        let screen = Rect::new(0, 0, 80, 24);
+        let results = search_areas(screen)[2];
+        let mini = mini_video_area(screen);
+        assert_eq!(mini.y, results.y);
+        assert_eq!(mini.right(), results.right());
+        assert_eq!(mini.width, 32);
+        assert_eq!(mini.height, 10);
+    }
+
+    #[test]
+    fn mini_video_area_shrinks_to_fit_a_small_results_block() {
+        let screen = Rect::new(0, 0, 20, 10);
+        let results = search_areas(screen)[2];
+        let mini = mini_video_area(screen);
+        assert!(
+            mini.width <= results.width / 2 && mini.width >= 1,
+            "{mini:?}"
+        );
+        assert!(
+            mini.height <= results.height && mini.height >= 1,
+            "{mini:?}"
+        );
+    }
+
+    /// video_target_area の検証用に、映像を持つ App を組み立てる。
+    fn video_app(mode: Mode, display: DisplayMode) -> App {
+        App {
+            mode,
+            display,
+            screen: Rect::new(0, 0, 80, 24),
+            video: Some(VideoSink::new(Geometry::new(
+                Rect::new(0, 0, 80, 21),
+                crate::video::FALLBACK_CELL,
+                crate::video::MAX_FRAME_PIXELS,
+            ))),
+            ..App::default()
+        }
+    }
+
+    #[test]
+    fn video_target_area_is_none_without_a_video() {
+        let app = App {
+            mode: Mode::Playing,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        assert_eq!(video_target_area(&app, app.screen), None);
+    }
+
+    #[test]
+    fn video_target_area_is_the_full_video_area_while_playing() {
+        // window であっても Mode::Playing 中は差がない (別ウィンドウでも kitty 用に用意はしてある)。
+        for display in [
+            DisplayMode::Embedded,
+            DisplayMode::Text,
+            DisplayMode::Window,
+        ] {
+            let app = video_app(Mode::Playing, display);
+            assert_eq!(
+                video_target_area(&app, app.screen),
+                Some(video_area(app.screen)),
+                "{display:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_target_area_is_the_mini_area_while_backgrounded() {
+        for display in [DisplayMode::Embedded, DisplayMode::Text] {
+            let app = video_app(Mode::Results, display);
+            assert_eq!(
+                video_target_area(&app, app.screen),
+                Some(mini_video_area(app.screen)),
+                "{display:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_target_area_is_none_in_window_mode_while_backgrounded() {
+        let app = video_app(Mode::Results, DisplayMode::Window);
+        assert_eq!(video_target_area(&app, app.screen), None);
+    }
+
+    /// 指定セルの文字だけを取り出す。rendered() は全角文字で桁がずれるので、
+    /// 特定の列を狙うこのテストでは buffer を直接読む。
+    fn symbol_at(app: &App, width: u16, height: u16, x: u16, y: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("端末");
+        terminal.draw(|frame| draw(frame, app)).expect("描ける");
+        terminal.backend().buffer()[(x, y)].symbol().to_string()
+    }
+
+    #[test]
+    fn draw_search_narrows_the_results_block_for_the_mini_player() {
+        let screen = Rect::new(0, 0, 80, 24);
+        let row = search_areas(screen)[2].y;
+        let column = screen.width - 1;
+
+        // 通常時 (再生していない = 映像が無い) は結果ブロックが右端まで届く。
+        let normal = App {
+            mode: Mode::Results,
+            screen,
+            results: vec![result(0)],
+            ..App::default()
+        };
+        let full_corner = symbol_at(&normal, screen.width, screen.height, column, row);
+        assert_ne!(full_corner, " ", "背景無しなら結果ブロックが右端まで届く");
+
+        // バックグラウンド中 (映像を持ったまま検索側にいる) はミニプレイヤー分だけ避ける。
+        let backgrounded = App {
+            results: vec![result(0)],
+            background: true,
+            ..video_app(Mode::Results, DisplayMode::Embedded)
+        };
+        let narrowed_corner = symbol_at(&backgrounded, screen.width, screen.height, column, row);
+        assert_eq!(
+            narrowed_corner, " ",
+            "ミニプレイヤー分は結果ブロックを避ける"
+        );
     }
 
     #[test]
@@ -1713,7 +1904,14 @@ mod tests {
 
     #[test]
     fn the_channel_help_names_the_way_back() {
-        let help = help_text(Mode::Channel, DisplayMode::Embedded, false, false, 80);
+        let help = help_text(
+            Mode::Channel,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            80,
+        );
         for key in ["Enter:再生", "Tab:", "Esc", "q:終了"] {
             assert!(help.contains(key), "{key} が無い: {help}");
         }
@@ -1756,18 +1954,94 @@ mod tests {
 
     #[test]
     fn the_results_help_never_offers_more_when_it_cannot_load_more() {
-        let help = help_text(Mode::Results, DisplayMode::Embedded, false, false, 200);
+        let help = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(!help.contains("m:もっと見る"), "{help}");
     }
 
     #[test]
     fn the_more_hint_shows_up_once_there_is_room_and_more_to_load() {
-        let wide = help_text(Mode::Results, DisplayMode::Embedded, false, true, 200);
+        let wide = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            true,
+            false,
+            200,
+        );
         assert!(wide.contains("m:もっと見る"), "{wide}");
 
         // 既存の案内だけでちょうど 80 桁が埋まるので、80 桁端末ではまだ出ない。
-        let narrow = help_text(Mode::Results, DisplayMode::Embedded, false, true, 80);
+        let narrow = help_text(Mode::Results, DisplayMode::Embedded, false, true, false, 80);
         assert!(!narrow.contains("m:もっと見る"), "{narrow}");
+    }
+
+    #[test]
+    fn the_leave_background_hint_only_shows_up_while_backgrounded() {
+        let hidden = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(!hidden.contains("b:全画面へ"), "{hidden}");
+
+        let shown = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            false,
+            true,
+            200,
+        );
+        assert!(shown.contains("b:全画面へ"), "{shown}");
+
+        let hidden = help_text(
+            Mode::Channel,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(!hidden.contains("b:全画面へ"), "{hidden}");
+
+        let shown = help_text(
+            Mode::Channel,
+            DisplayMode::Embedded,
+            false,
+            false,
+            true,
+            200,
+        );
+        assert!(shown.contains("b:全画面へ"), "{shown}");
+
+        let hidden = help_text(Mode::Input, DisplayMode::Embedded, false, false, false, 200);
+        assert!(!hidden.contains("Ctrl+B"), "{hidden}");
+
+        let shown = help_text(Mode::Input, DisplayMode::Embedded, false, false, true, 200);
+        assert!(shown.contains("Ctrl+B:全画面へ"), "{shown}");
+    }
+
+    #[test]
+    fn the_playing_help_always_names_the_background_key() {
+        let help = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(help.contains("b:検索へ"), "{help}");
     }
 
     /// 矩形の左上と右下。両端が同じセルを指すことを確かめるための 2 点。
@@ -2026,13 +2300,27 @@ mod tests {
 
     #[test]
     fn playing_help_drops_whole_hints_when_the_terminal_is_narrow() {
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
+        let wide = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(wide.contains("クリック:シーク"), "{wide}");
 
-        let narrow = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 30);
+        let narrow = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            30,
+        );
         assert_eq!(narrow, "space:一時停止 ←→:シーク");
         assert_eq!(
-            help_text(Mode::Playing, DisplayMode::Embedded, false, false, 0),
+            help_text(Mode::Playing, DisplayMode::Embedded, false, false, false, 0),
             ""
         );
     }
@@ -2040,7 +2328,14 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_subtitle_key() {
         // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
+        let wide = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(wide.contains("s:字幕"), "{wide}");
         // 幅に入らないぶんは丸ごと落ちる。途中で切れた案内は出さない。
         let narrow = help_80(Mode::Playing, DisplayMode::Text);
@@ -2115,7 +2410,14 @@ mod tests {
         assert!(grid::display_width(&help) <= 80, "{help}");
         // 狭い端末では途中で切らず丸ごと落とす。
         assert_eq!(
-            help_text(Mode::Settings, DisplayMode::Embedded, false, false, 0),
+            help_text(
+                Mode::Settings,
+                DisplayMode::Embedded,
+                false,
+                false,
+                false,
+                0
+            ),
             ""
         );
     }
@@ -2123,7 +2425,14 @@ mod tests {
     #[test]
     fn a_narrow_settings_help_drops_the_direct_input_before_the_way_out() {
         // 直接入力を足す前の 5 つは 58 桁に収まる。足りないぶんは末尾から落とす。
-        let narrow = help_text(Mode::Settings, DisplayMode::Embedded, false, false, 58);
+        let narrow = help_text(
+            Mode::Settings,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            58,
+        );
         for key in ["↑↓:選択", "←→:値変更", "Enter/Space:切替", "s:保存"] {
             assert!(narrow.contains(key), "{key} が落ちた: {narrow}");
         }
@@ -2323,17 +2632,38 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_comment_key() {
         // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
+        let wide = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(wide.contains("o:コメント"), "{wide}");
     }
 
     #[test]
     fn the_arrow_hint_switches_to_the_comment_list_while_it_is_open() {
-        let open = help_text(Mode::Playing, DisplayMode::Embedded, true, false, 200);
+        let open = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            true,
+            false,
+            false,
+            200,
+        );
         assert!(open.contains("↑↓:行送り"), "{open}");
         assert!(!open.contains("↑↓:音量"), "{open}");
 
-        let closed = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
+        let closed = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(closed.contains("↑↓:音量"), "{closed}");
     }
 
@@ -2382,7 +2712,15 @@ mod tests {
     fn playing_help_mentions_the_mouse() {
         // マウスの案内は幅が余ったときだけ出す。
         assert!(
-            help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200).contains("クリック")
+            help_text(
+                Mode::Playing,
+                DisplayMode::Embedded,
+                false,
+                false,
+                false,
+                200
+            )
+            .contains("クリック")
         );
         assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
     }

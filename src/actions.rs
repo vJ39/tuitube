@@ -20,7 +20,7 @@ use crate::speed::Speed;
 use crate::subtitles::{self, SubtitleLaunch, SubtitleStatus};
 use crate::thumbs;
 use crate::ui;
-use crate::video::{CellSize, DecoderKind, VideoSink};
+use crate::video::{CellSize, DecoderKind, Geometry, VideoSink};
 use ratatui::layout::Rect;
 use std::collections::HashMap;
 use std::future::Future;
@@ -238,6 +238,8 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
     app.playback = Playback::default();
     app.seek_bar = SeekBarState::default();
     app.video = None;
+    // バックグラウンド中に自然終了・エラーで閉じても、退避状態を持ち越さない。
+    app.background = false;
     // sink を手放した後も残骸は消す。SIGKILL 経路では mpv 自身が消せない。
     session.owe_clear = true;
     // mpv の a=d でサムネイルも消えているので、結果へ戻ったら貼り直す。
@@ -245,13 +247,18 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
     if error.is_some() {
         app.set_error(error);
     }
-    app.enter_search_mode(if app.channel.is_some() {
+    app.enter_search_mode(background_return_mode(app));
+}
+
+/// end_playback / enter_background が検索側のどのモードへ戻すかの共通基準。
+fn background_return_mode(app: &App) -> Mode {
+    if app.channel.is_some() {
         Mode::Channel
     } else if app.results.is_empty() {
         Mode::Input
     } else {
         Mode::Results
-    });
+    }
 }
 
 pub fn start_search(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
@@ -1059,6 +1066,8 @@ pub fn enter_playback(
     app.seek_bar = SeekBarState::default();
     app.video = Some(video);
     app.mode = Mode::Playing;
+    // バックグラウンド中に別の動画へ差し替えても、前面 (Mode::Playing) に確実に戻す。
+    app.background = false;
     app.set_error(None);
     // 表示の希望は持ち越し、前の動画の選択だけ捨てる。
     app.subtitles.begin_playback(std::time::Instant::now());
@@ -1088,6 +1097,54 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
             app.video = None;
             app.set_error(Some(e));
         }
+    }
+}
+
+/// Mode::Playing から検索側へ退避する (b)。session.player/app.video/app.playback は
+/// 生かしたまま、映像の置き場所だけ隅のミニプレイヤーへ動かす。
+pub async fn enter_background(app: &mut App, session: &mut Session) {
+    app.background = true;
+    app.mode = background_return_mode(app);
+    apply_video_placement(app, session).await;
+}
+
+/// 検索側から前面 (Mode::Playing) へ戻る。バックグラウンド中でなければ何もしない。
+pub async fn leave_background(app: &mut App, session: &mut Session) {
+    if !app.background {
+        return;
+    }
+    app.background = false;
+    app.mode = Mode::Playing;
+    apply_video_placement(app, session).await;
+}
+
+/// 新しい置き場所 (ui::video_target_area) へ映像の寸法を合わせる。
+/// バックグラウンドのどちら向きの遷移でも手順は同じ。
+async fn apply_video_placement(app: &mut App, session: &mut Session) {
+    if let Some(area) = ui::video_target_area(app, app.screen) {
+        let geometry = Geometry::new(area, cell_size(), app.settings.display.max_pixels());
+        if let Some(video) = &app.video {
+            video.resize(geometry);
+        }
+        send_resize_commands(app, session, geometry).await;
+    }
+    // 古い置き場所の残像は消す。mpv の a=d でサムネイルも巻き込まれるので貼り直す。
+    session.owe_clear = true;
+    app.thumbs.mark_dirty();
+}
+
+/// apply_resize_with と同じ分岐。window 中は描き直すものが無いので何も送らない。
+async fn send_resize_commands(app: &mut App, session: &mut Session, geometry: Geometry) {
+    let Some(p) = session.player.as_mut() else {
+        return;
+    };
+    let sent = match app.display {
+        DisplayMode::Embedded => p.send_all(&mpv::resize_video(geometry)).await,
+        DisplayMode::Text => p.send_all(&mpv::resize_text_video(geometry)).await,
+        DisplayMode::Window => return,
+    };
+    if let Err(e) = sent {
+        app.set_error(Some(e));
     }
 }
 
@@ -1638,6 +1695,174 @@ mod tests {
         let mut session = Session::default();
         end_playback(&mut app, &mut session, None).await;
         assert_eq!(app.error.as_deref(), Some("前のエラー"));
+    }
+
+    #[tokio::test]
+    async fn end_playback_resets_background() {
+        let mut app = App {
+            mode: Mode::Playing,
+            background: true,
+            video: Some(sink()),
+            ..App::default()
+        };
+        let mut session = Session::default();
+        end_playback(&mut app, &mut session, None).await;
+        assert!(!app.background);
+    }
+
+    #[test]
+    fn enter_playback_resets_background() {
+        // バックグラウンド中 (Mode::Results 等) に別の動画で Enter を押した経路を再現する。
+        let mut app = App {
+            mode: Mode::Results,
+            background: true,
+            ..App::default()
+        };
+        let mut session = Session::default();
+        enter_playback(
+            &mut app,
+            &mut session,
+            "title".to_string(),
+            "https://example.com/watch".to_string(),
+            sink(),
+        );
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(!app.background);
+    }
+
+    #[tokio::test]
+    async fn enter_background_returns_to_results_and_keeps_the_player_alive() {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            results: vec![result("a")],
+            video: Some(sink()),
+            playback: Playback {
+                title: "song".to_string(),
+                ..Playback::default()
+            },
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        enter_background(&mut app, &mut session).await;
+
+        assert!(app.background);
+        assert_eq!(app.mode, Mode::Results);
+        assert!(app.video.is_some(), "映像はそのまま");
+        assert_eq!(app.playback.title, "song", "再生中の情報はそのまま");
+        assert!(session.player.is_some(), "player はそのまま");
+        assert!(session.owe_clear);
+        assert!(app.thumbs.take_dirty());
+
+        let geometry = Geometry::new(
+            ui::mini_video_area(app.screen),
+            cell_size(),
+            MAX_FRAME_PIXELS,
+        );
+        assert_eq!(
+            lines(&sent),
+            mpv::resize_video(geometry)
+                .iter()
+                .map(|c| c.to_line())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_background_without_results_returns_to_input() {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            video: Some(sink()),
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        enter_background(&mut app, &mut session).await;
+        assert_eq!(app.mode, Mode::Input);
+        assert!(app.background);
+    }
+
+    #[tokio::test]
+    async fn enter_background_while_in_a_channel_returns_to_the_channel() {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            channel: Some(ChannelView::new("UCabc".to_string(), "channel".to_string())),
+            video: Some(sink()),
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        enter_background(&mut app, &mut session).await;
+        assert_eq!(app.mode, Mode::Channel);
+        assert!(app.background);
+    }
+
+    #[tokio::test]
+    async fn enter_background_in_window_mode_sends_no_mpv_commands() {
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            display: DisplayMode::Window,
+            video: Some(sink()),
+            ..playing_app()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        enter_background(&mut app, &mut session).await;
+
+        assert!(app.background);
+        assert!(lines(&sent).is_empty(), "window 中は追加の映像描画をしない");
+        assert!(session.owe_clear);
+    }
+
+    #[tokio::test]
+    async fn leave_background_returns_to_playing_and_resizes_to_the_full_area() {
+        let mut app = App {
+            mode: Mode::Results,
+            background: true,
+            screen: Rect::new(0, 0, 80, 24),
+            results: vec![result("a")],
+            video: Some(sink()),
+            ..App::default()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        leave_background(&mut app, &mut session).await;
+
+        assert!(!app.background);
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(session.owe_clear);
+
+        let geometry = Geometry::new(ui::video_area(app.screen), cell_size(), MAX_FRAME_PIXELS);
+        assert_eq!(
+            lines(&sent),
+            mpv::resize_video(geometry)
+                .iter()
+                .map(|c| c.to_line())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_background_does_nothing_when_not_in_background() {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            results: vec![result("a")],
+            ..App::default()
+        };
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+
+        leave_background(&mut app, &mut session).await;
+
+        assert_eq!(
+            app.mode,
+            Mode::Results,
+            "バックグラウンドでなければ何もしない"
+        );
+        assert!(lines(&sent).is_empty());
+        assert!(!session.owe_clear);
     }
 
     #[test]

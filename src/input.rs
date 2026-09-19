@@ -3,12 +3,12 @@
 use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
     close_download, close_settings, config_path_from_env, copy_url_with, cycle_display_mode,
-    hide_current_channel, hide_selected, leave_channel, like_video, load_more, move_download_focus,
-    move_selection, move_settings_selection, open_channel, open_download, open_settings,
-    reload_channel_tab, reload_tab, reset_speed, save_settings, scroll_comments, seek_absolute,
-    seek_relative, select_channel_tab, select_tab, send_to_player, start_download, start_playback,
-    start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
-    toggle_comments, toggle_subtitles,
+    enter_background, hide_current_channel, hide_selected, leave_background, leave_channel,
+    like_video, load_more, move_download_focus, move_selection, move_settings_selection,
+    open_channel, open_download, open_settings, reload_channel_tab, reload_tab, reset_speed,
+    save_settings, scroll_comments, seek_absolute, seek_relative, select_channel_tab, select_tab,
+    send_to_player, start_download, start_playback, start_search, stop_playback, subscribe_channel,
+    switch_channel_tab, switch_tab, toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -43,6 +43,8 @@ pub async fn handle_key(
         if !key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    // Ctrl+C の即終了と同じく、バックグラウンド中の再生を持ったまま終了しない。
+                    stop_playback(session).await;
                     app.should_quit = true;
                     app.confirm_quit = false;
                 }
@@ -56,7 +58,7 @@ pub async fn handle_key(
     }
 
     match app.mode {
-        Mode::Input => handle_key_input(app, key, tx, session),
+        Mode::Input => handle_key_input(app, key, tx, session).await,
         Mode::Results => handle_key_results(app, key, tx, session).await,
         Mode::Channel => handle_key_channel(app, key, tx, session).await,
         Mode::Playing => handle_key_playing(app, key, tx, session).await,
@@ -65,7 +67,7 @@ pub async fn handle_key(
     }
 }
 
-fn handle_key_input(
+async fn handle_key_input(
     app: &mut App,
     key: KeyEvent,
     tx: &UnboundedSender<AppEvent>,
@@ -84,6 +86,10 @@ fn handle_key_input(
         // 入力欄では大文字の S も検索語なので、設定は Ctrl+S で開く。
         KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
         KeyCode::Char(c) if is_select_all_key(c, key.modifiers) => app.query.select_all(),
+        // バックグラウンド中の前面復帰。b は検索語なので Ctrl+B で取る。
+        KeyCode::Char(c) if is_leave_background_key(c, key.modifiers) => {
+            leave_background(app, session).await;
+        }
         // 他の Ctrl 付きは検索語に入れない。制御文字が混ざると検索が通らない。
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char(c) => {
@@ -127,6 +133,8 @@ async fn handle_key_results(
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
         KeyCode::Char('m') => load_more(app, tx, session),
+        // バックグラウンド中でなければ何もしない (leave_background が判定する)。
+        KeyCode::Char('b') => leave_background(app, session).await,
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
             app.set_error(None);
@@ -169,6 +177,8 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         KeyCode::Char('s') => subscribe_channel(app, tx, session, deps),
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
+        // バックグラウンド中でなければ何もしない (leave_background が判定する)。
+        KeyCode::Char('b') => leave_background(app, session).await,
         KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
         KeyCode::Char('q') => app.confirm_quit = true,
         _ => {}
@@ -178,6 +188,11 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
 /// 設定画面を開くキー。Ctrl+S はどちらの検索画面でも使える。
 fn is_settings_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'s')
+}
+
+/// バックグラウンド中に前面へ戻すキー。入力欄では b も検索語なので Ctrl 付きだけを見る。
+fn is_leave_background_key(c: char, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'b')
 }
 
 /// 検索語を全選択するキー。
@@ -421,6 +436,9 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     }
     if key.code == KeyCode::Char('d') {
         open_download(app, session);
+    }
+    if key.code == KeyCode::Char('b') {
+        enter_background(app, session).await;
     }
 }
 
@@ -815,43 +833,43 @@ mod tests {
         assert!(!app.comments.visible());
     }
 
-    #[test]
-    fn typing_appends_to_the_query_and_clears_the_error() {
+    #[tokio::test]
+    async fn typing_appends_to_the_query_and_clears_the_error() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
             error: Some("boom".to_string()),
             ..App::default()
         };
-        handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session);
-        handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session).await;
+        handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session).await;
 
         assert_eq!(app.query.text(), "ラー");
         assert!(app.error.is_none());
     }
 
-    #[test]
-    fn backspace_removes_one_character_not_one_byte() {
+    #[tokio::test]
+    async fn backspace_removes_one_character_not_one_byte() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
             query: QueryEditor::from("ラー"),
             ..App::default()
         };
-        handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
         assert_eq!(app.query.text(), "ラ");
-        handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session);
-        handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
         assert!(app.query.text().is_empty());
     }
 
-    #[test]
-    fn esc_asks_to_confirm_quit_only_when_there_is_no_result_list_to_go_back_to() {
+    #[tokio::test]
+    async fn esc_asks_to_confirm_quit_only_when_there_is_no_result_list_to_go_back_to() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
 
         let mut app = App::default();
-        handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
         assert!(!app.should_quit, "即終了ではなく確認を挟む");
         assert!(app.confirm_quit);
         assert_eq!(app.mode, Mode::Input);
@@ -860,7 +878,7 @@ mod tests {
             results: vec![result("a")],
             ..App::default()
         };
-        handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
         assert!(!app.should_quit);
         assert!(!app.confirm_quit);
         assert_eq!(app.mode, Mode::Results);
@@ -890,15 +908,15 @@ mod tests {
         assert_eq!(app.mode, Mode::Input);
     }
 
-    #[test]
-    fn enter_with_a_blank_query_does_not_start_a_search() {
+    #[tokio::test]
+    async fn enter_with_a_blank_query_does_not_start_a_search() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
             query: QueryEditor::from("   "),
             ..App::default()
         };
-        handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
 
         assert!(!app.searching);
         assert!(session.search_task.is_none());
@@ -937,6 +955,96 @@ mod tests {
         handle_key_results(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
         assert!(!app.should_quit, "即終了ではなく確認を挟む");
         assert!(app.confirm_quit);
+    }
+
+    #[tokio::test]
+    async fn b_key_backgrounds_playback_and_returns_to_the_result_list() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            results: vec![result("a")],
+            ..playing_app()
+        };
+
+        handle_key_playing(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+
+        assert!(app.background);
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[tokio::test]
+    async fn b_key_returns_to_playing_only_while_backgrounded() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("a")],
+            ..App::default()
+        };
+
+        // バックグラウンドでなければ何もしない (b は結果一覧の他のキーと衝突しない)。
+        handle_key_results(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Results);
+        assert!(!app.background);
+
+        app.background = true;
+        handle_key_results(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(!app.background);
+    }
+
+    #[tokio::test]
+    async fn b_key_returns_to_playing_from_the_channel_list_only_while_backgrounded() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(1);
+
+        handle_key_channel(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Channel);
+        assert!(!app.background);
+
+        app.background = true;
+        handle_key_channel(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(!app.background);
+    }
+
+    #[tokio::test]
+    async fn ctrl_b_returns_to_playing_from_the_input_mode_only_while_backgrounded() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+
+        // 素の b は検索語として入る。
+        let mut app = App::default();
+        handle_key_input(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "b");
+
+        // Ctrl+B はバックグラウンドでなければ何もしない。
+        handle_key_input(&mut app, ctrl_b, &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Input);
+
+        app.background = true;
+        handle_key_input(&mut app, ctrl_b, &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(!app.background);
+    }
+
+    #[tokio::test]
+    async fn confirm_quit_stops_playback_before_quitting() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let sent = record(&mut session);
+        let mut app = App {
+            confirm_quit: true,
+            ..App::default()
+        };
+
+        handle_key(&mut app, key(KeyCode::Char('y')), &tx, &mut session).await;
+
+        assert!(app.should_quit);
+        assert!(!app.confirm_quit);
+        assert_eq!(*sent.lock().expect("溜め込み先"), [mpv::quit().to_line()]);
     }
 
     #[test]
@@ -2380,11 +2488,11 @@ mod tests {
         let mut session = Session::default();
         let mut app = App::default();
 
-        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
         assert_eq!(app.tabs.selected(), 1);
         take_search(&mut session);
 
-        handle_key_input(&mut app, key(KeyCode::BackTab), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::BackTab), &tx, &mut session).await;
         assert_eq!(app.tabs.selected(), 0);
         take_search(&mut session);
     }
@@ -2429,11 +2537,11 @@ mod tests {
             query: QueryEditor::from("ラーメン"),
             ..App::default()
         };
-        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
         take_search(&mut session);
         assert!(!app.tabs.is_all());
 
-        handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
         assert!(app.tabs.is_all());
         assert!(take_search(&mut session));
     }
@@ -2443,11 +2551,11 @@ mod tests {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App::default();
-        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
         take_search(&mut session);
 
-        handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session);
-        handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session);
+        handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session).await;
+        handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session).await;
         assert_eq!(app.query.text(), "ラー", "戻れば元の入力が残っている");
         assert!(!app.tabs.is_all());
     }

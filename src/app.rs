@@ -565,6 +565,9 @@ pub struct App {
     pub subtitles: SubtitleState,
     /// 再生中だけ、mpv の kitty 出力を受け取るスロットが入る。
     pub video: Option<VideoSink>,
+    /// Mode::Playing を抜けて検索側にいる間 true。session.player/video/playback は
+    /// 生かしたまま、embedded/text 表示中だけ隅にミニプレイヤーを出す。
+    pub background: bool,
     /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
     pub screen: Rect,
     /// results を入れ替えた回数。
@@ -632,6 +635,7 @@ impl Default for App {
             settings_backup: settings.clone(),
             settings,
             video: None,
+            background: false,
             screen: Rect::default(),
             results_generation: 0,
             drawn_generation: 0,
@@ -1034,8 +1038,17 @@ impl App {
         }
     }
 
-    /// 格子のタイトルは 18 桁ほどで切れるので、選択中の完全なタイトルはここに出す。
-    fn results_status(&self) -> String {
+    /// バックグラウンド中に状態行の先頭へ足す、再生中のタイトルの目印。
+    fn background_marker(&self) -> String {
+        if self.background {
+            format!("▶ {}  |  ", self.playback.title)
+        } else {
+            String::new()
+        }
+    }
+
+    /// 件数と選択中のタイトルの本体。results_status/channel_status で共有する。
+    fn results_body(&self) -> String {
         let count = format!("{} 件", self.view_results().len());
         if self.thumbs.is_fetching() {
             return format!("{count}  |  サムネイル取得中...");
@@ -1046,16 +1059,22 @@ impl App {
         }
     }
 
+    /// 格子のタイトルは 18 桁ほどで切れるので、選択中の完全なタイトルはここに出す。
+    fn results_status(&self) -> String {
+        format!("{}{}", self.background_marker(), self.results_body())
+    }
+
     /// チャンネル名とタブは検索欄に出ないので、状態行の先頭に出す。
     fn channel_status(&self) -> String {
         let Some(channel) = &self.channel else {
             return self.results_status();
         };
         format!(
-            "{} [{}]  |  {}",
+            "{}{} [{}]  |  {}",
+            self.background_marker(),
             channel.channel_title,
             channel.tab.label(),
-            self.results_status()
+            self.results_body()
         )
     }
 
@@ -1351,6 +1370,45 @@ mod tests {
             ..App::default()
         };
         assert_eq!(app.status_line(), "0 件");
+    }
+
+    #[test]
+    fn background_marker_leads_the_results_and_channel_status() {
+        let app = App {
+            mode: Mode::Results,
+            background: true,
+            results: vec![result("a")],
+            playback: Playback {
+                title: "song".to_string(),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        assert_eq!(app.status_line(), "▶ song  |  1 件  |  title a");
+
+        // バックグラウンドでなければ足さない。
+        let app = App {
+            background: false,
+            ..app
+        };
+        assert_eq!(app.status_line(), "1 件  |  title a");
+
+        let mut channel = ChannelView::new("UCabc".to_string(), "channel".to_string());
+        channel.state_mut().results = vec![result("a")];
+        let app = App {
+            mode: Mode::Channel,
+            background: true,
+            channel: Some(channel),
+            playback: Playback {
+                title: "song".to_string(),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        assert_eq!(
+            app.status_line(),
+            "▶ song  |  channel [動画]  |  1 件  |  title a"
+        );
     }
 
     #[test]
