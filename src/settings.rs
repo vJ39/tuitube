@@ -107,11 +107,12 @@ pub struct RawMpv {
     pub extra_args: Option<Vec<String>>,
 }
 
-/// yt-dlp へ渡すブラウザ指定だけを持つ。cookie の値そのものは保存しない。
+/// yt-dlp へ渡すブラウザ指定と cookies.txt のパス。cookie の値そのものは保存しない。
 /// フィールドを足すと validate の網羅分解が止まるので、そこで是非を判断する。
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RawCookies {
     pub browser: Option<String>,
+    pub file: Option<String>,
 }
 
 /// 環境変数による上書き。未設定は None。
@@ -140,8 +141,12 @@ impl EnvOverridden {
         if self.fps_cap.is_some() {
             keys.push("fps_cap");
         }
-        if self.cookies.is_some() {
-            keys.push("cookies.browser");
+        // 書き戻すのはファイルが持っていた値なので、キー名もその値に合わせる。
+        if let Some(cookies) = &self.cookies {
+            keys.push(match cookies {
+                Some(CookieSource::File(_)) => "cookies.file",
+                _ => "cookies.browser",
+            });
         }
         keys
     }
@@ -595,16 +600,58 @@ fn validate_window(window: RawWindow, notices: &mut Vec<String>) -> WindowOption
     checked
 }
 
-/// ブラウザ指定の検証。対応ブラウザの一覧照合はせず、綴り違いは yt-dlp に任せる。
+/// cookie の渡し方の検証。ブラウザ名の綴りは yt-dlp に、cookies.txt の中身の
+/// 形式も yt-dlp に任せ、ここで見るのはファイルを読み書きできるかどうかだけ。
 fn validate_cookies(raw: RawCookies, notices: &mut Vec<String>) -> Option<CookieSource> {
     // 網羅分解。cookie の値に当たるフィールドを足すとここで止まる。
-    let RawCookies { browser } = raw;
+    let RawCookies { browser, file } = raw;
+    let path = file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(expand_home);
+    if file.is_some() && path.is_none() {
+        notices.push("[cookies] file が空です。指定なしとして扱います".to_string());
+    }
+    if let Some(path) = path {
+        // 排他の知らせは file を使えると分かってから。使えないときは browser も使わないので、
+        // 「file を使います」と「cookie 連携なしで動きます」が並ぶと矛盾して見える。
+        if let Err(e) = usable_cookie_file(&path) {
+            notices.push(format!(
+                "[cookies] file {} を使えません: {e}。cookie 連携なしで動きます",
+                path.display()
+            ));
+            return None;
+        }
+        if browser.as_deref().is_some_and(|b| !b.trim().is_empty()) {
+            notices.push(
+                "[cookies] browser と file の両方が指定されています。file を使います".to_string(),
+            );
+        }
+        return CookieSource::from_file(Some(&path));
+    }
     let browser = browser?;
     let source = CookieSource::from_spec(Some(&browser));
     if source.is_none() {
         notices.push("[cookies] browser が空です。指定なしとして扱います".to_string());
     }
     source
+}
+
+/// yt-dlp は終了時に --cookies のファイルへ cookie を書き戻すので、読めるだけでは足りない。
+/// 書き込めないと検索のたびに失敗し、しかもエラーは結果を出した後に出る。
+/// append で開けば中身を変えずに書き込み可否だけ確かめられる。
+fn usable_cookie_file(path: &Path) -> Result<(), String> {
+    let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("ファイルではありません".to_string());
+    }
+    fs::File::open(path).map_err(|e| format!("読めません ({e})"))?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| format!("書き込めません ({e})。yt-dlp が cookie を書き戻します"))
 }
 
 /// 環境変数 TUITUBE_COOKIES_FROM_BROWSER の解釈。
@@ -732,8 +779,20 @@ pub fn render(settings: &Settings) -> String {
     ));
     out.push_str(&string_line(
         "browser",
-        settings.cookies.as_ref().map(CookieSource::spec),
+        settings.cookies.as_ref().and_then(CookieSource::spec),
         "chrome",
+    ));
+    out.push_str("# ブラウザもキーチェーンも無い環境向けに、エクスポートした cookies.txt (Netscape 形式) を渡す指定。yt-dlp の --cookies に渡す。\n");
+    out.push_str("# browser と両方書いたときは file を使う。使えないファイルを指した場合は cookie 連携なしで起動する。\n");
+    out.push_str("# yt-dlp が終了時にこのファイルへ cookie を書き戻すので、読み取り専用にせず書き込みも許可しておく。\n");
+    out.push_str(&string_line(
+        "file",
+        settings
+            .cookies
+            .as_ref()
+            .and_then(CookieSource::file)
+            .and_then(Path::to_str),
+        "~/.config/tuitube/cookies.txt",
     ));
 
     out.push_str("\n[mpv]\n");
@@ -932,6 +991,197 @@ mod tests {
 
     fn spec(value: &str) -> Option<CookieSource> {
         CookieSource::from_spec(Some(value))
+    }
+
+    fn file_source(path: &Path) -> Option<CookieSource> {
+        CookieSource::from_file(Some(path))
+    }
+
+    /// 実在する cookies.txt を 1 つ置く。後始末は呼び出し側。
+    fn cookie_file(name: &str) -> (PathBuf, PathBuf) {
+        let dir = temp_dir(name);
+        let path = dir.join("cookies.txt");
+        fs::write(&path, "# Netscape HTTP Cookie File\n").expect("書ける");
+        (dir, path)
+    }
+
+    #[test]
+    fn cookies_file_is_read_into_a_file_source() {
+        let (dir, path) = cookie_file("cookies-file");
+        let text = format!("[cookies]\nfile = \"{}\"\n", path.display());
+        assert_eq!(settings_of(&text).cookies, file_source(&path));
+        assert!(notices_of(&text).is_empty(), "{:?}", notices_of(&text));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cookie_file_wins_over_a_browser_with_a_notice() {
+        let (dir, path) = cookie_file("cookies-both");
+        let text = format!(
+            "[cookies]\nbrowser = \"chrome\"\nfile = \"{}\"\n",
+            path.display()
+        );
+        assert_eq!(settings_of(&text).cookies, file_source(&path));
+        let notices = notices_of(&text);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("browser") && notices[0].contains("file"),
+            "{notices:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_cookie_file_starts_without_cookies_and_says_so() {
+        let dir = temp_dir("cookies-missing");
+        let path = dir.join("nope.txt");
+        // browser も書いてあるが、file を優先した結果として cookie 連携なしで起動する。
+        let text = format!(
+            "[cookies]\nbrowser = \"chrome\"\nfile = \"{}\"\n",
+            path.display()
+        );
+        assert_eq!(settings_of(&text).cookies, None);
+        let notice = notices_of(&text).join(" / ");
+        assert!(notice.contains(&path.display().to_string()), "{notice}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_blank_cookie_file_leaves_the_browser_in_place_with_a_notice() {
+        for value in ["", "  "] {
+            let text = format!("[cookies]\nbrowser = \"chrome\"\nfile = \"{value}\"\n");
+            assert_eq!(settings_of(&text).cookies, spec("chrome"), "{text}");
+            let notices = notices_of(&text);
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(notices[0].contains("[cookies] file"), "{notices:?}");
+        }
+    }
+
+    #[test]
+    fn a_cookie_file_that_is_a_directory_is_ignored_with_a_notice() {
+        let dir = temp_dir("cookies-dir");
+        let text = format!("[cookies]\nfile = \"{}\"\n", dir.display());
+        assert_eq!(settings_of(&text).cookies, None);
+        assert_eq!(notices_of(&text).len(), 1, "{:?}", notices_of(&text));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_cookie_file_is_ignored_with_a_notice() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, path) = cookie_file("cookies-unreadable");
+        let mut perms = fs::metadata(&path).expect("メタデータ").permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&path, perms).expect("権限を落とせる");
+        // root は 0o000 でも読めるので、その環境では確かめない。
+        if fs::File::open(&path).is_ok() {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let text = format!("[cookies]\nfile = \"{}\"\n", path.display());
+        assert_eq!(settings_of(&text).cookies, None);
+        let notice = notices_of(&text).join(" / ");
+        assert!(notice.contains(&path.display().to_string()), "{notice}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_cookie_file_is_refused_because_yt_dlp_writes_it_back() {
+        use std::os::unix::fs::PermissionsExt;
+        // yt-dlp は終了時に --cookies のファイルを開き直して書き戻す。読めるだけでは
+        // 検索のたびに PermissionError で落ちるので、起動時に弾く。
+        let (dir, path) = cookie_file("cookies-read-only");
+        let mut perms = fs::metadata(&path).expect("メタデータ").permissions();
+        perms.set_mode(0o444);
+        fs::set_permissions(&path, perms).expect("権限を落とせる");
+        // root は 0o444 でも書けるので、その環境では確かめない。
+        if fs::OpenOptions::new().append(true).open(&path).is_ok() {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let text = format!("[cookies]\nfile = \"{}\"\n", path.display());
+        assert_eq!(settings_of(&text).cookies, None);
+        let notice = notices_of(&text).join(" / ");
+        assert!(notice.contains(&path.display().to_string()), "{notice}");
+        assert!(notice.contains("書き込めません"), "{notice}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unusable_cookie_file_does_not_also_claim_the_file_is_in_use() {
+        // 「file を使います」と「cookie 連携なしで動きます」が並ぶと矛盾して読める。
+        let dir = temp_dir("cookies-both-missing");
+        let path = dir.join("nope.txt");
+        let text = format!(
+            "[cookies]\nbrowser = \"chrome\"\nfile = \"{}\"\n",
+            path.display()
+        );
+        let notices = notices_of(&text);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("cookie 連携なしで動きます"),
+            "{notices:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cookie_file_starting_with_a_tilde_is_expanded_to_the_home_directory() {
+        let home = std::env::var("HOME").expect("HOME");
+        let text = "[cookies]\nfile = \"~/no-such-tuitube-cookies.txt\"\n";
+        let notice = notices_of(text).join(" / ");
+        assert!(
+            notice.contains(&format!("{home}/no-such-tuitube-cookies.txt")),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn the_cookies_environment_variable_also_overrides_a_file() {
+        let (dir, path) = cookie_file("cookies-env");
+        let file =
+            parse(&format!("[cookies]\nfile = \"{}\"\n", path.display())).expect("読めるはず");
+        let with = |cookies| {
+            validate(
+                file.clone(),
+                EnvOverrides {
+                    cookies,
+                    ..EnvOverrides::default()
+                },
+            )
+            .settings
+            .cookies
+        };
+        assert_eq!(with(Some("safari")), spec("safari"));
+        assert_eq!(with(Some("none")), None);
+        assert_eq!(with(None), file_source(&path));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_round_trips_a_cookie_file() {
+        let (dir, path) = cookie_file("cookies-render");
+        let settings = Settings {
+            cookies: file_source(&path),
+            ..Settings::default()
+        };
+        let text = render(&settings);
+        assert!(
+            text.contains(&format!("file = \"{}\"", path.display())),
+            "{text}"
+        );
+        // browser 行は書き方の例のコメントに戻る。
+        assert!(text.contains("# browser = \"chrome\""), "{text}");
+        assert_eq!(settings_of(&text), settings);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_shows_how_to_write_the_cookie_file_key() {
+        let text = render(&Settings::default());
+        assert!(text.contains("# file = "), "{text}");
     }
 
     #[test]
@@ -1235,6 +1485,32 @@ mod tests {
         let to_save = overridden.restore(&validated.settings);
         assert_eq!(to_save.fps_cap, FpsCap::new(30), "ファイルの値へ戻す");
         assert_eq!(to_save.cookies, spec("chrome"));
+    }
+
+    #[test]
+    fn the_held_key_is_named_after_the_value_that_goes_back_into_the_file() {
+        // 環境変数は browser 用でも、書き戻すのはファイルが持っていた file の指定。
+        let (dir, path) = cookie_file("cookies-env-key");
+        let file =
+            parse(&format!("[cookies]\nfile = \"{}\"\n", path.display())).expect("読めるはず");
+        let validated = validate(
+            file,
+            EnvOverrides {
+                cookies: Some("chrome"),
+                ..EnvOverrides::default()
+            },
+        );
+        assert_eq!(
+            validated.settings.cookies,
+            spec("chrome"),
+            "実行中は chrome"
+        );
+        assert_eq!(validated.overridden.keys(), ["cookies.file"]);
+        assert_eq!(
+            validated.overridden.restore(&validated.settings).cookies,
+            file_source(&path)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

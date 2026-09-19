@@ -721,7 +721,9 @@ mod tests {
             };
             let line = status_text(&app, 80);
             assert!(line.contains(feed.label()), "{line}");
+            // browser / file どちらの設定先も切れずに出る長さにする。
             assert!(line.contains("[cookies] browser"), "{line}");
+            assert!(line.contains("file"), "{line}");
             assert!(!line.contains('…'), "{line}");
         }
     }

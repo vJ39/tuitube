@@ -415,10 +415,10 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
 /// mpv の失敗が cookie 由来なら連携を止める。mpv の作り直しは利用者の Enter に任せる。
 fn note_cookie_failure(app: &mut App, error: Option<String>) -> Option<String> {
     let text = error?;
-    if app.cookies.for_playback().is_none() {
+    let Some(source) = app.cookies.for_playback().cloned() else {
         return Some(text);
-    }
-    let Some(reason) = cookies::cookie_store_failure(&text) else {
+    };
+    let Some(reason) = cookies::cookie_store_failure(&text, &source) else {
         return Some(text);
     };
     app.cookies.suspend(reason);

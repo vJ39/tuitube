@@ -1459,6 +1459,38 @@ mod tests {
     }
 
     #[test]
+    fn a_cookie_file_reaches_mpv_once_the_search_confirmed_it() {
+        let file =
+            CookieSource::from_file(Some(std::path::Path::new("/tmp/cookies.txt"))).expect("path");
+        let app = App {
+            cookies: CookieState::Active(file),
+            ..playing_app()
+        };
+        let (_video, plan) = playback_plan(&app);
+        assert!(
+            plan.args()
+                .contains(&"--ytdl-raw-options-append=cookies=/tmp/cookies.txt".to_string()),
+            "{:?}",
+            plan.args()
+        );
+
+        // 検索で確かめる前 (Armed) は再生に渡さない。既存のブラウザ指定と同じ扱い。
+        let app = App {
+            cookies: CookieState::Armed(
+                CookieSource::from_file(Some(std::path::Path::new("/tmp/cookies.txt")))
+                    .expect("path"),
+            ),
+            ..playing_app()
+        };
+        let (_video, plan) = playback_plan(&app);
+        assert!(
+            !plan.args().iter().any(|arg| arg.contains("cookies")),
+            "{:?}",
+            plan.args()
+        );
+    }
+
+    #[test]
     fn start_playback_passes_the_current_speed_to_the_plan() {
         let app = App {
             speed: faster(),

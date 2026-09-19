@@ -89,7 +89,7 @@ pub enum Mode {
 }
 
 /// 設定画面で編集できる項目。画面の並びはこの順。
-/// ここに無い値 (window.* / cookies.browser / mpv.extra_args / subtitles.lang / categories) は
+/// ここに無い値 (window.* / cookies.* / mpv.extra_args / subtitles.lang / categories) は
 /// config.toml を直接編集する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsItem {
@@ -447,7 +447,7 @@ impl App {
         state.loaded = true;
         self.sync_from_tab();
         if self.results.is_empty() {
-            self.error = Some(target.empty_message());
+            self.error = Some(target.empty_message(self.cookies.for_search()));
             self.enter_search_mode(Mode::Input);
         } else {
             self.enter_search_mode(Mode::Results);

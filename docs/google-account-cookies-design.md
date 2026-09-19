@@ -202,7 +202,7 @@ URL 無し起動(§1-7)で起動時に cookie の可否を判定できるが、�
 ### 2-8. セキュリティ・プライバシー
 
 - tuitube は cookie の値を読まない・保存しない・ログに出さない。扱うのはブラウザ名(spec)だけ。`ps` に見えるのも spec のみ
-- yt-dlp は cookie をメモリ内で使う。`--cookies FILE`(ファイル書き出し)は使わない
+- `--cookies-from-browser` で渡す場合、yt-dlp は cookie をメモリ内で使う。この判断は cookies-file-design.md で覆し、ヘッドレス環境向けに `--cookies FILE` も選べるようにした。file 方式では利用者が置いた cookies.txt を yt-dlp が読み書きする(終了時に書き戻す)
 - アカウント制限のリスク(§1-8)は利用者向け説明に転記する
 - 検索結果 JSON にアカウントを示す項目は含まれない(実測で確認したフィールド一覧に該当なし)
 

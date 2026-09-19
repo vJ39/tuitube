@@ -1,51 +1,91 @@
-//! ブラウザの YouTube ログイン cookie を yt-dlp 経由で使うための判定と文言。
+//! YouTube ログイン cookie を yt-dlp 経由で使うための判定と文言。
 //! 外部プロセスには触れない。実行は search.rs / mpv.rs が行う。
+
+use std::path::{Path, PathBuf};
 
 pub const ENV_VAR: &str = "TUITUBE_COOKIES_FROM_BROWSER";
 /// フィードは制限しないと 167 件返ることがある (`:ytrec` 実測)。
 pub const FEED_LIMIT: usize = 30;
 
-/// yt-dlp の BROWSER[+KEYRING][:PROFILE][::CONTAINER] をそのまま保持する。
-/// 対応ブラウザの一覧は持たない (yt-dlp の更新で変わるため、検証も yt-dlp に任せる)。
+/// cookie の渡し方。対応ブラウザの一覧も cookies.txt の中身も検証しない
+/// (どちらも yt-dlp の更新で変わるため、検証は yt-dlp に任せる)。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CookieSource {
-    spec: String,
+pub enum CookieSource {
+    /// yt-dlp の BROWSER[+KEYRING][:PROFILE][::CONTAINER]。
+    Browser(String),
+    /// エクスポートした cookies.txt (Netscape 形式) のパス。
+    File(PathBuf),
 }
 
 impl CookieSource {
     /// 設定ファイルの [cookies] browser も環境変数も、同じ spec 文字列を渡す。
     pub fn from_spec(value: Option<&str>) -> Option<Self> {
         let spec = value.unwrap_or_default().trim();
-        (!spec.is_empty()).then(|| Self {
-            spec: spec.to_string(),
-        })
+        (!spec.is_empty()).then(|| Self::Browser(spec.to_string()))
     }
 
-    pub fn spec(&self) -> &str {
-        &self.spec
+    /// 設定ファイルの [cookies] file から。存在の確認は settings 側で済ませておく。
+    pub fn from_file(path: Option<&Path>) -> Option<Self> {
+        let path = path?;
+        (!path.as_os_str().is_empty()).then(|| Self::File(path.to_path_buf()))
+    }
+
+    pub fn spec(&self) -> Option<&str> {
+        match self {
+            Self::Browser(spec) => Some(spec),
+            Self::File(_) => None,
+        }
+    }
+
+    pub fn file(&self) -> Option<&Path> {
+        match self {
+            Self::Browser(_) => None,
+            Self::File(path) => Some(path),
+        }
     }
 
     /// 表示用。':' '+' より前。"chrome:Profile 1" → "chrome"
-    pub fn browser(&self) -> &str {
-        let end = self.spec.find([':', '+']).unwrap_or(self.spec.len());
-        &self.spec[..end]
+    pub fn browser(&self) -> Option<&str> {
+        let spec = self.spec()?;
+        let end = spec.find([':', '+']).unwrap_or(spec.len());
+        Some(&spec[..end])
+    }
+
+    /// 文言に出す名前。ブラウザ名か、cookies.txt のファイル名。
+    pub fn label(&self) -> String {
+        match self {
+            Self::Browser(_) => self.browser().unwrap_or_default().to_string(),
+            Self::File(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        }
     }
 
     /// シェルを経由しないので、引用符もエスケープも付けない。
     pub fn yt_dlp_args(&self) -> [String; 2] {
-        [
-            "--cookies-from-browser".to_string(),
-            self.spec().to_string(),
-        ]
+        match self {
+            Self::Browser(spec) => ["--cookies-from-browser".to_string(), spec.clone()],
+            Self::File(path) => ["--cookies".to_string(), path.display().to_string()],
+        }
     }
 
     /// 利用者の mpv.conf にある ytdl-raw-options を消さないよう追加形で渡す。
-    /// -append は値を ',' で分割しないので、空白やコロン入りの spec もそのまま届く。
+    /// -append は値を ',' で分割しないので、空白やコロン入りの値もそのまま届く。
     pub fn mpv_arg(&self) -> String {
-        format!(
-            "--ytdl-raw-options-append=cookies-from-browser={}",
-            self.spec()
-        )
+        match self {
+            Self::Browser(spec) => {
+                format!("--ytdl-raw-options-append=cookies-from-browser={spec}")
+            }
+            Self::File(path) => {
+                format!("--ytdl-raw-options-append=cookies={}", path.display())
+            }
+        }
+    }
+
+    fn is_safari(&self) -> bool {
+        self.browser()
+            .is_some_and(|browser| browser.eq_ignore_ascii_case("safari"))
     }
 }
 
@@ -109,14 +149,24 @@ pub fn classify(exit_code: Option<i32>, stderr: &str) -> CookieOutcome {
     CookieOutcome::Ok
 }
 
-/// mpv の失敗文言から cookie ストア由来の行だけを拾う。mpv は cookie と無関係な理由でも
+/// mpv の失敗文言から cookie 由来の行だけを拾う。mpv は cookie と無関係な理由でも
 /// 権限エラーを出すので、その行が cookie を指しているときだけ cookie 由来とみなす。
-pub fn cookie_store_failure(text: &str) -> Option<String> {
+pub fn cookie_store_failure(text: &str, source: &CookieSource) -> Option<String> {
     find_line(text, |line| {
         COOKIE_STORE_MARKERS.iter().any(|m| line.contains(m))
-            || (PERMISSION_MARKERS.iter().any(|m| line.contains(m))
-                && line.to_lowercase().contains("cookie"))
+            || (PERMISSION_MARKERS.iter().any(|m| line.contains(m)) && names_cookies(line, source))
     })
+}
+
+/// browser 方式は cookie ストアのパスに必ず "Cookies" が入るが、file 方式の名前は
+/// 利用者任せなので (例 yt.txt)、指定したパスと一致するかも見る。
+fn names_cookies(line: &str, source: &CookieSource) -> bool {
+    if line.to_lowercase().contains("cookie") {
+        return true;
+    }
+    source
+        .file()
+        .is_some_and(|path| line.contains(&path.display().to_string()))
 }
 
 /// 該当行を本文だけにして返す。最初の 1 行が原因で、後続は波及した結果。
@@ -146,20 +196,19 @@ const SAFARI_TCC: &str = "Safari の cookie を読めませんでした。端末
 /// 利用者向けの説明文。表示しない outcome では空になる。
 pub fn describe(outcome: &CookieOutcome, source: &CookieSource) -> String {
     match outcome {
-        // フルディスクアクセスの案内が要るのは Safari だけ。他のブラウザでは誤った案内になる。
+        // フルディスクアクセスの案内が要るのは Safari だけ。他では誤った案内になる。
         CookieOutcome::Unreadable(detail)
-            if detail.contains("Operation not permitted")
-                && source.browser().eq_ignore_ascii_case("safari") =>
+            if detail.contains("Operation not permitted") && source.is_safari() =>
         {
             SAFARI_TCC.to_string()
         }
         CookieOutcome::Unreadable(detail) => format!(
             "cookie を読めませんでした ({}): {detail}。cookie 無しで検索しました",
-            source.browser()
+            source.label()
         ),
         CookieOutcome::Degraded(_) => format!(
             "cookie を復号できませんでした ({})。キーチェーンのダイアログで「常に許可」を選んでください。以後は cookie 無しで動作します",
-            source.browser()
+            source.label()
         ),
         CookieOutcome::TimedOut => format!(
             "検索がタイムアウトしました ({} 秒)。cookie 連携の初回は macOS のキーチェーン許可ダイアログが別ウィンドウで出ている可能性があります。「常に許可」を選び、tuitube を再起動してください。以後は cookie 無しで動作します",
@@ -172,9 +221,9 @@ pub fn describe(outcome: &CookieOutcome, source: &CookieSource) -> String {
 /// フィード名が要るので describe とは別にする。
 pub fn login_required_message(feed: Feed, source: &CookieSource) -> String {
     format!(
-        "{} にはログインが必要です。ブラウザ ({}) で YouTube にログインしているか確認してください",
+        "{} にはログインが必要です。{} の cookie が YouTube にログイン済みか確認してください",
         feed.label(),
-        source.browser()
+        source.label()
     )
 }
 
@@ -245,9 +294,9 @@ impl CookieState {
         match self {
             Self::Off => None,
             Self::Armed(source) | Self::Active(source) => {
-                Some(format!("cookies: {}", source.browser()))
+                Some(format!("cookies: {}", source.label()))
             }
-            Self::Suspended { source, .. } => Some(format!("cookies: {} (停止)", source.browser())),
+            Self::Suspended { source, .. } => Some(format!("cookies: {} (停止)", source.label())),
         }
     }
 
@@ -259,8 +308,9 @@ impl CookieState {
             Self::Suspended { reason, .. } => {
                 format!("{} は cookie 連携が停止中: {reason}", feed.label())
             }
+            // ブラウザを置けない環境からも使うので、file 方式も必ず併記する。
             _ => format!(
-                "{} には cookie 連携が必要です (設定の [cookies] browser)",
+                "{} には cookie 連携が必要です ([cookies] browser か file)",
                 feed.label()
             ),
         }
@@ -337,14 +387,23 @@ impl Target {
         }
     }
 
-    pub fn empty_message(&self) -> String {
+    /// 確認先は cookie の出どころで変わる。file 方式ではブラウザのログイン状態は
+    /// 関係がなく、見るのは cookies.txt の中身。
+    pub fn empty_message(&self, source: Option<&CookieSource>) -> String {
         match self {
             Target::Search(_) => "検索結果が0件でした".to_string(),
             // `:ytrec` は未ログインでもエラーにならず 0 件で返るので、件数でなく原因を出す。
-            Target::Feed(feed) => format!(
-                "{} が空でした。ブラウザで YouTube にログインしているか確認してください",
-                feed.label()
-            ),
+            Target::Feed(feed) => match source {
+                Some(source) => format!(
+                    "{} が空でした。{} の cookie が YouTube にログイン済みか確認してください",
+                    feed.label(),
+                    source.label()
+                ),
+                None => format!(
+                    "{} が空でした。cookie が YouTube にログイン済みか確認してください",
+                    feed.label()
+                ),
+            },
         }
     }
 
@@ -362,6 +421,10 @@ mod tests {
         CookieSource::from_spec(Some(spec)).expect("spec")
     }
 
+    fn file_source(path: &str) -> CookieSource {
+        CookieSource::from_file(Some(Path::new(path))).expect("path")
+    }
+
     #[test]
     fn from_spec_trims_and_rejects_blank() {
         assert_eq!(CookieSource::from_spec(None), None);
@@ -371,8 +434,105 @@ mod tests {
             CookieSource::from_spec(Some(" chrome:Profile 1 "))
                 .expect("値がある")
                 .spec(),
-            "chrome:Profile 1"
+            Some("chrome:Profile 1")
         );
+    }
+
+    #[test]
+    fn from_file_rejects_an_empty_path() {
+        assert_eq!(CookieSource::from_file(None), None);
+        assert_eq!(CookieSource::from_file(Some(Path::new(""))), None);
+        assert_eq!(
+            CookieSource::from_file(Some(Path::new("/tmp/cookies.txt"))),
+            Some(CookieSource::File(PathBuf::from("/tmp/cookies.txt")))
+        );
+    }
+
+    #[test]
+    fn a_source_carries_either_a_browser_spec_or_a_path() {
+        let browser = source("chrome:Profile 1");
+        assert_eq!(browser.spec(), Some("chrome:Profile 1"));
+        assert_eq!(browser.file(), None);
+
+        let file = file_source("/tmp/cookies.txt");
+        assert_eq!(file.spec(), None);
+        assert_eq!(file.browser(), None);
+        assert_eq!(file.file(), Some(Path::new("/tmp/cookies.txt")));
+    }
+
+    #[test]
+    fn yt_dlp_args_for_a_file_pass_the_path_to_the_cookies_flag() {
+        assert_eq!(
+            file_source("/tmp/my cookies.txt").yt_dlp_args(),
+            ["--cookies".to_string(), "/tmp/my cookies.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn mpv_arg_for_a_file_uses_the_cookies_option() {
+        assert_eq!(
+            file_source("/tmp/my cookies.txt").mpv_arg(),
+            "--ytdl-raw-options-append=cookies=/tmp/my cookies.txt"
+        );
+    }
+
+    #[test]
+    fn a_file_source_is_labelled_by_its_file_name() {
+        assert_eq!(
+            file_source("/home/u/.config/tuitube/cookies.txt").label(),
+            "cookies.txt"
+        );
+        // ファイル名を取れない指定は、そのままの綴りで出す。
+        assert_eq!(file_source("/").label(), "/");
+        assert_eq!(source("chrome:Profile 1").label(), "chrome");
+
+        let file = file_source("/tmp/cookies.txt");
+        assert_eq!(
+            CookieState::Armed(file.clone()).label().as_deref(),
+            Some("cookies: cookies.txt")
+        );
+        assert_eq!(
+            CookieState::Suspended {
+                source: file,
+                reason: "理由".to_string()
+            }
+            .label()
+            .as_deref(),
+            Some("cookies: cookies.txt (停止)")
+        );
+    }
+
+    #[test]
+    fn full_disk_access_is_not_suggested_for_a_cookie_file() {
+        // TCC はブラウザの cookie ストアの話で、自分で置いたファイルには関係がない。
+        let outcome = classify(
+            Some(1),
+            "ERROR: [Errno 1] Operation not permitted: '/tmp/cookies.txt'",
+        );
+        let text = describe(&outcome, &file_source("/tmp/cookies.txt"));
+        assert!(!text.contains("フルディスクアクセス"), "{text}");
+        assert!(text.contains("cookies.txt"), "{text}");
+        assert!(text.contains("Operation not permitted"), "{text}");
+    }
+
+    #[test]
+    fn a_file_source_names_the_file_when_login_is_required() {
+        let message = login_required_message(Feed::History, &file_source("/tmp/cookies.txt"));
+        assert!(message.starts_with("履歴"), "{message}");
+        assert!(message.contains("cookies.txt"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_feed_points_at_whichever_cookie_source_is_in_use() {
+        let feed = Target::Feed(Feed::Subscriptions);
+
+        // file 方式ではブラウザのログイン状態は関係がない。見るのは cookies.txt。
+        let message = feed.empty_message(Some(&file_source("/tmp/cookies.txt")));
+        assert!(message.contains("cookies.txt"), "{message}");
+        assert!(!message.contains("ブラウザ"), "{message}");
+
+        let message = feed.empty_message(Some(&source("chrome:Profile 1")));
+        assert!(message.contains("chrome"), "{message}");
     }
 
     #[test]
@@ -390,6 +550,8 @@ mod tests {
         for feed in Feed::ALL {
             let off = CookieState::Off.refusal(feed);
             assert!(off.contains("[cookies] browser"), "{off}");
+            // ブラウザを置けない環境の利用者にも設定先を伝える。
+            assert!(off.contains("file"), "{off}");
             assert!(off.contains(feed.label()), "{off}");
             // ステータス行は "エラー: " を足して 80 桁に描く。切れると設定先が読めない。
             let width = crate::grid::display_width(&format!("エラー: {off}"));
@@ -399,10 +561,10 @@ mod tests {
 
     #[test]
     fn browser_is_the_part_before_profile_or_keyring() {
-        assert_eq!(source("chrome:Profile 1").browser(), "chrome");
-        assert_eq!(source("chrome+basictext").browser(), "chrome");
-        assert_eq!(source("firefox::work").browser(), "firefox");
-        assert_eq!(source("safari").browser(), "safari");
+        assert_eq!(source("chrome:Profile 1").browser(), Some("chrome"));
+        assert_eq!(source("chrome+basictext").browser(), Some("chrome"));
+        assert_eq!(source("firefox::work").browser(), Some("firefox"));
+        assert_eq!(source("safari").browser(), Some("safari"));
     }
 
     #[test]
@@ -547,25 +709,33 @@ mod tests {
 
     #[test]
     fn cookie_store_failure_ignores_permission_errors_about_other_files() {
+        let chrome = source("chrome");
         // mpv はストリームやファイルのオープン失敗でも同じ文言を出す。
         assert_eq!(
-            cookie_store_failure("Operation not permitted: '/dev/dsp'"),
+            cookie_store_failure("Operation not permitted: '/dev/dsp'", &chrome),
             None
         );
-        assert_eq!(cookie_store_failure("Permission denied: '/x.mkv'"), None);
         assert_eq!(
-            cookie_store_failure("Failed to recognize file format."),
+            cookie_store_failure("Permission denied: '/x.mkv'", &chrome),
+            None
+        );
+        assert_eq!(
+            cookie_store_failure("Failed to recognize file format.", &chrome),
             None
         );
 
         // cookie ストアを指す行だけ拾い、ERROR: の飾りは落とす。
         assert_eq!(
-            cookie_store_failure("ERROR: could not find chrome cookies database in '/x'"),
+            cookie_store_failure(
+                "ERROR: could not find chrome cookies database in '/x'",
+                &chrome
+            ),
             Some("could not find chrome cookies database in '/x'".to_string())
         );
         assert_eq!(
             cookie_store_failure(
-                "ERROR: [Errno 13] Permission denied: '/Users/x/Library/Cookies/Cookies.binarycookies'"
+                "ERROR: [Errno 13] Permission denied: '/Users/x/Library/Cookies/Cookies.binarycookies'",
+                &chrome
             ),
             Some(
                 "[Errno 13] Permission denied: '/Users/x/Library/Cookies/Cookies.binarycookies'"
@@ -574,9 +744,36 @@ mod tests {
         );
         assert_eq!(
             cookie_store_failure(
-                "yt-dlp: error: unsupported browser specified for cookies: \"arc\""
+                "yt-dlp: error: unsupported browser specified for cookies: \"arc\"",
+                &chrome
             ),
             Some("unsupported browser specified for cookies: \"arc\"".to_string())
+        );
+    }
+
+    #[test]
+    fn a_cookie_file_is_recognised_by_its_path_whatever_it_is_named() {
+        // file 方式の名前は利用者任せで、"cookie" が入るとは限らない。
+        let file = file_source("/home/ubuntu/.config/tuitube/yt.txt");
+        assert_eq!(
+            cookie_store_failure(
+                "ERROR: [Errno 13] Permission denied: '/home/ubuntu/.config/tuitube/yt.txt'",
+                &file
+            ),
+            Some("[Errno 13] Permission denied: '/home/ubuntu/.config/tuitube/yt.txt'".to_string())
+        );
+        // 別のファイルの権限エラーは cookie 由来にしない。
+        assert_eq!(
+            cookie_store_failure("Permission denied: '/home/ubuntu/movie.mkv'", &file),
+            None
+        );
+        // browser 方式では同じ行を cookie 由来と判定しない (パスの一致が無い)。
+        assert_eq!(
+            cookie_store_failure(
+                "ERROR: [Errno 13] Permission denied: '/home/ubuntu/.config/tuitube/yt.txt'",
+                &source("chrome")
+            ),
+            None
         );
     }
 
@@ -777,10 +974,10 @@ mod tests {
 
         // 0 件の文言も分ける。
         assert_eq!(
-            Target::Search("q".to_string()).empty_message(),
+            Target::Search("q".to_string()).empty_message(None),
             "検索結果が0件でした"
         );
-        let message = Target::Feed(Feed::Recommended).empty_message();
+        let message = Target::Feed(Feed::Recommended).empty_message(None);
         assert!(message.starts_with("おすすめ"), "{message}");
         assert!(message.contains("ログイン"), "{message}");
 

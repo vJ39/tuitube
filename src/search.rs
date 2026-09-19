@@ -362,6 +362,22 @@ mod tests {
     }
 
     #[test]
+    fn yt_dlp_args_pass_a_cookie_file_with_the_cookies_flag() {
+        let file =
+            CookieSource::from_file(Some(std::path::Path::new("/tmp/cookies.txt"))).expect("path");
+        assert_eq!(
+            yt_dlp_args(&Target::Search("q".to_string()), Some(&file), 10),
+            [
+                "ytsearch10:q",
+                "--flat-playlist",
+                "--dump-json",
+                "--cookies",
+                "/tmp/cookies.txt",
+            ]
+        );
+    }
+
+    #[test]
     fn yt_dlp_args_take_the_result_count_from_the_setting() {
         let args = yt_dlp_args(&Target::Search("q".to_string()), None, 25);
         assert_eq!(args[0], "ytsearch25:q");
