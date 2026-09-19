@@ -5,6 +5,7 @@ mod clipboard;
 mod comments;
 mod cookies;
 mod display;
+mod download;
 mod fetch;
 mod geometry;
 mod grid;
@@ -203,9 +204,9 @@ fn present_thumbs(
     cell: video::CellSize,
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
-    // 再生中と設定画面では他の描画と重なるので 1 枚も書かない。
+    // 再生中・設定画面・ダウンロード画面では他の描画と重なるので 1 枚も書かない。
     // 戻ったときに貼り直せるよう dirty は残す。
-    if matches!(app.mode, Mode::Playing | Mode::Settings) {
+    if matches!(app.mode, Mode::Playing | Mode::Settings | Mode::Download) {
         return Ok(());
     }
     if !app.thumbs.take_dirty() {
@@ -432,6 +433,36 @@ async fn handle_event(
             result,
         } => apply_channel_lookup_with(app, tx, session, nonce, video_id, result, RealYtDlp),
         AppEvent::OauthDone { nonce, result } => apply_oauth_done(app, session, nonce, result),
+        AppEvent::DownloadDone { nonce, notice } => {
+            apply_download_done(app, session, nonce, notice)
+        }
+    }
+}
+
+/// ダウンロードの結果を画面へ渡す。
+fn apply_download_done(
+    app: &mut App,
+    session: &mut Session,
+    nonce: u64,
+    notice: Result<String, String>,
+) {
+    if nonce != session.download_nonce {
+        return;
+    }
+    session.download_task = None;
+    match notice {
+        Ok(notice) => app.set_temporary_notice(notice, std::time::Instant::now()),
+        Err(e) => {
+            // 失敗のときは set_error だけでは「ダウンロード中…」が残るので、ここで畳む。
+            if app
+                .notice
+                .as_deref()
+                .is_some_and(|n| n.starts_with(download::DOWNLOADING_PREFIX))
+            {
+                app.set_notice(None);
+            }
+            app.set_error(Some(e));
+        }
     }
 }
 

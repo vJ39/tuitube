@@ -2,19 +2,22 @@
 
 use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
-    close_settings, config_path_from_env, copy_url_with, cycle_display_mode, hide_current_channel,
-    hide_selected, leave_channel, like_video, load_more, move_selection, move_settings_selection,
-    open_channel, open_settings, reload_channel_tab, reload_tab, reset_speed, save_settings,
-    scroll_comments, seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player,
-    start_playback, start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
+    close_download, close_settings, config_path_from_env, copy_url_with, cycle_display_mode,
+    hide_current_channel, hide_selected, leave_channel, like_video, load_more, move_download_focus,
+    move_selection, move_settings_selection, open_channel, open_download, open_settings,
+    reload_channel_tab, reload_tab, reset_speed, save_settings, scroll_comments, seek_absolute,
+    seek_relative, select_channel_tab, select_tab, send_to_player, start_download, start_playback,
+    start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
     toggle_comments, toggle_subtitles,
 };
-use crate::app::{App, AppEvent, Mode};
+use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
+use crate::download;
 use crate::geometry::cell_size;
 use crate::grid::Dir;
 use crate::mpv::{self, MpvCommand};
 use crate::oauth;
+use crate::query::QueryEditor;
 use crate::seekbar::{MouseAction, MouseInput};
 use crate::ui;
 use crate::video::CellSize;
@@ -40,6 +43,7 @@ pub async fn handle_key(
         Mode::Channel => handle_key_channel(app, key, tx, session).await,
         Mode::Playing => handle_key_playing(app, key, tx, session).await,
         Mode::Settings => handle_key_settings(app, key),
+        Mode::Download => handle_key_download(app, key, tx, session).await,
     }
 }
 
@@ -101,6 +105,7 @@ async fn handle_key_results(
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Char('c') => open_channel(app, tx, session),
+        KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
         KeyCode::Char('m') => load_more(app, tx, session),
@@ -144,6 +149,7 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         // 取りそこねたタブはここからしか戻せない。タブを送り直しても読み込み済みのまま。
         KeyCode::Char('r') => reload_channel_tab(app, tx, session),
         KeyCode::Char('s') => subscribe_channel(app, tx, session, deps),
+        KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
         KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
         KeyCode::Char('q') => app.should_quit = true,
@@ -267,6 +273,69 @@ fn apply_settings_edit(app: &mut App, action: EditAction) {
     }
 }
 
+/// ダウンロード画面の操作。yt-dlp を実際に起動させないよう Downloader を差し替えられる形。
+async fn handle_key_download(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    handle_key_download_with(app, key, tx, session, download::RealYtDlp).await;
+}
+
+/// フォーカス中の行が Dir/Filename なら、その QueryEditor。Format には無い。
+fn download_editor_mut(app: &mut App) -> Option<&mut QueryEditor> {
+    match app.download_focus {
+        DownloadField::Dir => Some(&mut app.download_dir),
+        DownloadField::Filename => Some(&mut app.download_filename),
+        DownloadField::Format => None,
+    }
+}
+
+async fn handle_key_download_with<D: download::Downloader + Send + Sync + 'static>(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    downloader: D,
+) {
+    match key.code {
+        KeyCode::Up => move_download_focus(app, -1),
+        KeyCode::Down => move_download_focus(app, 1),
+        // 形式の行では ← → Enter Space が切替、それ以外はカーソル移動/決定。
+        KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+            if app.download_focus == DownloadField::Format =>
+        {
+            app.download_audio_only = !app.download_audio_only;
+        }
+        KeyCode::Left => {
+            if let Some(editor) = download_editor_mut(app) {
+                editor.move_left(false);
+            }
+        }
+        KeyCode::Right => {
+            if let Some(editor) = download_editor_mut(app) {
+                editor.move_right(false);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(editor) = download_editor_mut(app) {
+                editor.backspace();
+            }
+        }
+        // 制御文字混じりの Ctrl+ 何かは入力に混ぜない。
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char(c) => {
+            if let Some(editor) = download_editor_mut(app) {
+                editor.insert(c);
+            }
+        }
+        KeyCode::Enter => start_download(app, tx, session, downloader),
+        KeyCode::Esc => close_download(app),
+        _ => {}
+    }
+}
+
 async fn handle_key_playing(
     app: &mut App,
     key: KeyEvent,
@@ -332,6 +401,9 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     if key.code == KeyCode::Char('l') {
         like_video(app, tx, session, deps);
     }
+    if key.code == KeyCode::Char('d') {
+        open_download(app, session);
+    }
     if key.code == KeyCode::Char('q') {
         app.should_quit = true;
     }
@@ -350,7 +422,7 @@ pub async fn handle_mouse(
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
         Mode::Channel => handle_mouse_channel(app, mouse, tx, session).await,
         Mode::Input => handle_mouse_input(app, mouse, tx, session),
-        Mode::Settings => {}
+        Mode::Settings | Mode::Download => {}
     }
 }
 
@@ -2882,5 +2954,275 @@ mod tests {
         assert_eq!(app.tabs.selected(), 0);
         assert!(session.search_task.is_none());
         assert!(!app.should_quit);
+    }
+
+    // ---- ダウンロード画面 ----
+
+    #[tokio::test]
+    async fn d_opens_the_download_screen_from_results() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(2);
+        app.selected = 1;
+
+        handle_key(&mut app, key(KeyCode::Char('d')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Download);
+        assert_eq!(app.download_return, Mode::Results);
+        assert_eq!(app.download_url, "https://www.youtube.com/watch?v=id1");
+    }
+
+    #[tokio::test]
+    async fn d_opens_the_download_screen_from_the_channel_view() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(2);
+
+        handle_key(&mut app, key(KeyCode::Char('d')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Download);
+        assert_eq!(app.download_return, Mode::Channel);
+    }
+
+    #[tokio::test]
+    async fn d_opens_the_download_screen_while_playing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            playback: Playback {
+                title: "曲".to_string(),
+                url: "https://www.youtube.com/watch?v=song1".to_string(),
+                ..Playback::default()
+            },
+            ..playing_app()
+        };
+
+        handle_key(&mut app, key(KeyCode::Char('d')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Download);
+        assert_eq!(app.download_return, Mode::Playing);
+        assert_eq!(app.download_url, "https://www.youtube.com/watch?v=song1");
+        assert_eq!(app.download_filename.text(), "曲");
+    }
+
+    /// ダウンロード画面を開いた状態 (Results から)。
+    fn download_app() -> App {
+        let mut app = grid_app(1);
+        let mut session = Session::default();
+        open_download(&mut app, &mut session);
+        app
+    }
+
+    #[tokio::test]
+    async fn up_and_down_move_the_focus_between_the_three_rows() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        assert_eq!(app.download_focus, DownloadField::Dir);
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Down),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        assert_eq!(app.download_focus, DownloadField::Filename);
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Up),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        assert_eq!(app.download_focus, DownloadField::Dir);
+    }
+
+    #[tokio::test]
+    async fn arrow_keys_move_the_cursor_in_the_focused_editor() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download_dir = QueryEditor::from("/tmp/out");
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Left),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+
+        assert_eq!(app.download_dir.before_cursor(), "/tmp/ou");
+    }
+
+    #[tokio::test]
+    async fn typing_inserts_into_the_focused_editor() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download_dir = QueryEditor::default();
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Char('/')),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Char('x')),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+
+        assert_eq!(app.download_dir.text(), "/x");
+    }
+
+    #[tokio::test]
+    async fn backspace_edits_the_focused_editor() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download_dir = QueryEditor::from("/tmp");
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Backspace),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+
+        assert_eq!(app.download_dir.text(), "/tm");
+    }
+
+    #[tokio::test]
+    async fn left_and_right_toggle_the_format_row_instead_of_moving_a_cursor() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download_focus = DownloadField::Format;
+        assert!(!app.download_audio_only);
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Right),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        assert!(app.download_audio_only, "音声のみへ切替");
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Left),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        assert!(!app.download_audio_only, "動画へ戻る");
+    }
+
+    #[tokio::test]
+    async fn enter_and_space_also_toggle_the_format_row() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download_focus = DownloadField::Format;
+        assert!(!app.download_audio_only);
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Enter),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        assert!(app.download_audio_only, "Enter で音声のみへ切替");
+        assert_eq!(app.mode, Mode::Download, "ダウンロードを開始しない");
+        assert!(session.download_task.is_none());
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Char(' ')),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+        assert!(!app.download_audio_only, "Space で動画へ戻る");
+    }
+
+    #[tokio::test]
+    async fn typing_on_the_format_row_does_nothing() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download_focus = DownloadField::Format;
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Char('x')),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+
+        assert!(!app.download_audio_only, "文字入力では切り替わらない");
+    }
+
+    #[tokio::test]
+    async fn esc_closes_the_download_screen_without_starting_anything() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        handle_key_download_with(
+            &mut app,
+            key(KeyCode::Esc),
+            &tx,
+            &mut session,
+            crate::download::fixtures::FakeDownloader::new([]),
+        )
+        .await;
+
+        assert_eq!(app.mode, Mode::Results);
+        assert!(session.download_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_starts_the_download_and_returns_to_the_previous_screen() {
+        let mut app = download_app();
+        app.download_dir = QueryEditor::from("/tmp/out");
+        app.download_filename = QueryEditor::from("title");
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let downloader =
+            crate::download::fixtures::FakeDownloader::new([crate::download::fixtures::done(
+                0,
+                "/tmp/out/title.mp4\n",
+                "",
+            )]);
+
+        handle_key_download_with(&mut app, key(KeyCode::Enter), &tx, &mut session, downloader)
+            .await;
+
+        assert_eq!(app.mode, Mode::Results, "即座に元の画面へ戻る");
+        assert!(session.download_task.is_some(), "背景で進む");
+        session.download_task.take().unwrap().abort();
     }
 }

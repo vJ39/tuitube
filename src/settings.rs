@@ -54,6 +54,7 @@ pub struct RawConfig {
     pub cookies: Option<RawCookies>,
     pub search: Option<RawSearch>,
     pub thumbnails: Option<RawThumbnails>,
+    pub download: Option<RawDownload>,
     pub categories: Option<Vec<RawCategory>>,
 }
 
@@ -72,6 +73,12 @@ pub struct RawThumbnails {
     pub cache_dir: Option<String>,
     pub max_cached: Option<i64>,
     pub timeout_secs: Option<i64>,
+}
+
+/// ダウンロード画面 (`Mode::Download`) の保存先。設定画面 (v1) には出さない。
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawDownload {
+    pub dir: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
@@ -246,6 +253,12 @@ impl ThumbnailSettings {
     }
 }
 
+/// ダウンロード画面 (`Mode::Download`) の保存先。未指定なら download::default_dir が決める。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DownloadSettings {
+    pub dir: Option<PathBuf>,
+}
+
 /// 検証済みの値。App が持つのはこれ。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -259,6 +272,7 @@ pub struct Settings {
     pub cookies: Option<CookieSource>,
     pub search: SearchSettings,
     pub thumbnails: ThumbnailSettings,
+    pub download: DownloadSettings,
     /// 「すべて」を除いたカテゴリタブ。
     pub categories: Vec<Category>,
 }
@@ -274,6 +288,7 @@ impl Default for Settings {
             cookies: None,
             search: SearchSettings::default(),
             thumbnails: ThumbnailSettings::default(),
+            download: DownloadSettings::default(),
             categories: default_categories(),
         }
     }
@@ -374,6 +389,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> Validated {
 
     let search = validate_search(raw.search.unwrap_or_default(), &mut notices);
     let thumbnails = validate_thumbnails(raw.thumbnails.unwrap_or_default(), &mut notices);
+    let download = validate_download(raw.download.unwrap_or_default(), &mut notices);
     let categories = validate_categories(raw.categories, &mut notices);
 
     Validated {
@@ -386,6 +402,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> Validated {
             cookies,
             search,
             thumbnails,
+            download,
             categories,
         },
         overridden,
@@ -512,9 +529,23 @@ fn validate_thumbnails(raw: RawThumbnails, notices: &mut Vec<String>) -> Thumbna
     }
 }
 
+/// ダウンロード画面の保存先。存在確認はしない (yt-dlp が -o の既定動作で作る)。
+fn validate_download(raw: RawDownload, notices: &mut Vec<String>) -> DownloadSettings {
+    let dir = raw
+        .dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(expand_home);
+    if raw.dir.is_some() && dir.is_none() {
+        notices.push("[download] dir が空です。既定の場所を使います".to_string());
+    }
+    DownloadSettings { dir }
+}
+
 /// 先頭の `~/` だけ $HOME へ置き換える。そのままだと "~" という名前の
-/// ディレクトリが作られてしまう。
-fn expand_home(dir: &str) -> PathBuf {
+/// ディレクトリが作られてしまう。download.rs からも再利用する。
+pub(crate) fn expand_home(dir: &str) -> PathBuf {
     let Some(rest) = dir.strip_prefix("~/") else {
         return PathBuf::from(dir);
     };
@@ -1165,6 +1196,41 @@ mod tests {
         let path = dir.join("cookies.txt");
         fs::write(&path, "# Netscape HTTP Cookie File\n").expect("書ける");
         (dir, path)
+    }
+
+    #[test]
+    fn download_dir_is_read_from_the_download_section() {
+        let text = "[download]\ndir = \"/tmp/out\"\n";
+        assert_eq!(
+            settings_of(text).download.dir,
+            Some(PathBuf::from("/tmp/out"))
+        );
+        assert!(notices_of(text).is_empty(), "{:?}", notices_of(text));
+    }
+
+    #[test]
+    fn download_dir_expands_a_leading_tilde() {
+        let home = std::env::var("HOME").expect("HOME");
+        let text = "[download]\ndir = \"~/Movies\"\n";
+        assert_eq!(
+            settings_of(text).download.dir,
+            Some(PathBuf::from(format!("{home}/Movies")))
+        );
+    }
+
+    #[test]
+    fn a_blank_download_dir_falls_back_with_a_notice() {
+        let text = "[download]\ndir = \"  \"\n";
+        assert_eq!(settings_of(text).download.dir, None);
+        let notices = notices_of(text);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("[download] dir"), "{notices:?}");
+    }
+
+    #[test]
+    fn an_unset_download_dir_is_none_without_a_notice() {
+        assert_eq!(settings_of("").download.dir, None);
+        assert!(notices_of("").is_empty());
     }
 
     #[test]

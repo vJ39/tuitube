@@ -1,15 +1,17 @@
 //! Session を動かすアクション。キー入力もイベント処理もここを通して player を触る。
 
-use crate::app::{App, AppEvent, ChannelView, Mode, Playback, SETTINGS_ITEMS};
+use crate::app::{App, AppEvent, ChannelView, DownloadField, Mode, Playback, SETTINGS_ITEMS};
 use crate::clipboard::{Clipboard, MISSING_PBCOPY};
 use crate::comments;
 use crate::cookies::Target;
 use crate::display::{self, DisplayMode, LaunchPlan};
+use crate::download;
 use crate::fetch::{Fetcher, RealCurl};
 use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::grid::{self, Dir};
 use crate::mpv::{self, MpvCommand, MpvController};
 use crate::oauth;
+use crate::query::QueryEditor;
 use crate::search::{self, RealYtDlp, SearchResult, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::settings;
@@ -96,6 +98,10 @@ pub struct Session {
     pub oauth_task: Option<JoinHandle<()>>,
     /// 打ち切りごとに進む世代。前の操作ぶんが遅れて届いても混ざらない。
     pub oauth_nonce: u64,
+    /// 動画/音声ファイルのダウンロード。同時に走らせるのは1件まで。
+    pub download_task: Option<JoinHandle<()>>,
+    /// 打ち切りごとに進む世代。前のダウンロードぶんが遅れて届いても混ざらない。
+    pub download_nonce: u64,
     /// 直近の端末サイズと、それを映像へ反映する時刻。
     pub pending_resize: Option<(u16, u16)>,
     pub resize_at: Option<Instant>,
@@ -1285,6 +1291,93 @@ pub fn close_settings(app: &mut App) {
     app.mode = app.settings_return;
     // 開くときに剥がしたサムネイルを貼り直す。
     app.thumbs.mark_dirty();
+}
+
+/// ダウンロード画面へ入る。Results/Channel は選択中の行、Playing は再生中の動画が対象。
+/// 対象を選べない (一覧が空) ときは何もしない。
+pub fn open_download(app: &mut App, session: &mut Session) {
+    let (title, url) = match app.mode {
+        Mode::Playing => (app.playback.title.clone(), app.playback.url.clone()),
+        _ => match app.view_selected_result() {
+            Some(result) => (result.title.clone(), result.url()),
+            None => return,
+        },
+    };
+    app.download_return = app.mode;
+    app.mode = Mode::Download;
+    app.download_url = url;
+    let home = std::env::var_os("HOME");
+    let dir = download::default_dir(app.settings.download.dir.as_deref(), home.as_deref());
+    let dir_text = dir.map(|d| d.display().to_string()).unwrap_or_default();
+    app.download_dir = QueryEditor::from(dir_text.as_str());
+    app.download_filename = QueryEditor::from(download::sanitize_filename(&title).as_str());
+    app.download_audio_only = false;
+    app.download_focus = DownloadField::Dir;
+    // 貼ってあるサムネイル/映像は差分描画では消えないので、剥がしてから画面を出す。
+    session.owe_clear = true;
+}
+
+/// 何もせず閉じる。ダウンロードを始めていれば背景で進んだまま。
+pub fn close_download(app: &mut App) {
+    app.mode = app.download_return;
+    // 開くときに剥がしたサムネイル/映像を貼り直す。
+    app.thumbs.mark_dirty();
+}
+
+/// ↑↓ のフォーカス移動。3 行しか無いので端では巻き戻す。
+pub fn move_download_focus(app: &mut App, delta: i32) {
+    app.download_focus = if delta < 0 {
+        app.download_focus.prev()
+    } else {
+        app.download_focus.next()
+    };
+}
+
+/// Enter での開始。保存先とファイル名がどちらも入っていることを確かめてから、
+/// 背景でダウンロードを始めて画面を閉じる。
+pub fn start_download<D>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    downloader: D,
+) where
+    D: download::Downloader + Send + Sync + 'static,
+{
+    let dir_text = app.download_dir.text().trim().to_string();
+    // 初期値は open_download でサニタイズ済みだが、その後の自由入力で `/` `\` を
+    // 打ち直されるとディレクトリを飛び出せてしまうため、開始直前にも掛け直す。
+    let filename_text = download::sanitize_filename(app.download_filename.text().trim());
+    if dir_text.is_empty() || filename_text.is_empty() {
+        app.set_temporary_error(
+            "保存先とファイル名を入力してください".to_string(),
+            std::time::Instant::now(),
+        );
+        return;
+    }
+    cancel_download(session);
+    let nonce = session.download_nonce;
+    let audio_only = app.download_audio_only;
+    let url = app.download_url.clone();
+    // 期限では消さず、終わった時点 (DownloadDone) で畳む。
+    app.set_notice(Some(format!(
+        "{}{filename_text}",
+        download::DOWNLOADING_PREFIX
+    )));
+    let tx = tx.clone();
+    session.download_task = Some(tokio::spawn(async move {
+        let notice = download::run(&downloader, &dir_text, &filename_text, audio_only, &url).await;
+        let _ = tx.send(AppEvent::DownloadDone { nonce, notice });
+    }));
+    close_download(app);
+}
+
+/// 先行のダウンロードを打ち切る。nonce を進めるので、届いてしまった結果は捨てられる
+/// (kill_on_drop で子プロセスも落ちる)。
+fn cancel_download(session: &mut Session) {
+    if let Some(task) = session.download_task.take() {
+        task.abort();
+    }
+    session.download_nonce += 1;
 }
 
 /// ↑↓ の選択移動。行数が少ないので端では巻き戻す。
@@ -5046,5 +5139,305 @@ mod tests {
         assert!(!path.exists());
         assert!(app.notice.is_none());
         assert_eq!(app.result_ids(), ["id0", "id1"]);
+    }
+
+    // ---- ダウンロード画面 ----
+
+    fn download_ready_app(target: SearchResult) -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        app.set_results(vec![target], &Target::Search("q".to_string()));
+        app
+    }
+
+    #[test]
+    fn opening_the_download_screen_from_results_uses_the_selected_row() {
+        let mut session = Session::default();
+        let mut app = download_ready_app(SearchResult {
+            title: "面白い/動画".to_string(),
+            ..result("id0")
+        });
+
+        open_download(&mut app, &mut session);
+
+        assert_eq!(app.mode, Mode::Download);
+        assert_eq!(app.download_return, Mode::Results);
+        assert_eq!(app.download_url, "https://www.youtube.com/watch?v=id0");
+        // `/` はディレクトリを飛び出さないよう `_` へ置き換える。
+        assert_eq!(app.download_filename.text(), "面白い_動画");
+        assert_eq!(app.download_focus, DownloadField::Dir);
+        assert!(!app.download_audio_only, "既定は動画");
+        assert!(session.owe_clear, "貼ってあるサムネイルを剥がす");
+    }
+
+    #[test]
+    fn opening_the_download_screen_from_playing_uses_the_playback() {
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Playing,
+            playback: Playback {
+                title: "再生中の動画".to_string(),
+                url: "https://www.youtube.com/watch?v=live1".to_string(),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+
+        open_download(&mut app, &mut session);
+
+        assert_eq!(app.download_return, Mode::Playing);
+        assert_eq!(app.download_url, "https://www.youtube.com/watch?v=live1");
+        assert_eq!(app.download_filename.text(), "再生中の動画");
+    }
+
+    #[test]
+    fn opening_the_download_screen_without_a_selection_does_nothing() {
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Results,
+            ..App::default()
+        };
+
+        open_download(&mut app, &mut session);
+
+        assert_eq!(app.mode, Mode::Results, "一覧が空では開かない");
+    }
+
+    #[test]
+    fn opening_the_download_screen_defaults_the_dir_from_settings() {
+        let mut session = Session::default();
+        let mut app = download_ready_app(result("id0"));
+        app.settings.download.dir = Some(std::path::PathBuf::from("/configured/dir"));
+
+        open_download(&mut app, &mut session);
+
+        assert_eq!(app.download_dir.text(), "/configured/dir");
+    }
+
+    /// チャンネル一覧を開いていて、その一覧に選択中の動画がある画面。
+    fn channel_download_app() -> App {
+        let mut app = App {
+            mode: Mode::Channel,
+            screen: Rect::new(0, 0, 80, 24),
+            channel: Some(ChannelView::new("UCone".to_string(), "One".to_string())),
+            ..App::default()
+        };
+        app.set_results(
+            vec![result("id0")],
+            &Target::Channel {
+                id: "UCone".to_string(),
+                tab: ChannelTab::Videos,
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn the_download_screen_returns_to_the_mode_it_was_opened_from() {
+        for mut app in [download_ready_app(result("id0")), channel_download_app()] {
+            let origin = app.mode;
+            let mut session = Session::default();
+
+            open_download(&mut app, &mut session);
+            assert_eq!(app.mode, Mode::Download, "{origin:?}");
+
+            close_download(&mut app);
+            assert_eq!(app.mode, origin, "{origin:?} から開いた");
+        }
+    }
+
+    #[test]
+    fn closing_the_download_screen_marks_the_thumbnails_dirty_again() {
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+        app.thumbs.take_dirty();
+
+        open_download(&mut app, &mut session);
+        assert!(session.owe_clear);
+
+        close_download(&mut app);
+        assert!(app.thumbs.take_dirty(), "戻ったら貼り直す");
+    }
+
+    #[test]
+    fn the_download_focus_wraps_at_both_ends() {
+        let mut app = App::default();
+        assert_eq!(app.download_focus, DownloadField::Dir);
+
+        move_download_focus(&mut app, -1);
+        assert_eq!(app.download_focus, DownloadField::Format, "巻き戻る");
+
+        move_download_focus(&mut app, 1);
+        assert_eq!(app.download_focus, DownloadField::Dir);
+        move_download_focus(&mut app, 1);
+        assert_eq!(app.download_focus, DownloadField::Filename);
+    }
+
+    #[tokio::test]
+    async fn starting_a_download_spawns_the_task_with_the_entered_values() {
+        let mut session = Session::default();
+        let mut app = download_ready_app(result("id0"));
+        open_download(&mut app, &mut session);
+        app.download_dir = QueryEditor::from("/tmp/tuitube-dl");
+        app.download_filename = QueryEditor::from("my-title");
+        app.download_audio_only = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let downloader = download::fixtures::FakeDownloader::new([download::fixtures::done(
+            0,
+            "/tmp/tuitube-dl/my-title.mp3\n",
+            "",
+        )]);
+
+        start_download(&mut app, &tx, &mut session, downloader.clone());
+
+        // Enter を押した時点で即座に元の画面へ戻る。ダウンロードは背景で進む。
+        assert_eq!(app.mode, Mode::Results);
+        assert_eq!(app.notice.as_deref(), Some("ダウンロード中: my-title"));
+        assert!(session.download_task.is_some());
+
+        // spawn した直後はまだポーリングされていないので、実際に起動したことは
+        // タスクの完走を待ってから確かめる。
+        session
+            .download_task
+            .take()
+            .expect("タスク")
+            .await
+            .expect("タスクは panic しない");
+
+        let calls = downloader.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].contains(&"--audio-format".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls[0].contains(&"/tmp/tuitube-dl/my-title.%(ext)s".to_string()),
+            "{calls:?}"
+        );
+        assert!(
+            calls[0].contains(&"https://www.youtube.com/watch?v=id0".to_string()),
+            "{calls:?}"
+        );
+
+        let event = rx.try_recv().expect("DownloadDone が届く");
+        match event {
+            AppEvent::DownloadDone { nonce, notice } => {
+                assert_eq!(nonce, session.download_nonce);
+                assert_eq!(
+                    notice.expect("成功"),
+                    "保存しました: /tmp/tuitube-dl/my-title.mp3"
+                );
+            }
+            _ => panic!("DownloadDone のはず"),
+        }
+    }
+
+    #[test]
+    fn starting_a_download_with_an_empty_directory_is_refused() {
+        let mut session = Session::default();
+        let mut app = download_ready_app(result("id0"));
+        open_download(&mut app, &mut session);
+        app.download_dir = QueryEditor::from("   ");
+        app.download_filename = QueryEditor::from("title");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        start_download(
+            &mut app,
+            &tx,
+            &mut session,
+            download::fixtures::FakeDownloader::new([]),
+        );
+
+        assert_eq!(app.mode, Mode::Download, "断ったら画面を閉じない");
+        assert!(session.download_task.is_none(), "起動しない");
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("入力してください")),
+            "{:?}",
+            app.error
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_a_download_resanitizes_a_filename_retyped_after_opening() {
+        // sanitize_filename は open_download の初期値計算にしか掛からないため、
+        // 開いた後に手で `/` を打ち直せてもディレクトリを飛び出さないことを確かめる。
+        let mut session = Session::default();
+        let mut app = download_ready_app(result("id0"));
+        open_download(&mut app, &mut session);
+        app.download_dir = QueryEditor::from("/tmp/tuitube-dl");
+        app.download_filename = QueryEditor::from("../../etc/evil");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let downloader =
+            download::fixtures::FakeDownloader::new([download::fixtures::done(0, "", "")]);
+
+        start_download(&mut app, &tx, &mut session, downloader.clone());
+        session
+            .download_task
+            .take()
+            .expect("タスク")
+            .await
+            .expect("タスクは panic しない");
+
+        let calls = downloader.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].contains(&"/tmp/tuitube-dl/.._.._etc_evil.%(ext)s".to_string()),
+            "パス区切りが残っていない: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn starting_a_download_with_an_empty_filename_is_refused() {
+        let mut session = Session::default();
+        let mut app = download_ready_app(result("id0"));
+        open_download(&mut app, &mut session);
+        app.download_filename = QueryEditor::from("");
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        start_download(
+            &mut app,
+            &tx,
+            &mut session,
+            download::fixtures::FakeDownloader::new([]),
+        );
+
+        assert_eq!(app.mode, Mode::Download);
+        assert!(session.download_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_download_cancels_the_previous_one() {
+        let mut session = Session::default();
+        let mut app = download_ready_app(result("id0"));
+        open_download(&mut app, &mut session);
+        app.download_dir = QueryEditor::from("/tmp/tuitube-dl");
+        app.download_filename = QueryEditor::from("first");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // 応答しない偽物で、走らせたままの状態を作る。
+        struct HangingDownloader;
+        impl download::Downloader for HangingDownloader {
+            fn run(
+                &self,
+                _args: Vec<String>,
+            ) -> impl Future<Output = std::io::Result<Output>> + Send {
+                std::future::pending()
+            }
+        }
+        start_download(&mut app, &tx, &mut session, HangingDownloader);
+        let first_nonce = session.download_nonce;
+        assert!(session.download_task.is_some());
+
+        open_download(&mut app, &mut session);
+        app.download_dir = QueryEditor::from("/tmp/tuitube-dl");
+        app.download_filename = QueryEditor::from("second");
+        start_download(&mut app, &tx, &mut session, HangingDownloader);
+
+        assert_ne!(session.download_nonce, first_nonce, "世代が進む");
+        assert!(session.download_task.is_some(), "新しい方は走らせたまま");
     }
 }
