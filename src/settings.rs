@@ -30,6 +30,10 @@ pub const MAX_SEARCH_LIMIT: usize = 1000;
 /// limit を大きくすると yt-dlp の所要時間が伸びるので、ここで延ばせるようにする。
 pub const MIN_SEARCH_TIMEOUT_SECS: u64 = 5;
 pub const MAX_SEARCH_TIMEOUT_SECS: u64 = 300;
+/// 同じ検索の結果を使い回す時間。
+pub const DEFAULT_SEARCH_CACHE_TTL_SECS: u64 = 300;
+pub const MIN_SEARCH_CACHE_TTL_SECS: u64 = 10;
+pub const MAX_SEARCH_CACHE_TTL_SECS: u64 = 3600;
 /// 起動時にディスクキャッシュへ残す枚数。
 pub const DEFAULT_MAX_CACHED: usize = 500;
 /// サムネイル 1 枚あたりのダウンロード上限秒数。
@@ -58,6 +62,8 @@ pub struct RawSearch {
     pub layout: Option<String>,
     pub limit: Option<i64>,
     pub timeout_secs: Option<i64>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_secs: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
@@ -189,6 +195,9 @@ pub struct SearchSettings {
     pub layout: LayoutMode,
     pub limit: usize,
     pub timeout: Duration,
+    /// 同じ検索を cache_ttl の間は取り直さない。
+    pub cache_enabled: bool,
+    pub cache_ttl: Duration,
 }
 
 impl Default for SearchSettings {
@@ -197,6 +206,8 @@ impl Default for SearchSettings {
             layout: LayoutMode::default(),
             limit: DEFAULT_SEARCH_LIMIT,
             timeout: crate::search::YT_DLP_TIMEOUT,
+            cache_enabled: false,
+            cache_ttl: Duration::from_secs(DEFAULT_SEARCH_CACHE_TTL_SECS),
         }
     }
 }
@@ -433,10 +444,27 @@ fn validate_search(raw: RawSearch, notices: &mut Vec<String>) -> SearchSettings 
             Duration::from_secs(clamped as u64)
         }
     };
+    let cache_ttl = match raw.cache_ttl_secs {
+        None => defaults.cache_ttl,
+        Some(secs) => {
+            let clamped = secs.clamp(
+                MIN_SEARCH_CACHE_TTL_SECS as i64,
+                MAX_SEARCH_CACHE_TTL_SECS as i64,
+            );
+            if clamped != secs {
+                notices.push(format!(
+                    "[search] cache_ttl_secs={secs} は {clamped} に丸めました"
+                ));
+            }
+            Duration::from_secs(clamped as u64)
+        }
+    };
     SearchSettings {
         layout,
         limit,
         timeout,
+        cache_enabled: raw.cache_enabled.unwrap_or(defaults.cache_enabled),
+        cache_ttl,
     }
 }
 
@@ -855,6 +883,21 @@ pub fn render(settings: &Settings) -> String {
     out.push_str(&format!(
         "timeout_secs = {}\n",
         settings.search.timeout.as_secs()
+    ));
+    out.push_str("# true にすると、同じ検索を cache_ttl_secs の間は取り直さない。\n");
+    out.push_str(
+        "# 控えはメモリ上だけなので、アプリを終了すると消える。r を押せば必ず取り直す。\n",
+    );
+    out.push_str(&format!(
+        "cache_enabled = {}\n",
+        settings.search.cache_enabled
+    ));
+    out.push_str(&format!(
+        "# 控えを使い回す秒数。{MIN_SEARCH_CACHE_TTL_SECS}..={MAX_SEARCH_CACHE_TTL_SECS}。\n"
+    ));
+    out.push_str(&format!(
+        "cache_ttl_secs = {}\n",
+        settings.search.cache_ttl.as_secs()
     ));
 
     let thumbnails = &settings.thumbnails;
@@ -1896,6 +1939,92 @@ mod tests {
     }
 
     #[test]
+    fn the_search_cache_is_off_with_a_five_minute_ttl_by_default() {
+        let settings = settings_of("");
+        assert!(!settings.search.cache_enabled);
+        assert_eq!(
+            settings.search.cache_ttl,
+            Duration::from_secs(DEFAULT_SEARCH_CACHE_TTL_SECS)
+        );
+        // キャッシュを知らない頃の設定ファイルも、これまでどおり毎回取り直す。
+        let old = settings_of("[search]\nlayout = \"list\"\nlimit = 50\n").search;
+        assert!(!old.cache_enabled);
+        assert_eq!(
+            old.cache_ttl,
+            Duration::from_secs(DEFAULT_SEARCH_CACHE_TTL_SECS)
+        );
+    }
+
+    #[test]
+    fn the_search_cache_settings_are_read() {
+        let text = "[search]\ncache_enabled = true\ncache_ttl_secs = 60\n";
+        let search = settings_of(text).search;
+        assert!(search.cache_enabled);
+        assert_eq!(search.cache_ttl, Duration::from_secs(60));
+        assert!(notices_of(text).is_empty());
+    }
+
+    #[test]
+    fn a_search_cache_ttl_outside_the_range_is_rounded_with_a_notice() {
+        for (raw, expected) in [
+            (0, MIN_SEARCH_CACHE_TTL_SECS),
+            (9, MIN_SEARCH_CACHE_TTL_SECS),
+            (-30, MIN_SEARCH_CACHE_TTL_SECS),
+            (3601, MAX_SEARCH_CACHE_TTL_SECS),
+            (100_000, MAX_SEARCH_CACHE_TTL_SECS),
+        ] {
+            let text = format!("[search]\ncache_ttl_secs = {raw}\n");
+            assert_eq!(
+                settings_of(&text).search.cache_ttl,
+                Duration::from_secs(expected),
+                "{text}"
+            );
+            let notice = notices_of(&text).join(" / ");
+            assert!(notice.contains("[search] cache_ttl_secs"), "{notice}");
+            assert!(notice.contains(&raw.to_string()), "{notice}");
+        }
+
+        // 端ちょうどは丸めない。
+        for secs in [MIN_SEARCH_CACHE_TTL_SECS, MAX_SEARCH_CACHE_TTL_SECS] {
+            let text = format!("[search]\ncache_ttl_secs = {secs}\n");
+            assert_eq!(
+                settings_of(&text).search.cache_ttl,
+                Duration::from_secs(secs)
+            );
+            assert!(notices_of(&text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn render_round_trips_the_search_cache() {
+        let custom = Settings {
+            search: SearchSettings {
+                cache_enabled: true,
+                cache_ttl: Duration::from_secs(60),
+                ..SearchSettings::default()
+            },
+            ..Settings::default()
+        };
+        let text = render(&custom);
+        assert!(text.contains("cache_enabled = true"), "{text}");
+        assert!(text.contains("cache_ttl_secs = 60"), "{text}");
+        assert_eq!(settings_of(&text), custom);
+
+        let text = render(&Settings::default());
+        assert!(text.contains("cache_enabled = false"), "{text}");
+        assert!(
+            text.contains(&format!("cache_ttl_secs = {DEFAULT_SEARCH_CACHE_TTL_SECS}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "{MIN_SEARCH_CACHE_TTL_SECS}..={MAX_SEARCH_CACHE_TTL_SECS}"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn thumbnail_settings_are_read() {
         let text = "[thumbnails]\nenabled = false\ncache_dir = \"/tmp/thumbs\"\nmax_cached = 20\ntimeout_secs = 5\n";
         let thumbnails = settings_of(text).thumbnails;
@@ -1997,6 +2126,8 @@ mod tests {
                 layout: LayoutMode::List,
                 limit: 30,
                 timeout: Duration::from_secs(45),
+                cache_enabled: true,
+                cache_ttl: Duration::from_secs(45),
             },
             thumbnails: ThumbnailSettings {
                 enabled: false,

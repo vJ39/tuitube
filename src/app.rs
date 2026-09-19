@@ -9,8 +9,9 @@ use crate::rgb::RgbImage;
 use crate::search::{ChannelRef, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::{
-    EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_LIMIT, MAX_SEARCH_TIMEOUT_SECS,
-    MAX_THUMB_TIMEOUT_SECS, MIN_SEARCH_LIMIT, MIN_SEARCH_TIMEOUT_SECS, Settings,
+    EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_CACHE_TTL_SECS, MAX_SEARCH_LIMIT,
+    MAX_SEARCH_TIMEOUT_SECS, MAX_THUMB_TIMEOUT_SECS, MIN_SEARCH_CACHE_TTL_SECS, MIN_SEARCH_LIMIT,
+    MIN_SEARCH_TIMEOUT_SECS, Settings,
 };
 use crate::speed::{Polled, Speed};
 use crate::subtitles::SubtitleState;
@@ -179,12 +180,14 @@ pub enum SettingsItem {
     SearchLayout,
     SearchLimit,
     SearchTimeoutSecs,
+    SearchCacheEnabled,
+    SearchCacheTtlSecs,
     ThumbnailsEnabled,
     ThumbnailsMaxCached,
     ThumbnailsTimeoutSecs,
 }
 
-pub const SETTINGS_ITEMS: [SettingsItem; 10] = [
+pub const SETTINGS_ITEMS: [SettingsItem; 12] = [
     SettingsItem::DisplayMode,
     SettingsItem::DisplayQuality,
     SettingsItem::FpsCap,
@@ -192,6 +195,8 @@ pub const SETTINGS_ITEMS: [SettingsItem; 10] = [
     SettingsItem::SearchLayout,
     SettingsItem::SearchLimit,
     SettingsItem::SearchTimeoutSecs,
+    SettingsItem::SearchCacheEnabled,
+    SettingsItem::SearchCacheTtlSecs,
     SettingsItem::ThumbnailsEnabled,
     SettingsItem::ThumbnailsMaxCached,
     SettingsItem::ThumbnailsTimeoutSecs,
@@ -201,6 +206,7 @@ pub const SETTINGS_ITEMS: [SettingsItem; 10] = [
 const FPS_CAP_STEP: u64 = 5;
 const SEARCH_LIMIT_STEP: u64 = 1;
 const SEARCH_TIMEOUT_STEP: u64 = 5;
+const SEARCH_CACHE_TTL_STEP: u64 = 5;
 const MAX_CACHED_STEP: u64 = 50;
 const THUMB_TIMEOUT_STEP: u64 = 5;
 /// 0 秒では 1 枚も取れないので、秒数はここまでしか下げない。
@@ -230,6 +236,8 @@ impl SettingsItem {
             Self::SearchLayout => "search.layout",
             Self::SearchLimit => "search.limit",
             Self::SearchTimeoutSecs => "search.timeout_secs",
+            Self::SearchCacheEnabled => "search.cache_enabled",
+            Self::SearchCacheTtlSecs => "search.cache_ttl_secs",
             Self::ThumbnailsEnabled => "thumbnails.enabled",
             Self::ThumbnailsMaxCached => "thumbnails.max_cached",
             Self::ThumbnailsTimeoutSecs => "thumbnails.timeout_secs",
@@ -249,6 +257,8 @@ impl SettingsItem {
             Self::SearchLayout => settings.search.layout.key().to_string(),
             Self::SearchLimit => settings.search.limit.to_string(),
             Self::SearchTimeoutSecs => settings.search.timeout.as_secs().to_string(),
+            Self::SearchCacheEnabled => settings.search.cache_enabled.to_string(),
+            Self::SearchCacheTtlSecs => settings.search.cache_ttl.as_secs().to_string(),
             Self::ThumbnailsEnabled => settings.thumbnails.enabled.to_string(),
             Self::ThumbnailsMaxCached => settings.thumbnails.max_cached.to_string(),
             Self::ThumbnailsTimeoutSecs => settings.thumbnails.timeout.as_secs().to_string(),
@@ -274,6 +284,7 @@ impl SettingsItem {
             Self::FpsCap
                 | Self::SearchLimit
                 | Self::SearchTimeoutSecs
+                | Self::SearchCacheTtlSecs
                 | Self::ThumbnailsMaxCached
                 | Self::ThumbnailsTimeoutSecs
         )
@@ -286,6 +297,7 @@ impl SettingsItem {
             Self::FpsCap => u64::from(MAX_FPS_CAP),
             Self::SearchLimit => MAX_SEARCH_LIMIT as u64,
             Self::SearchTimeoutSecs => MAX_SEARCH_TIMEOUT_SECS,
+            Self::SearchCacheTtlSecs => MAX_SEARCH_CACHE_TTL_SECS,
             // max_cached に上限は無いので、apply_numeric が受け取れる最大値で数える。
             Self::ThumbnailsMaxCached => u64::try_from(usize::MAX).unwrap_or(u64::MAX),
             Self::ThumbnailsTimeoutSecs => MAX_THUMB_TIMEOUT_SECS,
@@ -293,6 +305,7 @@ impl SettingsItem {
             | Self::DisplayQuality
             | Self::SubtitlesEnabled
             | Self::SearchLayout
+            | Self::SearchCacheEnabled
             | Self::ThumbnailsEnabled => return 0,
         };
         max.to_string().len()
@@ -318,6 +331,10 @@ impl SettingsItem {
                 let secs = value.clamp(MIN_SEARCH_TIMEOUT_SECS, MAX_SEARCH_TIMEOUT_SECS);
                 settings.search.timeout = Duration::from_secs(secs);
             }
+            Self::SearchCacheTtlSecs => {
+                let secs = value.clamp(MIN_SEARCH_CACHE_TTL_SECS, MAX_SEARCH_CACHE_TTL_SECS);
+                settings.search.cache_ttl = Duration::from_secs(secs);
+            }
             Self::ThumbnailsMaxCached => {
                 settings.thumbnails.max_cached = usize::try_from(value).unwrap_or(usize::MAX);
             }
@@ -330,6 +347,7 @@ impl SettingsItem {
             | Self::DisplayQuality
             | Self::SubtitlesEnabled
             | Self::SearchLayout
+            | Self::SearchCacheEnabled
             | Self::ThumbnailsEnabled => return false,
         }
         true
@@ -376,6 +394,20 @@ impl SettingsItem {
                     up,
                 );
                 settings.search.timeout = Duration::from_secs(secs);
+            }
+            Self::SearchCacheEnabled => {
+                settings.search.cache_enabled = !settings.search.cache_enabled;
+            }
+            Self::SearchCacheTtlSecs => {
+                let current = settings.search.cache_ttl.as_secs();
+                let secs = step(
+                    current,
+                    SEARCH_CACHE_TTL_STEP,
+                    MIN_SEARCH_CACHE_TTL_SECS,
+                    MAX_SEARCH_CACHE_TTL_SECS,
+                    up,
+                );
+                settings.search.cache_ttl = Duration::from_secs(secs);
             }
             Self::ThumbnailsEnabled => settings.thumbnails.enabled = !settings.thumbnails.enabled,
             Self::ThumbnailsMaxCached => {
@@ -622,6 +654,21 @@ impl App {
         self.set_error(None);
     }
 
+    /// 結果の行き先になるタブの状態。チャンネル閲覧中はその現在タブ。
+    pub fn view_state(&self) -> &TabState {
+        match &self.channel {
+            Some(channel) => channel.state(),
+            None => self.tabs.state(),
+        }
+    }
+
+    pub fn view_state_mut(&mut self) -> &mut TabState {
+        match &mut self.channel {
+            Some(channel) => channel.state_mut(),
+            None => self.tabs.state_mut(),
+        }
+    }
+
     /// 今の画面が見ている一覧。チャンネル閲覧中はその現在タブ、それ以外は検索結果。
     pub fn view_results(&self) -> &[SearchResult] {
         match &self.channel {
@@ -687,23 +734,14 @@ impl App {
             .into_iter()
             .filter(|result| !self.hidden.hides(result))
             .collect();
-        match &mut self.channel {
-            Some(channel) => {
-                let state = channel.state_mut();
-                state.results = results;
-                state.selected = 0;
-                state.scroll = 0;
-                state.loaded = true;
-            }
-            None => {
-                let state = self.tabs.state_mut();
-                state.results = results;
-                state.selected = 0;
-                state.scroll = 0;
-                // 0 件でも読み込み済みにする。戻るたびに同じ検索を投げ直さないため。
-                state.loaded = true;
-            }
-        }
+        let state = self.view_state_mut();
+        state.results = results;
+        state.selected = 0;
+        state.scroll = 0;
+        // 0 件でも読み込み済みにする。戻るたびに同じ検索を投げ直さないため。
+        state.loaded = true;
+        // 取り直しの頼みはここで果たされる。
+        state.reload = false;
         self.sync_from_view();
         if self.channel.is_some() {
             // 配信を持たないチャンネルも 0 件で来る。失敗ではないのでエラーにしない。
@@ -1909,6 +1947,8 @@ mod tests {
                 "search.layout",
                 "search.limit",
                 "search.timeout_secs",
+                "search.cache_enabled",
+                "search.cache_ttl_secs",
                 "thumbnails.enabled",
                 "thumbnails.max_cached",
                 "thumbnails.timeout_secs",
@@ -1929,6 +1969,8 @@ mod tests {
                 "search.layout: grid",
                 "search.limit: 10",
                 "search.timeout_secs: 30",
+                "search.cache_enabled: false",
+                "search.cache_ttl_secs: 300",
                 "thumbnails.enabled: true",
                 "thumbnails.max_cached: 500",
                 "thumbnails.timeout_secs: 10",
@@ -2103,6 +2145,80 @@ mod tests {
     }
 
     #[test]
+    fn the_search_cache_toggle_flips_either_way() {
+        let mut settings = Settings::default();
+        assert!(!settings.search.cache_enabled, "既定は off のまま");
+        for delta in [1, -1] {
+            SettingsItem::SearchCacheEnabled.adjust(&mut settings, delta);
+            assert!(settings.search.cache_enabled);
+            SettingsItem::SearchCacheEnabled.adjust(&mut settings, delta);
+            assert!(!settings.search.cache_enabled);
+        }
+    }
+
+    #[test]
+    fn the_search_cache_ttl_steps_by_five_and_stays_inside_its_range() {
+        let mut settings = Settings::default();
+        let secs = |settings: &Settings| settings.search.cache_ttl.as_secs();
+        assert_eq!(secs(&settings), 300, "既定は 300 秒のまま");
+
+        SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, 1);
+        assert_eq!(secs(&settings), 305);
+        SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, -1);
+        assert_eq!(secs(&settings), 300);
+
+        for _ in 0..200 {
+            SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, -1);
+        }
+        assert_eq!(secs(&settings), MIN_SEARCH_CACHE_TTL_SECS, "下限で止まる");
+
+        for _ in 0..1000 {
+            SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, 1);
+        }
+        assert_eq!(secs(&settings), MAX_SEARCH_CACHE_TTL_SECS, "上限で止まる");
+    }
+
+    #[test]
+    fn the_search_cache_ttl_takes_typed_numbers_and_the_toggle_does_not() {
+        let mut settings = Settings::default();
+        assert!(SettingsItem::SearchCacheTtlSecs.is_numeric());
+        assert!(!SettingsItem::SearchCacheEnabled.is_numeric());
+        assert_eq!(
+            SettingsItem::SearchCacheTtlSecs.max_digits(),
+            MAX_SEARCH_CACHE_TTL_SECS.to_string().len()
+        );
+
+        assert!(SettingsItem::SearchCacheTtlSecs.apply_numeric(&mut settings, "45"));
+        assert_eq!(settings.search.cache_ttl, Duration::from_secs(45));
+        assert!(SettingsItem::SearchCacheTtlSecs.apply_numeric(&mut settings, "1"));
+        assert_eq!(
+            settings.search.cache_ttl,
+            Duration::from_secs(MIN_SEARCH_CACHE_TTL_SECS)
+        );
+        assert!(SettingsItem::SearchCacheTtlSecs.apply_numeric(&mut settings, "99999"));
+        assert_eq!(
+            settings.search.cache_ttl,
+            Duration::from_secs(MAX_SEARCH_CACHE_TTL_SECS)
+        );
+        assert!(!SettingsItem::SearchCacheEnabled.apply_numeric(&mut settings, "1"));
+    }
+
+    #[test]
+    fn the_search_cache_rows_show_the_config_keys() {
+        let settings = Settings::default();
+        assert_eq!(
+            SettingsItem::SearchCacheEnabled.row(&settings),
+            "search.cache_enabled: false"
+        );
+        assert_eq!(
+            SettingsItem::SearchCacheTtlSecs.row(&settings),
+            "search.cache_ttl_secs: 300"
+        );
+        assert!(SETTINGS_ITEMS.contains(&SettingsItem::SearchCacheEnabled));
+        assert!(SETTINGS_ITEMS.contains(&SettingsItem::SearchCacheTtlSecs));
+    }
+
+    #[test]
     fn the_thumbnail_numbers_step_by_their_own_width() {
         let mut settings = Settings::default();
         SettingsItem::ThumbnailsMaxCached.adjust(&mut settings, 1);
@@ -2205,6 +2321,7 @@ mod tests {
                 "fps_cap",
                 "search.limit",
                 "search.timeout_secs",
+                "search.cache_ttl_secs",
                 "thumbnails.max_cached",
                 "thumbnails.timeout_secs",
             ]

@@ -10,7 +10,7 @@ use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::grid::{self, Dir};
 use crate::mpv::{self, MpvCommand, MpvController};
 use crate::oauth;
-use crate::search::{self, RealYtDlp, YtDlp};
+use crate::search::{self, RealYtDlp, SearchResult, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::settings;
 use crate::speed::Speed;
@@ -19,6 +19,7 @@ use crate::thumbs;
 use crate::ui;
 use crate::video::{CellSize, DecoderKind, VideoSink};
 use ratatui::layout::Rect;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -29,6 +30,9 @@ use tokio::time::Instant;
 
 /// ドラッグ中は Resize が連続して届くので、落ち着くまで mpv の作り直しを待つ。
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(200);
+/// 控えておく検索の数。既定のタブ 10 枚を cookie の有無ぶん持っても余る幅にしてある。
+/// 1 件あたり最大 search.limit 件を抱えるので、使い捨ての検索語で青天井にはしない。
+const CACHE_CAPACITY: usize = 64;
 /// ←→ 1 回あたりのシーク幅。
 pub const SEEK_STEP_SECS: f64 = 5.0;
 /// コピーできたことを伝える文言。
@@ -96,6 +100,60 @@ pub struct Session {
     pub resize_at: Option<Instant>,
     /// 再生が終わった後など、sink 越しに出せない画像削除の持ち越し。
     pub owe_clear: bool,
+    /// 成功した検索の控え。ディスクへは残さないのでアプリを終えると消える。
+    pub search_cache: HashMap<String, CacheEntry>,
+    /// 走らせた検索の鍵。結果を反映すると cookie の状態が動くので、
+    /// 取りに行った時点の鍵をここへ置いておく。
+    pub pending_cache_key: Option<String>,
+}
+
+/// 検索 1 回ぶんの控え。
+pub struct CacheEntry {
+    pub results: Vec<SearchResult>,
+    pub fetched_at: Instant,
+}
+
+/// 同じ検索を指す鍵。cookie の有無で結果が変わるので、使ったかどうかも混ぜる。
+pub fn cache_key(target: &Target, limit: usize, used_cookies: bool) -> String {
+    format!("{target:?}|{limit}|{used_cookies}")
+}
+
+/// 期限内の控えだけを返す。
+fn cached_results(session: &Session, key: &str, ttl: Duration) -> Option<Vec<SearchResult>> {
+    let entry = session.search_cache.get(key)?;
+    (entry.fetched_at.elapsed() < ttl).then(|| entry.results.clone())
+}
+
+/// 成功した検索を控える。失敗・控えから返した分・設定が off の間は鍵が無いので何もしない。
+pub fn remember_search(session: &mut Session, results: &[SearchResult], ttl: Duration) {
+    let Some(key) = session.pending_cache_key.take() else {
+        return;
+    };
+    // 上書きぶんは枠を取り合わない。
+    session.search_cache.remove(&key);
+    // 期限切れは読まれないまま残るので、書くついでに落とす。
+    session
+        .search_cache
+        .retain(|_, entry| entry.fetched_at.elapsed() < ttl);
+    // 検索語ごとに鍵が増えるので、それでも溢れるぶんは取ったのが古い順に捨てる。
+    while session.search_cache.len() >= CACHE_CAPACITY {
+        let Some(oldest) = session
+            .search_cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.fetched_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        session.search_cache.remove(&oldest);
+    }
+    session.search_cache.insert(
+        key,
+        CacheEntry {
+            results: results.to_vec(),
+            fetched_at: Instant::now(),
+        },
+    );
 }
 
 /// 再生中の player へコマンドを送り、失敗だけを画面に出す。キーもマウスもここを使う。
@@ -256,9 +314,27 @@ fn spawn_search<R>(
     let nonce = session.search_nonce;
     let limit = app.settings.search.limit;
     let timeout = app.settings.search.timeout;
+    let cookies = app.cookies.for_search().cloned();
+    // off の間は鍵を作らない。読み出しも控えも鍵の有無で決まるので、溜まりもしない。
+    let key = app
+        .settings
+        .search
+        .cache_enabled
+        .then(|| cache_key(&target, limit, cookies.is_some()));
+    // r での取り直しは「今の中身を見たい」意思表示。読み込めるまで控えは出さない。
+    if !app.view_state().reload
+        && let Some(key) = &key
+        && let Some(results) = cached_results(session, key, app.settings.search.cache_ttl)
+    {
+        // 取りに行っていないので cookie の状態は確かめない。
+        app.set_error(None);
+        app.set_results(results, &target);
+        start_thumbnails(app, tx, session);
+        return;
+    }
+    session.pending_cache_key = key;
     app.searching = true;
     app.set_error(None);
-    let cookies = app.cookies.for_search().cloned();
     let tx = tx.clone();
     session.search_task = Some(tokio::spawn(async move {
         let report = search::run_search(&runner, &target, cookies.as_ref(), limit, timeout).await;
@@ -644,11 +720,18 @@ pub fn reload_channel_tab_with<R>(
 ) where
     R: YtDlp + Send + Sync + 'static,
 {
-    let Some(channel) = app.channel.as_mut() else {
+    if app.channel.is_none() {
         return;
-    };
-    channel.state_mut().loaded = false;
+    }
+    request_reload(app);
     start_channel_search_with(app, tx, session, runner);
+}
+
+/// 取り直しを頼む。打ち切られても印は残るので、次の入口も控えを出さずに取りに行く。
+fn request_reload(app: &mut App) {
+    let state = app.view_state_mut();
+    state.loaded = false;
+    state.reload = true;
 }
 
 pub fn select_tab(
@@ -706,7 +789,7 @@ pub fn reload_tab_with<R>(
 ) where
     R: YtDlp + Send + Sync + 'static,
 {
-    app.tabs.state_mut().loaded = false;
+    request_reload(app);
     start_tab_search_with(app, tx, session, runner);
 }
 
@@ -864,6 +947,8 @@ fn cancel_search(app: &mut App, session: &mut Session) {
         task.abort();
     }
     session.search_nonce += 1;
+    // 打ち切った検索の結果はもう採用しないので、その控え先も捨てる。
+    session.pending_cache_key = None;
     app.searching = false;
     app.set_notice(None);
     // 一覧が入れ替わる操作では、引いている最中のチャンネルも用済み。
@@ -1195,7 +1280,7 @@ mod tests {
     use super::*;
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::comments::CommentState;
-    use crate::cookies::{ChannelTab, CookieSource, CookieState};
+    use crate::cookies::{ChannelTab, CookieSource, CookieState, Feed};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::oauth::fixtures::FakeBackend;
@@ -3431,6 +3516,314 @@ mod tests {
         reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
         assert!(session.search_task.is_some());
         assert!(!app.tabs.state().loaded);
+    }
+
+    /// キャッシュを効かせた検索画面。サムネイルは別の話なので取りに行かせない。
+    fn cache_app(ttl_secs: u64) -> App {
+        let mut app = App {
+            query: QueryEditor::from("ラーメン"),
+            ..App::default()
+        };
+        app.settings.search.cache_enabled = true;
+        app.settings.search.cache_ttl = Duration::from_secs(ttl_secs);
+        app.settings.thumbnails.enabled = false;
+        app
+    }
+
+    /// 取りに行った検索が成功して届いた状態を作る。
+    fn prime_cache(app: &App, session: &mut Session, target: &Target, results: Vec<SearchResult>) {
+        session.pending_cache_key = Some(cache_key(
+            target,
+            app.settings.search.limit,
+            app.cookies.for_search().is_some(),
+        ));
+        remember_search(session, &results, app.settings.search.cache_ttl);
+    }
+
+    fn ramen() -> Target {
+        Target::Search("ラーメン".to_string())
+    }
+
+    #[test]
+    fn the_cache_key_separates_targets_limits_and_cookie_use() {
+        let udon = Target::Search("うどん".to_string());
+        assert_ne!(cache_key(&ramen(), 20, false), cache_key(&udon, 20, false));
+        assert_ne!(
+            cache_key(&ramen(), 20, false),
+            cache_key(&ramen(), 50, false)
+        );
+        assert_ne!(
+            cache_key(&ramen(), 20, false),
+            cache_key(&ramen(), 20, true)
+        );
+        assert_eq!(cache_key(&ramen(), 20, true), cache_key(&ramen(), 20, true));
+
+        let videos = Target::Channel {
+            id: "UCabc".to_string(),
+            tab: ChannelTab::Videos,
+        };
+        let shorts = Target::Channel {
+            id: "UCabc".to_string(),
+            tab: ChannelTab::Shorts,
+        };
+        assert_ne!(cache_key(&videos, 20, false), cache_key(&shorts, 20, false));
+        assert_ne!(
+            cache_key(&videos, 20, false),
+            cache_key(&Target::Feed(Feed::History), 20, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_search_is_served_without_running_yt_dlp() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        prime_cache(&app, &mut session, &ramen(), vec![result("a"), result("b")]);
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none(), "yt-dlp を起動しない");
+        assert!(!app.searching);
+        assert_eq!(app.result_ids(), ["a", "b"]);
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[tokio::test]
+    async fn the_cache_is_ignored_while_the_setting_is_off() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+        app.settings.search.cache_enabled = false;
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_some(), "毎回取り直す");
+        assert!(app.searching);
+        assert!(app.results.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cache_entry_is_served_until_the_ttl_and_refetched_after_it() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(60);
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_none(), "期限内は控えで返す");
+        assert_eq!(app.result_ids(), ["a"]);
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_some(), "期限切れは取り直す");
+        assert!(app.searching);
+    }
+
+    #[tokio::test]
+    async fn reload_ignores_the_cache_and_fetches_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+
+        reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_some(), "r は常に取り直す");
+        assert!(app.searching);
+        assert!(app.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reloading_a_channel_tab_ignores_the_cache() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        app.channel = Some(ChannelView::new(
+            "UCabc".to_string(),
+            "Some Channel".to_string(),
+        ));
+        let target = app.channel.as_ref().expect("channel").target();
+        prime_cache(&app, &mut session, &target, vec![result("a")]);
+
+        reload_channel_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_some(), "r は常に取り直す");
+        assert!(app.view_results().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_search_with_cookies_is_not_served_to_one_without_them() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        app.cookies = CookieState::Active(CookieSource::from_spec(Some("chrome")).expect("spec"));
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+
+        app.cookies = CookieState::Off;
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_some(), "cookie 無しでは取り直す");
+
+        // cookie を戻せば同じ控えが効く。
+        app.cookies = CookieState::Active(CookieSource::from_spec(Some("chrome")).expect("spec"));
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_none());
+        assert_eq!(app.result_ids(), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_leaves_the_cookie_state_alone() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        let armed = CookieState::Armed(CookieSource::from_spec(Some("chrome")).expect("spec"));
+        app.cookies = armed.clone();
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none());
+        assert_eq!(app.cookies, armed, "取りに行っていないので確認もしない");
+    }
+
+    #[tokio::test]
+    async fn a_refused_feed_is_not_served_from_the_cache() {
+        // cookie が外れた後は、cookie 付きで取った控えを出さずに理由を出す。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        app.cookies = CookieState::Active(CookieSource::from_spec(Some("chrome")).expect("spec"));
+        let target = Target::Feed(Feed::History);
+        prime_cache(&app, &mut session, &target, vec![result("a")]);
+
+        app.cookies = CookieState::Off;
+        app.query.set(":ythis");
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none());
+        assert!(app.results.is_empty());
+        assert!(app.error.is_some(), "理由を出す");
+    }
+
+    #[tokio::test]
+    async fn a_search_is_not_kept_while_the_setting_is_off() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        app.settings.search.cache_enabled = false;
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_some());
+        assert!(
+            session.pending_cache_key.is_none(),
+            "off の間は控え先を作らない"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_search_is_kept_while_the_setting_is_on() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert_eq!(
+            session.pending_cache_key,
+            Some(cache_key(&ramen(), app.settings.search.limit, false))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_entries_are_dropped_when_the_next_search_is_kept() {
+        let mut session = Session::default();
+        let app = cache_app(60);
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let udon = Target::Search("うどん".to_string());
+        prime_cache(&app, &mut session, &udon, vec![result("b")]);
+
+        assert_eq!(session.search_cache.len(), 1, "期限切れは残さない");
+        assert!(session.search_cache.contains_key(&cache_key(
+            &udon,
+            app.settings.search.limit,
+            false
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_stops_at_its_capacity_and_drops_the_oldest() {
+        let mut session = Session::default();
+        // 期限では減らない幅にして、上限だけが効いていることを見る。
+        let app = cache_app(3600);
+        let query = |i: usize| Target::Search(format!("q{i}"));
+        let key = |target: &Target| cache_key(target, app.settings.search.limit, false);
+
+        for i in 0..CACHE_CAPACITY + 10 {
+            prime_cache(&app, &mut session, &query(i), vec![result("a")]);
+            // 控えた順を区別できるよう時計を進める。
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+
+        assert_eq!(session.search_cache.len(), CACHE_CAPACITY);
+        assert!(
+            !session.search_cache.contains_key(&key(&query(0))),
+            "古い順に捨てる"
+        );
+        assert!(
+            session
+                .search_cache
+                .contains_key(&key(&query(CACHE_CAPACITY + 9))),
+            "最後に控えたものは残す"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_was_cut_short_still_ignores_the_cache() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        prime_cache(&app, &mut session, &ramen(), vec![result("a")]);
+
+        reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+        // 読み込めないうちに別のタブへ移ると、取り直しは打ち切られる。
+        switch_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+        // 戻って押し直したときも、捨てたはずの控えは出さない。
+        select_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+
+        assert!(session.search_task.is_some(), "取り直しを続ける");
+        assert!(app.results.is_empty());
+
+        // 読み込めたら頼みは果たされる。次からは控えが効く。
+        app.set_results(vec![result("b")], &ramen());
+        assert!(!app.tabs.state().reload);
+        start_tab_search_with(&mut app, &tx, &mut session, StubYtDlp);
+        assert!(session.search_task.is_none());
+        assert_eq!(app.result_ids(), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn a_channel_reload_that_was_cut_short_still_ignores_the_cache() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        app.channel = Some(ChannelView::new(
+            "UCabc".to_string(),
+            "Some Channel".to_string(),
+        ));
+        let target = app.channel.as_ref().expect("channel").target();
+        prime_cache(&app, &mut session, &target, vec![result("a")]);
+
+        reload_channel_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+        // タブを送って打ち切り、押し直しで戻る。
+        switch_channel_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+        select_channel_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+
+        assert!(session.search_task.is_some(), "取り直しを続ける");
+        assert!(app.view_results().is_empty());
     }
 
     #[tokio::test]

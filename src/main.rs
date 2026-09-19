@@ -366,7 +366,7 @@ async fn handle_event(
             }
             session.search_task = None;
             app.searching = false;
-            apply_search_done(app, &target, report);
+            apply_search_done(app, session, &target, report);
             actions::start_thumbnails(app, tx, session);
         }
         AppEvent::MpvProperty { nonce, id, data } => {
@@ -511,7 +511,12 @@ fn apply_channel_lookup_with<R>(
 }
 
 /// cookie の状態を進めてから、結果かエラーを画面へ渡す。
-fn apply_search_done(app: &mut App, target: &Target, report: search::SearchReport) {
+fn apply_search_done(
+    app: &mut App,
+    session: &mut Session,
+    target: &Target,
+    report: search::SearchReport,
+) {
     let armed = matches!(app.cookies, CookieState::Armed(_));
     let source = app.cookies.for_search().cloned();
     // 待った上限は報告から取る。検索中に設定画面で変えられても文言がずれない。
@@ -536,7 +541,10 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
     }
 
     match report.results {
-        Ok(results) => app.set_results(results, target),
+        Ok(results) => {
+            actions::remember_search(session, &results, app.settings.search.cache_ttl);
+            app.set_results(results, target);
+        }
         // 配信タブを持たないチャンネルでは yt-dlp が「そのタブは無い」と言って失敗する。
         // 一覧が無いだけなので、タブごとの文言に寄せて 0 件として扱う。
         // 起動失敗・通信失敗・タイムアウトはここへ入れない。原因が画面から消える。
@@ -961,6 +969,109 @@ mod tests {
         assert_eq!(app.mode, Mode::Results);
         assert!(!app.searching);
         assert!(app.notice.is_none());
+    }
+
+    /// 取りに行った検索の鍵を控えた状態。設定が on のとき spawn_search が置いていくもの。
+    fn pending_key(app: &App, session: &mut Session, target: &Target) {
+        session.pending_cache_key = Some(actions::cache_key(
+            target,
+            app.settings.search.limit,
+            app.cookies.for_search().is_some(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_successful_search_is_remembered() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            ..App::default()
+        };
+        app.settings.search.cache_enabled = true;
+        let target = Target::Search("q".to_string());
+        pending_key(&app, &mut session, &target);
+
+        handle_event(
+            &mut app,
+            search_done(1, CookieOutcome::NotUsed, Ok(vec![result("a")])),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        let key = actions::cache_key(&target, app.settings.search.limit, false);
+        let entry = session.search_cache.get(&key).expect("控える");
+        assert_eq!(entry.results, vec![result("a")]);
+        assert!(session.pending_cache_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_search_is_not_remembered() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            ..App::default()
+        };
+        pending_key(&app, &mut session, &Target::Search("q".to_string()));
+
+        handle_event(
+            &mut app,
+            search_done(
+                1,
+                CookieOutcome::TimedOut,
+                Err("検索がタイムアウトしました (30 秒)".to_string()),
+            ),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(session.search_cache.is_empty(), "失敗は控えない");
+    }
+
+    #[tokio::test]
+    async fn a_feed_that_needs_a_login_is_not_remembered() {
+        // 結果は 0 件で返るが、出すのは理由。控えると次回その理由が出なくなる。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            cookies: CookieState::Active(source()),
+            ..App::default()
+        };
+        let target = Target::Feed(cookies::Feed::History);
+        pending_key(&app, &mut session, &target);
+
+        handle_event(
+            &mut app,
+            AppEvent::SearchDone {
+                nonce: 1,
+                target,
+                report: SearchReport {
+                    results: Ok(Vec::new()),
+                    outcome: CookieOutcome::LoginRequired,
+                    fell_back: false,
+                    timeout: search::YT_DLP_TIMEOUT,
+                },
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(session.search_cache.is_empty());
+        assert!(app.error.is_some(), "理由を出す");
     }
 
     #[test]

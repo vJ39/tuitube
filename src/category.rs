@@ -42,6 +42,9 @@ pub struct TabState {
     pub selected: usize,
     pub scroll: usize,
     pub loaded: bool,
+    /// r で取り直しを頼まれた印。読み込めるまで下りないので、途中で打ち切っても
+    /// 次の入口が控えを出さない。
+    pub reload: bool,
 }
 
 #[derive(Debug)]
