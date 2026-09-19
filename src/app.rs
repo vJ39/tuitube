@@ -1579,7 +1579,7 @@ mod tests {
         }
         assert_eq!(settings.search.limit, MIN_SEARCH_LIMIT);
 
-        for _ in 0..100 {
+        for _ in 0..(MAX_SEARCH_LIMIT + 10) {
             SettingsItem::SearchLimit.adjust(&mut settings, 1);
         }
         assert_eq!(settings.search.limit, MAX_SEARCH_LIMIT);

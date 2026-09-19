@@ -25,7 +25,7 @@ pub const MAX_FRAME_PIXELS_LIMIT: u32 = 3840 * 2160;
 /// 1 回の検索で取る件数 (ytsearchN の N)。
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MIN_SEARCH_LIMIT: usize = 1;
-pub const MAX_SEARCH_LIMIT: usize = 50;
+pub const MAX_SEARCH_LIMIT: usize = 1000;
 /// 起動時にディスクキャッシュへ残す枚数。
 pub const DEFAULT_MAX_CACHED: usize = 500;
 /// サムネイル 1 枚あたりのダウンロード上限秒数。
@@ -1745,8 +1745,16 @@ mod tests {
     }
 
     #[test]
+    fn the_search_limit_upper_bound_is_1000() {
+        assert_eq!(MAX_SEARCH_LIMIT, 1000);
+        let text = "[search]\nlimit = 1000\n";
+        assert_eq!(settings_of(text).search.limit, 1000);
+        assert!(notices_of(text).is_empty(), "上限ちょうどは丸めない");
+    }
+
+    #[test]
     fn a_search_limit_outside_the_range_is_rounded_with_a_notice() {
-        for (raw, expected) in [(0, MIN_SEARCH_LIMIT), (51, MAX_SEARCH_LIMIT), (-3, 1)] {
+        for (raw, expected) in [(0, MIN_SEARCH_LIMIT), (1001, MAX_SEARCH_LIMIT), (-3, 1)] {
             let text = format!("[search]\nlimit = {raw}\n");
             assert_eq!(settings_of(&text).search.limit, expected, "{text}");
             let notice = notices_of(&text).join(" / ");
