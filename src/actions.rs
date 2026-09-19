@@ -37,6 +37,9 @@ pub const COPIED_NOTICE: &str = "URL をコピーしました";
 pub const CHANNEL_LOOKUP_NOTICE: &str = "チャンネル情報を取得中…";
 /// 引いても channel_id が無かったときの文言。
 pub const NO_CHANNEL_NOTICE: &str = "このチャンネルへは移動できません";
+/// 非表示にしたことを伝える文言。
+pub const HIDDEN_VIDEO_NOTICE: &str = "この動画を非表示にしました";
+pub const HIDDEN_CHANNEL_NOTICE: &str = "このチャンネルを非表示にしました";
 /// 設定ファイルの置き場を決められないときの理由。$HOME も $XDG_CONFIG_HOME も無い環境。
 pub const NO_CONFIG_PATH: &str = "設定ファイルの置き場が分かりません ($HOME を設定してください)";
 
@@ -471,6 +474,46 @@ fn cancel_oauth(session: &mut Session) {
 }
 
 /// チャンネル一覧を抜けて検索結果へ戻る。
+/// 選択中の動画を非表示にする。書けた分だけ今の一覧からも消える。
+pub fn hide_selected(app: &mut App, now: std::time::Instant) {
+    let Some(result) = app.view_selected_result() else {
+        return;
+    };
+    let (id, title) = (result.id.clone(), result.title.clone());
+    match app.hidden.add_video(&id, &title) {
+        Ok(()) => {
+            app.drop_hidden();
+            app.set_temporary_notice(HIDDEN_VIDEO_NOTICE.to_string(), now);
+            // 最後の 1 件を隠したら見るものが無い。空の格子に留めず検索欄へ戻す。
+            if app.channel.is_none() && app.results.is_empty() {
+                app.enter_search_mode(Mode::Input);
+            }
+        }
+        Err(e) => app.set_temporary_error(hide_failed(&e), now),
+    }
+}
+
+/// 表示中のチャンネルを非表示にして検索側へ戻る。そのチャンネルの動画は全部消えるため。
+pub fn hide_current_channel(app: &mut App, session: &mut Session, now: std::time::Instant) {
+    let Some(channel) = app.channel.as_ref() else {
+        return;
+    };
+    let (id, title) = (channel.channel_id.clone(), channel.channel_title.clone());
+    match app.hidden.add_channel(&id, &title) {
+        Ok(()) => {
+            // 戻り先の判断は絞り込んだ後の件数で決める。
+            app.drop_hidden();
+            leave_channel(app, session);
+            app.set_temporary_notice(HIDDEN_CHANNEL_NOTICE.to_string(), now);
+        }
+        Err(e) => app.set_temporary_error(hide_failed(&e), now),
+    }
+}
+
+fn hide_failed(reason: &str) -> String {
+    format!("非表示リストを保存できません: {reason}")
+}
+
 pub fn leave_channel(app: &mut App, session: &mut Session) {
     if app.channel.is_none() {
         return;
@@ -3985,5 +4028,215 @@ mod tests {
 
         scroll_comments(&mut app, CommentScroll::Page(1));
         assert_eq!(app.comments.scroll(1, 19), 0);
+    }
+
+    /// 利用者の非表示リストを触らないよう、一時ディレクトリを追記先にする。
+    fn hidden_at(name: &str) -> (crate::hidden::Hidden, std::path::PathBuf) {
+        let path = settings_temp_dir(name).join("hidden.toml");
+        (crate::hidden::load_from(Some(&path)), path)
+    }
+
+    fn hidden_ids(path: &Path) -> crate::hidden::Hidden {
+        crate::hidden::load_from(Some(path))
+    }
+
+    #[test]
+    fn hiding_the_selected_video_writes_it_and_takes_it_off_the_list() {
+        let (hidden, path) = hidden_at("hide-video");
+        let mut app = App {
+            hidden,
+            ..channel_grid_app()
+        };
+        app.selected = 1;
+
+        hide_selected(&mut app, std::time::Instant::now());
+
+        assert_eq!(app.result_ids(), ["id0"], "その場で消える");
+        assert!(app.hidden.videos.contains("id1"));
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert!(written.contains("id1"), "{written}");
+        assert!(
+            written.contains("title id1"),
+            "見返す用の題名も書く: {written}"
+        );
+        assert_eq!(app.notice.as_deref(), Some(HIDDEN_VIDEO_NOTICE));
+        assert!(app.notice_until.is_some(), "期限つきで出す");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn hiding_clamps_the_selection_to_what_is_left() {
+        let (hidden, _path) = hidden_at("hide-last");
+        let mut app = App {
+            hidden,
+            ..grid_app(3)
+        };
+        app.selected = 2;
+
+        hide_selected(&mut app, std::time::Instant::now());
+
+        assert_eq!(app.result_ids(), ["id0", "id1"]);
+        assert_eq!(app.selected, 1, "末尾を消したら手前へ寄せる");
+    }
+
+    #[test]
+    fn hiding_the_last_row_goes_back_to_the_search_box() {
+        let (hidden, _path) = hidden_at("hide-only");
+        let mut app = App {
+            hidden,
+            ..grid_app(1)
+        };
+
+        hide_selected(&mut app, std::time::Instant::now());
+
+        assert!(app.results.is_empty());
+        assert_eq!(app.mode, Mode::Input, "空の格子に留めない");
+        assert_eq!(app.notice.as_deref(), Some(HIDDEN_VIDEO_NOTICE));
+    }
+
+    #[test]
+    fn hiding_a_row_in_a_channel_stays_in_the_channel() {
+        let (hidden, _path) = hidden_at("hide-in-channel");
+        let mut app = App {
+            hidden,
+            ..channel_grid_app()
+        };
+        app.channel = Some(ChannelView::new(
+            "UCone".to_string(),
+            "One Channel".to_string(),
+        ));
+        app.channel.as_mut().expect("channel").state_mut().results = vec![result("only")];
+        app.mode = Mode::Channel;
+        app.sync_from_view();
+
+        hide_selected(&mut app, std::time::Instant::now());
+
+        assert!(app.view_results().is_empty());
+        assert_eq!(app.mode, Mode::Channel, "Esc で戻れる画面のままにする");
+    }
+
+    #[test]
+    fn hiding_stays_hidden_on_the_next_search() {
+        let (hidden, _path) = hidden_at("hide-next-search");
+        let mut app = App {
+            hidden,
+            ..grid_app(2)
+        };
+
+        hide_selected(&mut app, std::time::Instant::now());
+        // 同じ動画を含む検索が返ってきても、もう並ばない。
+        app.set_results(
+            vec![result("id0"), result("id9")],
+            &Target::Search("q".to_string()),
+        );
+
+        assert_eq!(app.result_ids(), ["id9"]);
+    }
+
+    #[test]
+    fn hiding_without_a_selection_does_nothing() {
+        let (hidden, path) = hidden_at("hide-empty");
+        let mut app = App {
+            hidden,
+            ..App::default()
+        };
+
+        hide_selected(&mut app, std::time::Instant::now());
+
+        assert!(!path.exists(), "空振りでファイルを作らない");
+        assert!(app.notice.is_none());
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn a_hide_that_cannot_be_written_reports_the_reason_and_keeps_the_row() {
+        let dir = settings_temp_dir("hide-blocked");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "ファイルなので中に書けない").expect("書ける");
+        let mut app = App {
+            hidden: crate::hidden::load_from(Some(&blocker.join("hidden.toml"))),
+            ..grid_app(2)
+        };
+
+        hide_selected(&mut app, std::time::Instant::now());
+
+        assert_eq!(app.result_ids(), ["id0", "id1"], "消せていないので残す");
+        assert!(app.hidden.videos.is_empty());
+        let error = app.error.clone().expect("理由を出す");
+        assert!(error.contains("非表示"), "{error}");
+        assert!(app.error_until.is_some(), "期限つきで出す");
+    }
+
+    #[test]
+    fn hiding_the_channel_writes_it_and_returns_to_the_results() {
+        let (hidden, path) = hidden_at("hide-channel");
+        let mut session = Session::default();
+        let mut app = App {
+            hidden,
+            ..channel_grid_app()
+        };
+        // id0 の Channel へ移ってから隠す。
+        app.store_to_tab();
+        app.channel = Some(ChannelView::new(
+            "UCone".to_string(),
+            "One Channel".to_string(),
+        ));
+        app.mode = Mode::Channel;
+        app.sync_from_view();
+
+        hide_current_channel(&mut app, &mut session, std::time::Instant::now());
+
+        assert!(app.channel.is_none(), "チャンネルから出る");
+        assert_eq!(app.mode, Mode::Results);
+        assert!(app.hidden.channels.contains("UCone"));
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert!(written.contains("UCone"), "{written}");
+        assert!(written.contains("One Channel"), "{written}");
+        assert_eq!(app.notice.as_deref(), Some(HIDDEN_CHANNEL_NOTICE));
+        // 同じチャンネルの他の動画も検索結果から消える。
+        assert_eq!(app.result_ids(), ["id1"]);
+        assert_eq!(hidden_ids(&path).channels.len(), 1);
+    }
+
+    #[test]
+    fn hiding_the_channel_of_every_result_leaves_the_search_box() {
+        let (hidden, _path) = hidden_at("hide-channel-all");
+        let mut session = Session::default();
+        let mut app = App {
+            hidden,
+            ..channel_grid_app()
+        };
+        app.tabs.state_mut().results = vec![SearchResult {
+            channel_id: Some("UCone".to_string()),
+            ..result("id0")
+        }];
+        app.sync_from_tab();
+        app.channel = Some(ChannelView::new(
+            "UCone".to_string(),
+            "One Channel".to_string(),
+        ));
+        app.mode = Mode::Channel;
+
+        hide_current_channel(&mut app, &mut session, std::time::Instant::now());
+
+        assert!(app.results.is_empty());
+        assert_eq!(app.mode, Mode::Input, "見るものが無ければ検索欄へ戻す");
+        assert_eq!(app.notice.as_deref(), Some(HIDDEN_CHANNEL_NOTICE));
+    }
+
+    #[test]
+    fn hiding_a_channel_outside_the_channel_view_does_nothing() {
+        let (hidden, path) = hidden_at("hide-channel-none");
+        let mut session = Session::default();
+        let mut app = App {
+            hidden,
+            ..grid_app(2)
+        };
+
+        hide_current_channel(&mut app, &mut session, std::time::Instant::now());
+
+        assert!(!path.exists());
+        assert!(app.notice.is_none());
+        assert_eq!(app.result_ids(), ["id0", "id1"]);
     }
 }

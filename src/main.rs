@@ -8,6 +8,7 @@ mod display;
 mod fetch;
 mod geometry;
 mod grid;
+mod hidden;
 mod input;
 mod jpeg;
 mod kitty;
@@ -86,8 +87,9 @@ fn install_mouse_panic_hook() {
 }
 
 /// 読んだ設定から画面側の初期状態を組む。環境変数の上書きもここで持ち回す。
-fn app_from(loaded: settings::Loaded) -> App {
+fn app_from(loaded: settings::Loaded, hidden: hidden::Hidden) -> App {
     App {
+        hidden,
         display: loaded.settings.display.mode,
         // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
         cookies: CookieState::from_source(loaded.settings.cookies.clone()),
@@ -107,7 +109,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     spawn_input_reader(tx.clone());
 
     // 設定は起動時に一度だけ読む。読み替えたときは notice がステータス行に出る。
-    let mut app = app_from(settings::load());
+    let mut app = app_from(settings::load(), hidden::load());
     if let Some(dir) = app.settings.thumbnails.dir() {
         thumbs::prune_cache(&dir, app.settings.thumbnails.max_cached);
     }
@@ -979,7 +981,7 @@ mod tests {
                 ..settings::EnvOverrides::default()
             },
         );
-        let mut app = app_from(loaded);
+        let mut app = app_from(loaded, hidden::Hidden::default());
         assert_eq!(app.settings.cookies, None, "実行中は連携を切る");
 
         actions::save_settings_to(&mut app, Some(&path), std::time::Instant::now());
@@ -991,6 +993,21 @@ mod tests {
             CookieSource::from_spec(Some("chrome")),
             "{written}"
         );
+    }
+
+    #[test]
+    fn the_hidden_list_is_read_at_startup() {
+        let dir = std::env::temp_dir().join(format!("tuitube-main-hidden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("hidden.toml");
+        std::fs::write(&path, "[[videos]]\nid = \"v1\"\ntitle = \"動画\"\n").expect("書ける");
+
+        let loaded = settings::load_from(None, settings::EnvOverrides::default());
+        let app = app_from(loaded, hidden::load_from(Some(&path)));
+
+        assert!(app.hidden.videos.contains("v1"), "起動時に読み込む");
+        assert_eq!(app.hidden.path.as_deref(), Some(path.as_path()));
     }
 
     /// 検索中に S を押した形。裏で検索が終わっても設定画面は開いたままにする。

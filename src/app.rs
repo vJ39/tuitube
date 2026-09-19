@@ -2,6 +2,7 @@ use crate::category::{TabState, Tabs};
 use crate::comments::{Comment, Comments};
 use crate::cookies::{ChannelTab, CookieState, Target};
 use crate::display::{DisplayMode, FpsCap};
+use crate::hidden::Hidden;
 use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
 use crate::rgb::RgbImage;
@@ -509,6 +510,8 @@ pub struct App {
     pub settings_edit: Option<String>,
     /// 環境変数が上書きしている項目。画面の断りと、保存時の書き戻しに使う。
     pub env_overridden: EnvOverridden,
+    /// ローカル非表示リスト。一覧へ入れる前にここで外す。
+    pub hidden: Hidden,
 }
 
 impl Default for App {
@@ -547,8 +550,30 @@ impl Default for App {
             settings_return: Mode::Input,
             settings_edit: None,
             env_overridden: EnvOverridden::default(),
+            hidden: Hidden::default(),
         }
     }
+}
+
+/// 非表示になった行を落とし、選択と表示位置を残りへ合わせる。
+fn retain_visible(state: &mut TabState, hidden: &Hidden) {
+    let before = state.results.len();
+    let selected_id = state
+        .results
+        .get(state.selected)
+        .map(|result| result.id.clone());
+    state.results.retain(|result| !hidden.hides(result));
+    if state.results.len() == before {
+        return;
+    }
+    // 選んでいた動画が残っていればそこへ。消えていれば同じ位置の次の行へ送る。
+    // 添字だけで丸めると、手前の行が消えたときに別の動画へ移る。
+    let last = state.results.len().saturating_sub(1);
+    state.selected = selected_id
+        .and_then(|id| state.results.iter().position(|result| result.id == id))
+        .unwrap_or_else(|| state.selected.min(last));
+    // 選択より後ろから描き始めると、残った行を飛び越したまま画面に出る。
+    state.scroll = state.scroll.min(state.selected);
 }
 
 impl App {
@@ -658,6 +683,10 @@ impl App {
     }
 
     pub fn set_results(&mut self, results: Vec<SearchResult>, target: &Target) {
+        let results: Vec<SearchResult> = results
+            .into_iter()
+            .filter(|result| !self.hidden.hides(result))
+            .collect();
         match &mut self.channel {
             Some(channel) => {
                 let state = channel.state_mut();
@@ -744,6 +773,23 @@ impl App {
         let ids = self.view_result_ids();
         self.thumbs.reset(&ids);
         self.thumbs.mark_dirty();
+    }
+
+    /// 非表示にした行を、開いている一覧からも取り除く。次の検索を待たずに消すため。
+    pub fn drop_hidden(&mut self) {
+        // 選択位置は App 側が持っている。先に書き戻さないと取り込みで巻き戻る。
+        if self.channel.is_none() {
+            self.store_to_tab();
+        }
+        for state in self.tabs.states_mut() {
+            retain_visible(state, &self.hidden);
+        }
+        if let Some(channel) = self.channel.as_mut() {
+            for state in &mut channel.states {
+                retain_visible(state, &self.hidden);
+            }
+        }
+        self.sync_from_view();
     }
 
     /// 画面から離れる前に、タブへ選択位置を書き戻す。
@@ -2305,5 +2351,212 @@ mod tests {
         // 保存に失敗した理由はエラーとして出す。
         app.set_temporary_error("保存できません".to_string(), t0);
         assert_eq!(app.status_line(), "エラー: 保存できません");
+    }
+
+    fn from_channel(id: &str, channel_id: &str) -> SearchResult {
+        SearchResult {
+            channel_id: Some(channel_id.to_string()),
+            ..result(id)
+        }
+    }
+
+    fn hiding(videos: &[&str], channels: &[&str]) -> Hidden {
+        Hidden {
+            videos: videos.iter().map(|id| id.to_string()).collect(),
+            channels: channels.iter().map(|id| id.to_string()).collect(),
+            ..Hidden::default()
+        }
+    }
+
+    fn by_uploader(id: &str, uploader: &str) -> SearchResult {
+        SearchResult {
+            uploader: Some(uploader.to_string()),
+            ..result(id)
+        }
+    }
+
+    #[test]
+    fn set_results_drops_the_hidden_videos_and_channels() {
+        let mut app = App {
+            hidden: hiding(&["v1"], &["UC1"]),
+            ..App::default()
+        };
+        app.set_results(
+            vec![
+                result("v1"),
+                from_channel("v2", "UC1"),
+                from_channel("v3", "UC9"),
+                result("v4"),
+            ],
+            &search_target(),
+        );
+
+        assert_eq!(app.result_ids(), ["v3", "v4"]);
+        assert_eq!(
+            app.tabs.state().results.len(),
+            2,
+            "タブ側も絞った結果を持つ"
+        );
+        assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[test]
+    fn set_results_where_everything_is_hidden_ends_up_empty() {
+        let mut app = App {
+            hidden: hiding(&["v1"], &[]),
+            ..App::default()
+        };
+        app.set_results(vec![result("v1")], &search_target());
+
+        assert!(app.results.is_empty());
+        assert!(app.error.is_some(), "0 件として扱う");
+        assert_eq!(app.mode, Mode::Input);
+    }
+
+    #[test]
+    fn set_results_drops_hidden_rows_from_a_channel_tab_too() {
+        let mut app = channel_app();
+        app.hidden = hiding(&["v1"], &[]);
+        app.set_results(
+            vec![result("v1"), result("v2")],
+            &Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Videos,
+            },
+        );
+
+        assert_eq!(app.view_result_ids(), ["v2"]);
+    }
+
+    #[test]
+    fn dropping_hidden_takes_them_out_of_the_open_list() {
+        let mut app = App::default();
+        app.set_results(
+            vec![result("v1"), result("v2"), from_channel("v3", "UC1")],
+            &search_target(),
+        );
+        app.selected = 2;
+        app.scroll = 2;
+
+        app.hidden = hiding(&["v1"], &["UC1"]);
+        app.drop_hidden();
+
+        assert_eq!(app.result_ids(), ["v2"], "次の検索を待たずに消える");
+        assert_eq!(app.tabs.state().results.len(), 1);
+        assert_eq!(app.selected, 0, "残りの件数へ丸める");
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn dropping_hidden_keeps_the_selection_the_user_moved_to() {
+        let mut app = App::default();
+        app.set_results(
+            vec![result("v1"), result("v2"), result("v3")],
+            &search_target(),
+        );
+        // タブへ書き戻していない選択位置。取り込みで巻き戻してはいけない。
+        app.selected = 2;
+
+        app.hidden = hiding(&["v1"], &[]);
+        app.drop_hidden();
+
+        assert_eq!(app.result_ids(), ["v2", "v3"]);
+        assert_eq!(app.selected, 1, "見ていた v3 を選んだまま");
+    }
+
+    #[test]
+    fn dropping_hidden_reaches_the_channel_tabs_and_the_search_side() {
+        let mut app = channel_app();
+        app.channel.as_mut().expect("channel").state_mut().results =
+            vec![from_channel("v1", "UCabc"), result("v2")];
+
+        app.hidden = hiding(&["a"], &["UCabc"]);
+        app.drop_hidden();
+
+        assert_eq!(app.view_result_ids(), ["v2"], "チャンネルの一覧から外す");
+        // 検索側のタブは a / b を持っていた。戻ったときには a が消えている。
+        assert_eq!(app.tabs.state().results.len(), 1);
+    }
+
+    #[test]
+    fn set_results_drops_rows_that_only_carry_the_channel_name() {
+        // フィード系の行は channel_id を持たない。名前で外さないと隠したチャンネルが残る。
+        let mut hidden = hiding(&[], &["UC1"]);
+        hidden.channel_names.insert("One Channel".to_string());
+        let mut app = App {
+            hidden,
+            ..App::default()
+        };
+        app.set_results(
+            vec![
+                by_uploader("v1", "One Channel"),
+                by_uploader("v2", "Another Channel"),
+            ],
+            &search_target(),
+        );
+
+        assert_eq!(app.result_ids(), ["v2"]);
+    }
+
+    #[test]
+    fn dropping_hidden_keeps_the_selection_on_the_same_video() {
+        let mut app = App::default();
+        app.set_results(
+            vec![from_channel("v1", "UC1"), result("v2"), result("v3")],
+            &search_target(),
+        );
+        // 選んでいるのは v2。手前の v1 が消えても v2 のままにする。
+        app.selected = 1;
+
+        app.hidden = hiding(&[], &["UC1"]);
+        app.drop_hidden();
+
+        assert_eq!(app.result_ids(), ["v2", "v3"]);
+        assert_eq!(app.selected, 0, "選んでいた v2 を選んだまま");
+    }
+
+    #[test]
+    fn dropping_hidden_pulls_the_scroll_back_to_the_selection() {
+        let mut app = App::default();
+        let mut results = vec![from_channel("v0", "UC1")];
+        results.extend((1..20).map(|n| result(&format!("v{n}"))));
+        app.set_results(results, &search_target());
+        app.selected = 12;
+        app.scroll = 12;
+
+        // 先頭の 1 件だけ消えても、表示位置が選択より後ろに残ると残りを飛び越す。
+        app.hidden = hiding(&[], &["UC1"]);
+        app.drop_hidden();
+
+        assert_eq!(app.selected, 11, "v12 を選んだまま");
+        assert!(app.scroll <= app.selected, "選択より前から描き始める");
+    }
+
+    #[test]
+    fn dropping_hidden_from_the_middle_does_not_skip_the_rest() {
+        let mut app = App::default();
+        let mut results: Vec<SearchResult> = (0..5).map(|n| result(&format!("v{n}"))).collect();
+        results.extend((5..20).map(|n| from_channel(&format!("v{n}"), "UC1")));
+        app.set_results(results, &search_target());
+        app.selected = 2;
+        app.scroll = 12;
+
+        app.hidden = hiding(&[], &["UC1"]);
+        app.drop_hidden();
+
+        assert_eq!(app.results.len(), 5);
+        assert_eq!(app.selected, 2);
+        assert_eq!(app.scroll, 2, "残り 5 件の後ろから描き始めない");
+    }
+
+    #[test]
+    fn dropping_hidden_with_nothing_hidden_changes_nothing() {
+        let mut app = App::default();
+        app.set_results(vec![result("v1"), result("v2")], &search_target());
+        app.selected = 1;
+        app.drop_hidden();
+
+        assert_eq!(app.result_ids(), ["v1", "v2"]);
+        assert_eq!(app.selected, 1);
     }
 }

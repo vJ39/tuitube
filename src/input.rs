@@ -2,11 +2,12 @@
 
 use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
-    close_settings, copy_url_with, cycle_display_mode, leave_channel, like_video, move_selection,
-    move_settings_selection, open_channel, open_settings, reload_channel_tab, reload_tab,
-    reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative, select_channel_tab,
-    select_tab, send_to_player, start_playback, start_search, stop_playback, subscribe_channel,
-    switch_channel_tab, switch_tab, toggle_comments, toggle_subtitles,
+    close_settings, copy_url_with, cycle_display_mode, hide_current_channel, hide_selected,
+    leave_channel, like_video, move_selection, move_settings_selection, open_channel,
+    open_settings, reload_channel_tab, reload_tab, reset_speed, save_settings, scroll_comments,
+    seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player, start_playback,
+    start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
+    toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -99,6 +100,7 @@ async fn handle_key_results(
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Char('c') => open_channel(app, tx, session),
+        KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
             app.set_error(None);
@@ -139,6 +141,7 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         // 取りそこねたタブはここからしか戻せない。タブを送り直しても読み込み済みのまま。
         KeyCode::Char('r') => reload_channel_tab(app, tx, session),
         KeyCode::Char('s') => subscribe_channel(app, tx, session, deps),
+        KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
         KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
         KeyCode::Char('q') => app.should_quit = true,
         _ => {}
@@ -2671,6 +2674,110 @@ mod tests {
         assert_eq!(app.settings, crate::settings::Settings::default());
         assert_eq!(app.tabs.selected(), 0);
         assert!(!take_search(&mut session));
+    }
+
+    /// 利用者の非表示リストを触らないよう、一時ディレクトリを追記先にする。
+    fn hiding_app(name: &str) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "tuitube-input-hidden-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = App {
+            hidden: crate::hidden::load_from(Some(&dir.join("hidden.toml"))),
+            ..App::default()
+        };
+        let results = vec![
+            SearchResult {
+                channel_id: Some("UC1".to_string()),
+                ..result("v1")
+            },
+            result("v2"),
+        ];
+        app.set_results(results, &crate::cookies::Target::Search("q".to_string()));
+        app
+    }
+
+    fn hiding_channel_app(name: &str) -> App {
+        let mut app = hiding_app(name);
+        app.store_to_tab();
+        app.channel = Some(ChannelView::new("UC1".to_string(), "One".to_string()));
+        app.mode = Mode::Channel;
+        app.sync_from_view();
+        app
+    }
+
+    #[tokio::test]
+    async fn h_hides_the_selected_result() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = hiding_app("results");
+        app.selected = 1;
+
+        handle_key_results(&mut app, key(KeyCode::Char('h')), &tx, &mut session).await;
+
+        assert_eq!(app.result_ids(), ["v1"], "押した場で消える");
+        assert!(app.hidden.videos.contains("v2"));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(crate::actions::HIDDEN_VIDEO_NOTICE)
+        );
+        assert_eq!(app.mode, Mode::Results, "一覧に留まる");
+        assert!(!take_search(&mut session), "検索は走らない");
+    }
+
+    #[tokio::test]
+    async fn h_in_the_results_does_not_open_the_channel() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = hiding_app("results-not-c");
+
+        // c はチャンネルへ移る。h は同じ行に対して非表示にするだけ。
+        handle_key_results(&mut app, key(KeyCode::Char('h')), &tx, &mut session).await;
+
+        assert!(app.channel.is_none());
+        assert!(!take_channel_lookup(&mut session));
+    }
+
+    #[tokio::test]
+    async fn h_in_a_channel_hides_it_and_goes_back_to_the_results() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = hiding_channel_app("channel");
+
+        handle_key_channel_with(
+            &mut app,
+            key(KeyCode::Char('h')),
+            &tx,
+            &mut session,
+            fake_oauth(),
+        )
+        .await;
+
+        assert!(app.channel.is_none(), "チャンネルから出る");
+        assert_eq!(app.mode, Mode::Results);
+        assert!(app.hidden.channels.contains("UC1"));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(crate::actions::HIDDEN_CHANNEL_NOTICE)
+        );
+        // 同じチャンネルの動画は検索側の一覧からも消える。
+        assert_eq!(app.result_ids(), ["v2"]);
+        assert!(session.oauth_task.is_none(), "登録 (s) とは別の操作");
+    }
+
+    #[tokio::test]
+    async fn h_is_not_taken_by_the_other_screens() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        // 再生中の h は今までどおり何もしない。
+        let mut app = playing_app();
+        handle_key_playing(&mut app, key(KeyCode::Char('h')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert!(app.notice.is_none());
+        assert!(app.hidden.videos.is_empty());
     }
 
     #[tokio::test]

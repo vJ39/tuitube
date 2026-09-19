@@ -283,18 +283,18 @@ pub struct Validated {
     pub notices: Vec<String>,
 }
 
-/// `$XDG_CONFIG_HOME/tuitube/config.toml` か `$HOME/.config/tuitube/config.toml`。
-pub fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+/// `$XDG_CONFIG_HOME/tuitube` か `$HOME/.config/tuitube`。非表示リストもここへ並べる。
+pub fn app_config_dir(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
     if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
-        return Some(Path::new(xdg).join(APP_DIR).join(CONFIG_FILE));
+        return Some(Path::new(xdg).join(APP_DIR));
     }
     let home = home.filter(|v| !v.is_empty())?;
-    Some(
-        Path::new(home)
-            .join(".config")
-            .join(APP_DIR)
-            .join(CONFIG_FILE),
-    )
+    Some(Path::new(home).join(".config").join(APP_DIR))
+}
+
+/// `$XDG_CONFIG_HOME/tuitube/config.toml` か `$HOME/.config/tuitube/config.toml`。
+pub fn config_path(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    Some(app_config_dir(xdg_config_home, home)?.join(CONFIG_FILE))
 }
 
 pub fn parse(text: &str) -> Result<RawConfig, String> {

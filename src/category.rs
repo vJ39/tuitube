@@ -140,6 +140,11 @@ impl Tabs {
     pub fn state_mut(&mut self) -> &mut TabState {
         &mut self.states[self.selected]
     }
+
+    /// 開いているすべてのタブ。まとめて絞り込むときだけ使う。
+    pub fn states_mut(&mut self) -> &mut [TabState] {
+        &mut self.states
+    }
 }
 
 #[cfg(test)]

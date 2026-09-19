@@ -740,29 +740,33 @@ fn input_hints() -> Vec<String> {
     ]
 }
 
-/// 結果一覧の案内。80 桁端末に収まる範囲まで出る。
+/// 結果一覧の案内。ちょうど 80 桁で、80 桁端末に全部入る。
+/// h は押さないと気づけないので、矢印と Esc の言葉を削ってでも入れる。
 fn results_hints() -> Vec<String> {
     vec![
-        "↑↓←→:選択".to_string(),
+        "↑↓←→".to_string(),
         "Enter:再生".to_string(),
         "c:チャンネル".to_string(),
+        "h:隠す".to_string(),
         "Tab:カテゴリ".to_string(),
         "r:再取得".to_string(),
-        "Esc:検索へ".to_string(),
+        "Esc:検索".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ]
 }
 
-/// チャンネル一覧の案内。結果一覧と同じ操作で、タブがチャンネル内の 3 つになる。
-/// 全部で 77 桁ほどで 80 桁端末に収まる。
+/// チャンネル一覧の案内。全部で 79 桁で 80 桁端末に収まる。
+/// タブの案内が長いので、矢印は結果一覧の案内に任せて落としてある。
+/// h はこのチャンネルごと隠す。
 fn channel_hints() -> Vec<String> {
     vec![
-        "↑↓←→:選択".to_string(),
         "Enter:再生".to_string(),
         "Tab:動画/ショート/配信".to_string(),
+        "s:登録".to_string(),
+        "h:隠す".to_string(),
         "r:再取得".to_string(),
-        "Esc:結果へ".to_string(),
+        "Esc:戻る".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ]
@@ -1592,6 +1596,26 @@ mod tests {
         for key in ["r:再取得", "S:設定"] {
             assert!(help.contains(key), "{key} が無い: {help}");
         }
+    }
+
+    #[test]
+    fn the_results_help_names_the_hide_key() {
+        // 非表示リストを見る画面が無いので、案内に出ないと h に気づけない。
+        // h を足すぶん言葉を削ってあるので、他の案内が落ちていないことまで見る。
+        let help = help_80(Mode::Results, DisplayMode::Embedded);
+        for key in ["h:隠す", "Esc:検索", "q:終了", "S:設定"] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
+        assert!(grid::display_width(&help) <= 80, "{help}");
+    }
+
+    #[test]
+    fn the_channel_help_names_the_hide_and_subscribe_keys() {
+        let help = help_80(Mode::Channel, DisplayMode::Embedded);
+        for key in ["s:登録", "h:隠す"] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
+        assert!(grid::display_width(&help) <= 80, "{help}");
     }
 
     #[test]
