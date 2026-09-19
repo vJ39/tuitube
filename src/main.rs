@@ -426,14 +426,16 @@ async fn handle_event(
 fn apply_search_done(app: &mut App, target: &Target, report: search::SearchReport) {
     let armed = matches!(app.cookies, CookieState::Armed(_));
     let source = app.cookies.for_search().cloned();
-    app.cookies.observe(&report.outcome);
+    // 待った上限は報告から取る。検索中に設定画面で変えられても文言がずれない。
+    let timeout = report.timeout;
+    app.cookies.observe(&report.outcome, timeout);
 
     if let Some(source) = &source {
         app.set_notice(match &report.outcome {
-            CookieOutcome::Degraded(_) => Some(cookies::describe(&report.outcome, source)),
+            CookieOutcome::Degraded(_) => Some(cookies::describe(&report.outcome, source, timeout)),
             // 「cookie 無しで検索しました」は、実際に出し直せたときだけ言う。
             CookieOutcome::Unreadable(_) if report.fell_back => {
-                Some(cookies::describe(&report.outcome, source))
+                Some(cookies::describe(&report.outcome, source, timeout))
             }
             _ => None,
         });
@@ -451,7 +453,7 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
             // 初回のタイムアウトはキーチェーンのダイアログ待ちの可能性があるので、そちらを案内する。
             app.set_error(match (&report.outcome, &source) {
                 (CookieOutcome::TimedOut, Some(source)) if armed => {
-                    Some(cookies::describe(&report.outcome, source))
+                    Some(cookies::describe(&report.outcome, source, timeout))
                 }
                 _ => Some(e),
             });
@@ -665,6 +667,7 @@ mod tests {
                 results,
                 outcome,
                 fell_back: false,
+                timeout: search::YT_DLP_TIMEOUT,
             },
         }
     }
@@ -816,6 +819,7 @@ mod tests {
                     "could not find chrome cookies database in '/x'".to_string(),
                 ),
                 fell_back: true,
+                timeout: search::YT_DLP_TIMEOUT,
             },
         };
         handle_event(&mut app, event, &tx, &mut session).await;
@@ -826,6 +830,42 @@ mod tests {
         let notice = app.notice.expect("説明を出す");
         assert!(notice.contains("cookie 無しで検索しました"), "{notice}");
         assert!(matches!(app.cookies, CookieState::Suspended { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_names_the_seconds_the_search_actually_waited() {
+        // 検索中に設定画面で秒数を変えても、文言は打ち切った側の秒数で出す。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            cookies: CookieState::Armed(source()),
+            ..App::default()
+        };
+        app.settings.search.timeout = Duration::from_secs(120);
+        let event = AppEvent::SearchDone {
+            nonce: 1,
+            target: Target::Search("q".to_string()),
+            report: SearchReport {
+                results: Err("検索がタイムアウトしました (30 秒)".to_string()),
+                outcome: CookieOutcome::TimedOut,
+                fell_back: false,
+                timeout: Duration::from_secs(30),
+            },
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        let error = app.error.clone().expect("説明を出す");
+        assert!(error.contains("30 秒"), "{error}");
+        assert!(!error.contains("120 秒"), "{error}");
+        let CookieState::Suspended { reason, .. } = &app.cookies else {
+            panic!("停止する");
+        };
+        assert!(reason.contains("30 秒"), "{reason}");
+        assert!(!reason.contains("120 秒"), "{reason}");
     }
 
     #[test]

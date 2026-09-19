@@ -26,6 +26,10 @@ pub const MAX_FRAME_PIXELS_LIMIT: u32 = 3840 * 2160;
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MIN_SEARCH_LIMIT: usize = 1;
 pub const MAX_SEARCH_LIMIT: usize = 1000;
+/// yt-dlp 1 回ぶんを待つ上限秒数。既定は search::YT_DLP_TIMEOUT。
+/// limit を大きくすると yt-dlp の所要時間が伸びるので、ここで延ばせるようにする。
+pub const MIN_SEARCH_TIMEOUT_SECS: u64 = 5;
+pub const MAX_SEARCH_TIMEOUT_SECS: u64 = 300;
 /// 起動時にディスクキャッシュへ残す枚数。
 pub const DEFAULT_MAX_CACHED: usize = 500;
 /// サムネイル 1 枚あたりのダウンロード上限秒数。
@@ -53,6 +57,7 @@ pub struct RawConfig {
 pub struct RawSearch {
     pub layout: Option<String>,
     pub limit: Option<i64>,
+    pub timeout_secs: Option<i64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
@@ -183,6 +188,7 @@ impl DisplaySettings {
 pub struct SearchSettings {
     pub layout: LayoutMode,
     pub limit: usize,
+    pub timeout: Duration,
 }
 
 impl Default for SearchSettings {
@@ -190,6 +196,7 @@ impl Default for SearchSettings {
         Self {
             layout: LayoutMode::default(),
             limit: DEFAULT_SEARCH_LIMIT,
+            timeout: crate::search::YT_DLP_TIMEOUT,
         }
     }
 }
@@ -410,7 +417,27 @@ fn validate_search(raw: RawSearch, notices: &mut Vec<String>) -> SearchSettings 
             clamped as usize
         }
     };
-    SearchSettings { layout, limit }
+    let defaults = SearchSettings::default();
+    let timeout = match raw.timeout_secs {
+        None => defaults.timeout,
+        Some(secs) => {
+            let clamped = secs.clamp(
+                MIN_SEARCH_TIMEOUT_SECS as i64,
+                MAX_SEARCH_TIMEOUT_SECS as i64,
+            );
+            if clamped != secs {
+                notices.push(format!(
+                    "[search] timeout_secs={secs} は {clamped} に丸めました"
+                ));
+            }
+            Duration::from_secs(clamped as u64)
+        }
+    };
+    SearchSettings {
+        layout,
+        limit,
+        timeout,
+    }
 }
 
 fn validate_thumbnails(raw: RawThumbnails, notices: &mut Vec<String>) -> ThumbnailSettings {
@@ -818,6 +845,17 @@ pub fn render(settings: &Settings) -> String {
         "# 1 回の検索で取る件数。{MIN_SEARCH_LIMIT}..={MAX_SEARCH_LIMIT}。\n"
     ));
     out.push_str(&format!("limit = {}\n", settings.search.limit));
+    out.push_str(&format!(
+        "# yt-dlp 1 回ぶんを待つ上限秒数。{MIN_SEARCH_TIMEOUT_SECS}..={MAX_SEARCH_TIMEOUT_SECS}。\n"
+    ));
+    out.push_str("# cookie を読めずに出し直すときは、最大 2 回ぶん待つ。\n");
+    out.push_str(
+        "# limit を大きくすると検索に時間がかかる。「検索がタイムアウトしました」が出るなら延ばす。\n",
+    );
+    out.push_str(&format!(
+        "timeout_secs = {}\n",
+        settings.search.timeout.as_secs()
+    ));
 
     let thumbnails = &settings.thumbnails;
     out.push_str("\n[thumbnails]\n");
@@ -1763,6 +1801,101 @@ mod tests {
     }
 
     #[test]
+    fn the_search_timeout_is_read() {
+        let text = "[search]\ntimeout_secs = 90\n";
+        assert_eq!(settings_of(text).search.timeout, Duration::from_secs(90));
+        assert!(notices_of(text).is_empty());
+    }
+
+    #[test]
+    fn an_absent_search_timeout_keeps_the_previous_30_seconds() {
+        assert_eq!(settings_of("").search.timeout, Duration::from_secs(30));
+        assert_eq!(
+            SearchSettings::default().timeout,
+            crate::search::YT_DLP_TIMEOUT
+        );
+        // timeout_secs を知らない頃の設定ファイルも、これまでと同じ 30 秒で動く。
+        assert_eq!(
+            settings_of("[search]\nlayout = \"list\"\nlimit = 50\n")
+                .search
+                .timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn a_search_timeout_outside_the_range_is_rounded_with_a_notice() {
+        for (raw, expected) in [
+            (0, MIN_SEARCH_TIMEOUT_SECS),
+            (4, MIN_SEARCH_TIMEOUT_SECS),
+            (-10, MIN_SEARCH_TIMEOUT_SECS),
+            (301, MAX_SEARCH_TIMEOUT_SECS),
+            (100_000, MAX_SEARCH_TIMEOUT_SECS),
+        ] {
+            let text = format!("[search]\ntimeout_secs = {raw}\n");
+            assert_eq!(
+                settings_of(&text).search.timeout,
+                Duration::from_secs(expected),
+                "{text}"
+            );
+            let notice = notices_of(&text).join(" / ");
+            assert!(notice.contains("[search] timeout_secs"), "{notice}");
+            assert!(notice.contains(&raw.to_string()), "{notice}");
+        }
+
+        // 端ちょうどは丸めない。
+        for secs in [MIN_SEARCH_TIMEOUT_SECS, MAX_SEARCH_TIMEOUT_SECS] {
+            let text = format!("[search]\ntimeout_secs = {secs}\n");
+            assert_eq!(settings_of(&text).search.timeout, Duration::from_secs(secs));
+            assert!(notices_of(&text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_search_timeout_is_separate_from_the_thumbnail_timeout() {
+        // 同じキー名が 2 つのセクションにあるので、取り違えていないか確かめる。
+        let text = "[search]\ntimeout_secs = 120\n\n[thumbnails]\ntimeout_secs = 7\n";
+        let settings = settings_of(text);
+        assert_eq!(settings.search.timeout, Duration::from_secs(120));
+        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(7));
+        assert!(notices_of(text).is_empty());
+    }
+
+    #[test]
+    fn render_round_trips_the_search_timeout() {
+        let custom = Settings {
+            search: SearchSettings {
+                timeout: Duration::from_secs(120),
+                ..SearchSettings::default()
+            },
+            ..Settings::default()
+        };
+        let text = render(&custom);
+        assert!(text.contains("timeout_secs = 120"), "{text}");
+        assert_eq!(settings_of(&text), custom);
+
+        // 既定値もそのまま書き出して読み戻せる。
+        let text = render(&Settings::default());
+        assert!(text.contains("timeout_secs = 30"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "{MIN_SEARCH_TIMEOUT_SECS}..={MAX_SEARCH_TIMEOUT_SECS}"
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_search_timeout_comment_matches_what_happens_on_a_timeout() {
+        let text = render(&Settings::default());
+        // 超えたときは 0 件でなくエラーが出る。探す手がかりはその文言。
+        assert!(!text.contains("0 件"), "{text}");
+        assert!(text.contains("検索がタイムアウトしました"), "{text}");
+        // 縛るのは yt-dlp 1 回ぶんで、cookie の読み取りに失敗すると 2 回ぶん待つ。
+        assert!(text.contains("2 回"), "{text}");
+    }
+
+    #[test]
     fn thumbnail_settings_are_read() {
         let text = "[thumbnails]\nenabled = false\ncache_dir = \"/tmp/thumbs\"\nmax_cached = 20\ntimeout_secs = 5\n";
         let thumbnails = settings_of(text).thumbnails;
@@ -1863,6 +1996,7 @@ mod tests {
             search: SearchSettings {
                 layout: LayoutMode::List,
                 limit: 30,
+                timeout: Duration::from_secs(45),
             },
             thumbnails: ThumbnailSettings {
                 enabled: false,

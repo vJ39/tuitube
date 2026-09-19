@@ -15,7 +15,7 @@ TUI 上で設定を一覧・編集できる画面。`Mode::Settings` として�
 
 - `display.mode`: 次回起動から。実行中の表示モードは `app.display` が持ち、再生中の `w` で切り替える。
 - `display.quality` / `fps_cap` / `subtitles.enabled`: 次の再生から(`LaunchPlan` が起動時に読む)。
-- `search.limit` / `search.layout` / `thumbnails.*`: 保存した時点から。
+- `search.limit` / `search.layout` / `search.timeout_secs` / `thumbnails.*`: 保存した時点から。
 
 ### 環境変数が上書きしている項目
 
@@ -52,6 +52,7 @@ TUI 上で設定を一覧・編集できる画面。`Mode::Settings` として�
 | subtitles.enabled | Enter/Space で toggle | bool |
 | search.layout | → で次、← で前 | `LayoutMode::next()` / `prev()`(2 値なので同じ動き) |
 | search.limit | ←→ で 1 刻み増減 | `MIN_SEARCH_LIMIT`〜`MAX_SEARCH_LIMIT` |
+| search.timeout_secs | ←→ で 5 刻み増減 | `MIN_SEARCH_TIMEOUT_SECS`〜`MAX_SEARCH_TIMEOUT_SECS` |
 | thumbnails.enabled | Enter/Space で toggle | bool |
 | thumbnails.max_cached | ←→ で 50 刻み増減 | 0〜(上限なし、既存に準拠) |
 | thumbnails.timeout_secs | ←→ で 5 刻み増減 | 1〜`MAX_THUMB_TIMEOUT_SECS` |

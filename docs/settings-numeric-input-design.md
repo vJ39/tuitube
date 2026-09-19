@@ -1,10 +1,10 @@
 # 設定画面の数値直接入力
 
-数値項目(fps_cap / search.limit / thumbnails.max_cached / thumbnails.timeout_secs)は現在←→の1回きざみ増減しか無く、search.limitの上限が1000になったことで操作回数が多すぎる。数字キーで直接入力できるようにする。
+数値項目(fps_cap / search.limit / search.timeout_secs / thumbnails.max_cached / thumbnails.timeout_secs)は←→の刻み増減しか無く、search.limitの上限が1000になったことで操作回数が多すぎる。数字キーで直接入力できるようにする。
 
 ## 対象
 
-`SettingsItem`に数値項目かどうかを判定するメソッド(`is_numeric()`)を追加する。対象は`FpsCap`/`SearchLimit`/`ThumbnailsMaxCached`/`ThumbnailsTimeoutSecs`の4つ。
+`SettingsItem`に数値項目かどうかを判定するメソッド(`is_numeric()`)を追加する。対象は`FpsCap`/`SearchLimit`/`SearchTimeoutSecs`/`ThumbnailsMaxCached`/`ThumbnailsTimeoutSecs`の5つ。
 
 ## 状態
 

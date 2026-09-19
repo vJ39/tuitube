@@ -237,12 +237,13 @@ fn spawn_search<R>(
     }
     let nonce = session.search_nonce;
     let limit = app.settings.search.limit;
+    let timeout = app.settings.search.timeout;
     app.searching = true;
     app.set_error(None);
     let cookies = app.cookies.for_search().cloned();
     let tx = tx.clone();
     session.search_task = Some(tokio::spawn(async move {
-        let report = search::run_search(&runner, &target, cookies.as_ref(), limit).await;
+        let report = search::run_search(&runner, &target, cookies.as_ref(), limit, timeout).await;
         let _ = tx.send(AppEvent::SearchDone {
             nonce,
             target,
@@ -1066,6 +1067,35 @@ mod tests {
 
         assert!(app.notice.is_none());
         assert!(session.search_task.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_search_waits_as_long_as_the_setting_says() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: QueryEditor::from("ラーメン"),
+            ..App::default()
+        };
+        app.settings.search.timeout = Duration::from_secs(45);
+        start_search_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeYtDlp::new([Step::Hang, Step::Hang]),
+        );
+        session
+            .search_task
+            .take()
+            .expect("タスク")
+            .await
+            .expect("完走");
+
+        let Some(AppEvent::SearchDone { report, .. }) = rx.recv().await else {
+            panic!("検索結果が届く");
+        };
+        let error = report.results.expect_err("タイムアウト");
+        assert!(error.contains("45 秒"), "{error}");
     }
 
     #[tokio::test]

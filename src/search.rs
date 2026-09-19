@@ -5,9 +5,9 @@ use std::io::ErrorKind;
 use std::process::Output;
 use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
 
-/// yt-dlp 1 回の実行ごとの上限。cookie 付きの失敗から再試行すると最大 2 回分待つ。
+/// [search] timeout_secs を書いていないときの、yt-dlp 1 回ぶんの上限。
+/// cookie 付きの失敗から再試行すると最大 2 回分待つ。
 pub const YT_DLP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,6 +94,9 @@ pub struct SearchReport {
     pub outcome: CookieOutcome,
     /// cookie 無しで再実行した。
     pub fell_back: bool,
+    /// この検索を待った上限。結果が届くまでに設定を変えられても、
+    /// 文言の秒数はこちらを使う。
+    pub timeout: Duration,
 }
 
 struct Attempt {
@@ -106,21 +109,24 @@ pub async fn run_search(
     target: &Target,
     cookies: Option<&CookieSource>,
     limit: usize,
+    timeout: Duration,
 ) -> SearchReport {
-    let first = attempt(runner, target, cookies, limit).await;
+    let first = attempt(runner, target, cookies, limit, timeout).await;
     // 読めないときは検索そのものが実行されないので、同じ target を cookie 無しで出し直す。
     if let CookieOutcome::Unreadable(_) = &first.outcome {
-        let retry = attempt(runner, target, None, limit).await;
+        let retry = attempt(runner, target, None, limit, timeout).await;
         return SearchReport {
             results: retry.results,
             outcome: first.outcome,
             fell_back: true,
+            timeout,
         };
     }
     SearchReport {
         results: first.results,
         outcome: first.outcome,
         fell_back: false,
+        timeout,
     }
 }
 
@@ -129,15 +135,16 @@ async fn attempt(
     target: &Target,
     cookies: Option<&CookieSource>,
     limit: usize,
+    timeout: Duration,
 ) -> Attempt {
     let used_cookies = cookies.is_some();
     let args = yt_dlp_args(target, cookies, limit);
-    let output = match timeout(YT_DLP_TIMEOUT, runner.run(args)).await {
+    let output = match tokio::time::timeout(timeout, runner.run(args)).await {
         Err(_) => {
             return Attempt {
                 results: Err(format!(
                     "検索がタイムアウトしました ({} 秒)",
-                    YT_DLP_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 )),
                 outcome: outcome_of(used_cookies, CookieOutcome::TimedOut),
             };
@@ -424,6 +431,7 @@ mod tests {
             &Target::Search("q".to_string()),
             Some(&source("firefox")),
             10,
+            YT_DLP_TIMEOUT,
         )
         .await;
 
@@ -448,6 +456,7 @@ mod tests {
             &Target::Search("q".to_string()),
             Some(&source("chrome")),
             10,
+            YT_DLP_TIMEOUT,
         )
         .await;
 
@@ -469,6 +478,7 @@ mod tests {
             &Target::Search("q".to_string()),
             Some(&source("chrome")),
             10,
+            YT_DLP_TIMEOUT,
         )
         .await;
 
@@ -490,6 +500,7 @@ mod tests {
             &Target::Feed(Feed::History),
             Some(&source("safari")),
             10,
+            YT_DLP_TIMEOUT,
         )
         .await;
 
@@ -505,7 +516,14 @@ mod tests {
             "",
             "ERROR: could not find chrome cookies database in '/x'",
         )]);
-        let report = run_search(&runner, &Target::Search("q".to_string()), None, 10).await;
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            None,
+            10,
+            YT_DLP_TIMEOUT,
+        )
+        .await;
 
         // cookie を渡していない実行の stderr は cookie の判定材料にしない。
         assert_eq!(runner.calls().len(), 1);
@@ -521,12 +539,121 @@ mod tests {
             &Target::Search("q".to_string()),
             Some(&source("chrome")),
             10,
+            YT_DLP_TIMEOUT,
         )
         .await;
 
         assert_eq!(runner.calls().len(), 1, "タイムアウトでは再試行しない");
         let error = report.results.expect_err("結果は返らない");
         assert!(error.contains("タイムアウト"), "{error}");
+        assert!(error.contains("30 秒"), "{error}");
         assert_eq!(report.outcome, CookieOutcome::TimedOut);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_search_waits_for_the_timeout_it_is_given() {
+        for secs in [5, 90, 300] {
+            let runner = FakeYtDlp::new([Step::Hang]);
+            let started = tokio::time::Instant::now();
+            let report = run_search(
+                &runner,
+                &Target::Search("q".to_string()),
+                None,
+                10,
+                Duration::from_secs(secs),
+            )
+            .await;
+
+            assert_eq!(started.elapsed(), Duration::from_secs(secs), "{secs} 秒");
+            let error = report.results.expect_err("結果は返らない");
+            assert!(error.contains(&format!("{secs} 秒")), "{error}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_default_timeout_is_still_30_seconds() {
+        assert_eq!(YT_DLP_TIMEOUT, Duration::from_secs(30));
+        let runner = FakeYtDlp::new([Step::Hang]);
+        let started = tokio::time::Instant::now();
+        let _ = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            None,
+            10,
+            YT_DLP_TIMEOUT,
+        )
+        .await;
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_retry_without_cookies_gets_the_same_timeout() {
+        let runner = FakeYtDlp::new([
+            done(
+                1,
+                "",
+                "ERROR: could not find chrome cookies database in '/x'",
+            ),
+            Step::Hang,
+        ]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            Some(&source("chrome")),
+            10,
+            Duration::from_secs(45),
+        )
+        .await;
+
+        assert_eq!(runner.calls().len(), 2);
+        let error = report.results.expect_err("2 回目もタイムアウト");
+        assert!(error.contains("45 秒"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_report_carries_the_timeout_it_was_given() {
+        // 受け取る側は、届いた時点の設定でなくこの値で文言を作る。
+        let runner = FakeYtDlp::new([Step::Hang]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            None,
+            10,
+            Duration::from_secs(90),
+        )
+        .await;
+        assert_eq!(report.timeout, Duration::from_secs(90));
+
+        // 成功したときも同じ値が入る。
+        let runner = FakeYtDlp::new([done(0, LINE_FULL, "")]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            None,
+            10,
+            Duration::from_secs(15),
+        )
+        .await;
+        assert_eq!(report.timeout, Duration::from_secs(15));
+
+        // cookie 無しで出し直した報告にも入る。
+        let runner = FakeYtDlp::new([
+            done(
+                1,
+                "",
+                "ERROR: could not find chrome cookies database in '/x'",
+            ),
+            done(0, LINE_FULL, ""),
+        ]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            Some(&source("chrome")),
+            10,
+            Duration::from_secs(45),
+        )
+        .await;
+        assert!(report.fell_back);
+        assert_eq!(report.timeout, Duration::from_secs(45));
     }
 }

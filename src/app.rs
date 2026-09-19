@@ -8,8 +8,8 @@ use crate::rgb::RgbImage;
 use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::{
-    EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_LIMIT, MAX_THUMB_TIMEOUT_SECS,
-    MIN_SEARCH_LIMIT, Settings,
+    EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_LIMIT, MAX_SEARCH_TIMEOUT_SECS,
+    MAX_THUMB_TIMEOUT_SECS, MIN_SEARCH_LIMIT, MIN_SEARCH_TIMEOUT_SECS, Settings,
 };
 use crate::speed::{Polled, Speed};
 use crate::subtitles::SubtitleState;
@@ -100,18 +100,20 @@ pub enum SettingsItem {
     SubtitlesEnabled,
     SearchLayout,
     SearchLimit,
+    SearchTimeoutSecs,
     ThumbnailsEnabled,
     ThumbnailsMaxCached,
     ThumbnailsTimeoutSecs,
 }
 
-pub const SETTINGS_ITEMS: [SettingsItem; 9] = [
+pub const SETTINGS_ITEMS: [SettingsItem; 10] = [
     SettingsItem::DisplayMode,
     SettingsItem::DisplayQuality,
     SettingsItem::FpsCap,
     SettingsItem::SubtitlesEnabled,
     SettingsItem::SearchLayout,
     SettingsItem::SearchLimit,
+    SettingsItem::SearchTimeoutSecs,
     SettingsItem::ThumbnailsEnabled,
     SettingsItem::ThumbnailsMaxCached,
     SettingsItem::ThumbnailsTimeoutSecs,
@@ -120,6 +122,7 @@ pub const SETTINGS_ITEMS: [SettingsItem; 9] = [
 /// 数値項目の 1 回ぶんの刻み。
 const FPS_CAP_STEP: u64 = 5;
 const SEARCH_LIMIT_STEP: u64 = 1;
+const SEARCH_TIMEOUT_STEP: u64 = 5;
 const MAX_CACHED_STEP: u64 = 50;
 const THUMB_TIMEOUT_STEP: u64 = 5;
 /// 0 秒では 1 枚も取れないので、秒数はここまでしか下げない。
@@ -148,6 +151,7 @@ impl SettingsItem {
             Self::SubtitlesEnabled => "subtitles.enabled",
             Self::SearchLayout => "search.layout",
             Self::SearchLimit => "search.limit",
+            Self::SearchTimeoutSecs => "search.timeout_secs",
             Self::ThumbnailsEnabled => "thumbnails.enabled",
             Self::ThumbnailsMaxCached => "thumbnails.max_cached",
             Self::ThumbnailsTimeoutSecs => "thumbnails.timeout_secs",
@@ -166,6 +170,7 @@ impl SettingsItem {
             Self::SubtitlesEnabled => settings.subtitles.enabled.to_string(),
             Self::SearchLayout => settings.search.layout.key().to_string(),
             Self::SearchLimit => settings.search.limit.to_string(),
+            Self::SearchTimeoutSecs => settings.search.timeout.as_secs().to_string(),
             Self::ThumbnailsEnabled => settings.thumbnails.enabled.to_string(),
             Self::ThumbnailsMaxCached => settings.thumbnails.max_cached.to_string(),
             Self::ThumbnailsTimeoutSecs => settings.thumbnails.timeout.as_secs().to_string(),
@@ -190,6 +195,7 @@ impl SettingsItem {
             self,
             Self::FpsCap
                 | Self::SearchLimit
+                | Self::SearchTimeoutSecs
                 | Self::ThumbnailsMaxCached
                 | Self::ThumbnailsTimeoutSecs
         )
@@ -201,6 +207,7 @@ impl SettingsItem {
         let max: u64 = match self {
             Self::FpsCap => u64::from(MAX_FPS_CAP),
             Self::SearchLimit => MAX_SEARCH_LIMIT as u64,
+            Self::SearchTimeoutSecs => MAX_SEARCH_TIMEOUT_SECS,
             // max_cached に上限は無いので、apply_numeric が受け取れる最大値で数える。
             Self::ThumbnailsMaxCached => u64::try_from(usize::MAX).unwrap_or(u64::MAX),
             Self::ThumbnailsTimeoutSecs => MAX_THUMB_TIMEOUT_SECS,
@@ -228,6 +235,10 @@ impl SettingsItem {
                 let min = MIN_SEARCH_LIMIT as u64;
                 let max = MAX_SEARCH_LIMIT as u64;
                 settings.search.limit = value.clamp(min, max) as usize;
+            }
+            Self::SearchTimeoutSecs => {
+                let secs = value.clamp(MIN_SEARCH_TIMEOUT_SECS, MAX_SEARCH_TIMEOUT_SECS);
+                settings.search.timeout = Duration::from_secs(secs);
             }
             Self::ThumbnailsMaxCached => {
                 settings.thumbnails.max_cached = usize::try_from(value).unwrap_or(usize::MAX);
@@ -275,6 +286,18 @@ impl SettingsItem {
                 let min = MIN_SEARCH_LIMIT as u64;
                 let max = MAX_SEARCH_LIMIT as u64;
                 settings.search.limit = step(current, SEARCH_LIMIT_STEP, min, max, up) as usize;
+            }
+            Self::SearchTimeoutSecs => {
+                let current = settings.search.timeout.as_secs();
+                let min = MIN_SEARCH_TIMEOUT_SECS;
+                let secs = step(
+                    current,
+                    SEARCH_TIMEOUT_STEP,
+                    min,
+                    MAX_SEARCH_TIMEOUT_SECS,
+                    up,
+                );
+                settings.search.timeout = Duration::from_secs(secs);
             }
             Self::ThumbnailsEnabled => settings.thumbnails.enabled = !settings.thumbnails.enabled,
             Self::ThumbnailsMaxCached => {
@@ -1510,6 +1533,7 @@ mod tests {
                 "subtitles.enabled",
                 "search.layout",
                 "search.limit",
+                "search.timeout_secs",
                 "thumbnails.enabled",
                 "thumbnails.max_cached",
                 "thumbnails.timeout_secs",
@@ -1529,6 +1553,7 @@ mod tests {
                 "subtitles.enabled: true",
                 "search.layout: grid",
                 "search.limit: 10",
+                "search.timeout_secs: 30",
                 "thumbnails.enabled: true",
                 "thumbnails.max_cached: 500",
                 "thumbnails.timeout_secs: 10",
@@ -1672,6 +1697,37 @@ mod tests {
     }
 
     #[test]
+    fn the_search_timeout_steps_by_five_and_stays_inside_its_range() {
+        let mut settings = Settings::default();
+        let secs = |settings: &Settings| settings.search.timeout.as_secs();
+        assert_eq!(secs(&settings), 30, "既定は 30 秒のまま");
+
+        SettingsItem::SearchTimeoutSecs.adjust(&mut settings, 1);
+        assert_eq!(secs(&settings), 35);
+        SettingsItem::SearchTimeoutSecs.adjust(&mut settings, -1);
+        assert_eq!(secs(&settings), 30);
+
+        for _ in 0..20 {
+            SettingsItem::SearchTimeoutSecs.adjust(&mut settings, -1);
+        }
+        assert_eq!(secs(&settings), MIN_SEARCH_TIMEOUT_SECS, "下限で止まる");
+
+        for _ in 0..100 {
+            SettingsItem::SearchTimeoutSecs.adjust(&mut settings, 1);
+        }
+        assert_eq!(secs(&settings), MAX_SEARCH_TIMEOUT_SECS, "上限で止まる");
+    }
+
+    #[test]
+    fn the_search_timeout_row_shows_the_seconds() {
+        let settings = Settings::default();
+        assert_eq!(
+            SettingsItem::SearchTimeoutSecs.row(&settings),
+            "search.timeout_secs: 30"
+        );
+    }
+
+    #[test]
     fn the_thumbnail_numbers_step_by_their_own_width() {
         let mut settings = Settings::default();
         SettingsItem::ThumbnailsMaxCached.adjust(&mut settings, 1);
@@ -1773,6 +1829,7 @@ mod tests {
             [
                 "fps_cap",
                 "search.limit",
+                "search.timeout_secs",
                 "thumbnails.max_cached",
                 "thumbnails.timeout_secs",
             ]
@@ -1801,6 +1858,7 @@ mod tests {
         // 端へ寄せる入力 (search.limit の 9999 等) は打てる長さに収める。
         assert_eq!(SettingsItem::FpsCap.max_digits(), 3);
         assert_eq!(SettingsItem::SearchLimit.max_digits(), 4);
+        assert_eq!(SettingsItem::SearchTimeoutSecs.max_digits(), 3);
         assert_eq!(SettingsItem::ThumbnailsTimeoutSecs.max_digits(), 3);
         assert_eq!(SettingsItem::ThumbnailsMaxCached.max_digits(), 20);
     }
@@ -1830,6 +1888,21 @@ mod tests {
         assert_eq!(fps("999"), FpsCap::new(MAX_FPS_CAP));
         // 0 は「制限なし」。
         assert_eq!(fps("0"), None);
+
+        let search_timeout = |raw| {
+            typed(SettingsItem::SearchTimeoutSecs, raw, &settings)
+                .search
+                .timeout
+        };
+        assert_eq!(search_timeout("120"), Duration::from_secs(120));
+        assert_eq!(
+            search_timeout("0"),
+            Duration::from_secs(MIN_SEARCH_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            search_timeout("9999"),
+            Duration::from_secs(MAX_SEARCH_TIMEOUT_SECS)
+        );
 
         let cached = |raw| {
             typed(SettingsItem::ThumbnailsMaxCached, raw, &settings)

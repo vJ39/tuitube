@@ -2,6 +2,7 @@
 //! 外部プロセスには触れない。実行は search.rs / mpv.rs が行う。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub const ENV_VAR: &str = "TUITUBE_COOKIES_FROM_BROWSER";
 /// フィードは制限しないと 167 件返ることがある (`:ytrec` 実測)。
@@ -194,7 +195,8 @@ fn strip_prefix(line: &str) -> &str {
 const SAFARI_TCC: &str = "Safari の cookie を読めませんでした。端末アプリにフルディスクアクセスを許可してください (システム設定 → プライバシーとセキュリティ → フルディスクアクセス)。cookie 無しで検索しました";
 
 /// 利用者向けの説明文。表示しない outcome では空になる。
-pub fn describe(outcome: &CookieOutcome, source: &CookieSource) -> String {
+/// timeout は実際に待った上限 ([search] timeout_secs)。案内の秒数に出す。
+pub fn describe(outcome: &CookieOutcome, source: &CookieSource, timeout: Duration) -> String {
     match outcome {
         // フルディスクアクセスの案内が要るのは Safari だけ。他では誤った案内になる。
         CookieOutcome::Unreadable(detail)
@@ -212,7 +214,7 @@ pub fn describe(outcome: &CookieOutcome, source: &CookieSource) -> String {
         ),
         CookieOutcome::TimedOut => format!(
             "検索がタイムアウトしました ({} 秒)。cookie 連携の初回は macOS のキーチェーン許可ダイアログが別ウィンドウで出ている可能性があります。「常に許可」を選び、tuitube を再起動してください。以後は cookie 無しで動作します",
-            crate::search::YT_DLP_TIMEOUT.as_secs()
+            timeout.as_secs()
         ),
         _ => String::new(),
     }
@@ -264,7 +266,7 @@ impl CookieState {
     }
 
     /// 停止したら自動では戻さない。失敗のたびに yt-dlp を 2 回待たせないため。
-    pub fn observe(&mut self, outcome: &CookieOutcome) {
+    pub fn observe(&mut self, outcome: &CookieOutcome, timeout: Duration) {
         let Some(source) = self.for_search().cloned() else {
             return;
         };
@@ -272,11 +274,11 @@ impl CookieState {
         match outcome {
             CookieOutcome::Ok => *self = Self::Active(source),
             CookieOutcome::Degraded(_) | CookieOutcome::Unreadable(_) => {
-                let reason = describe(outcome, &source);
+                let reason = describe(outcome, &source, timeout);
                 *self = Self::Suspended { source, reason };
             }
             CookieOutcome::TimedOut if armed => {
-                let reason = describe(outcome, &source);
+                let reason = describe(outcome, &source, timeout);
                 *self = Self::Suspended { source, reason };
             }
             _ => {}
@@ -416,6 +418,10 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// 秒数そのものを確かめる以外のテストで渡す上限。
+    const TIMEOUT: Duration = crate::search::YT_DLP_TIMEOUT;
 
     fn source(spec: &str) -> CookieSource {
         CookieSource::from_spec(Some(spec)).expect("spec")
@@ -509,7 +515,7 @@ mod tests {
             Some(1),
             "ERROR: [Errno 1] Operation not permitted: '/tmp/cookies.txt'",
         );
-        let text = describe(&outcome, &file_source("/tmp/cookies.txt"));
+        let text = describe(&outcome, &file_source("/tmp/cookies.txt"), TIMEOUT);
         assert!(!text.contains("フルディスクアクセス"), "{text}");
         assert!(text.contains("cookies.txt"), "{text}");
         assert!(text.contains("Operation not permitted"), "{text}");
@@ -673,7 +679,7 @@ mod tests {
             Some(1),
             "ERROR: [Errno 1] Operation not permitted: '/Users/x/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies'",
         );
-        let text = describe(&outcome, &source("safari"));
+        let text = describe(&outcome, &source("safari"), TIMEOUT);
         assert!(text.contains("フルディスクアクセス"), "{text}");
 
         // それ以外は yt-dlp の本文をそのまま見せる。
@@ -681,7 +687,7 @@ mod tests {
             Some(1),
             "ERROR: could not find firefox cookies database in '/x/Profiles'",
         );
-        let text = describe(&other, &source("firefox"));
+        let text = describe(&other, &source("firefox"), TIMEOUT);
         assert!(text.contains("firefox"), "{text}");
         assert!(
             text.contains("could not find firefox cookies database"),
@@ -691,19 +697,42 @@ mod tests {
     }
 
     #[test]
+    fn the_timeout_notice_names_the_seconds_that_were_actually_used() {
+        for secs in [5, 30, 120, 300] {
+            let text = describe(
+                &CookieOutcome::TimedOut,
+                &source("chrome"),
+                Duration::from_secs(secs),
+            );
+            assert!(text.contains(&format!("{secs} 秒")), "{text}");
+            assert!(text.contains("キーチェーン"), "{text}");
+        }
+    }
+
+    #[test]
+    fn suspending_on_a_timeout_keeps_the_seconds_in_the_reason() {
+        let mut state = CookieState::Armed(source("chrome"));
+        state.observe(&CookieOutcome::TimedOut, Duration::from_secs(120));
+        let CookieState::Suspended { reason, .. } = state else {
+            panic!("停止する");
+        };
+        assert!(reason.contains("120 秒"), "{reason}");
+    }
+
+    #[test]
     fn full_disk_access_is_not_suggested_for_other_browsers() {
         // chrome を指定しているのに Safari の設定を直せとは言わない。
         let outcome = classify(
             Some(1),
             "ERROR: [Errno 1] Operation not permitted: '/Users/x/Library/Application Support/Google/Chrome/Default/Cookies'",
         );
-        let text = describe(&outcome, &source("chrome:Profile 1"));
+        let text = describe(&outcome, &source("chrome:Profile 1"), TIMEOUT);
         assert!(!text.contains("フルディスクアクセス"), "{text}");
         assert!(text.contains("chrome"), "{text}");
         assert!(text.contains("Operation not permitted"), "{text}");
 
         // Safari は大文字小文字を問わず案内する。
-        let text = describe(&outcome, &source("Safari"));
+        let text = describe(&outcome, &source("Safari"), TIMEOUT);
         assert!(text.contains("フルディスクアクセス"), "{text}");
     }
 
@@ -793,7 +822,7 @@ mod tests {
         // Off は何が来ても動かない。
         for outcome in &outcomes {
             let mut state = CookieState::Off;
-            state.observe(outcome);
+            state.observe(outcome, TIMEOUT);
             assert_eq!(state, CookieState::Off, "{outcome:?}");
         }
 
@@ -803,7 +832,7 @@ mod tests {
                 source: src.clone(),
                 reason: "理由".to_string(),
             };
-            state.observe(outcome);
+            state.observe(outcome, TIMEOUT);
             assert!(
                 matches!(state, CookieState::Suspended { .. }),
                 "{outcome:?}"
@@ -812,7 +841,7 @@ mod tests {
 
         let armed = |outcome: &CookieOutcome| {
             let mut state = CookieState::Armed(src.clone());
-            state.observe(outcome);
+            state.observe(outcome, TIMEOUT);
             state
         };
         assert_eq!(armed(&CookieOutcome::Ok), CookieState::Active(src.clone()));
@@ -840,7 +869,7 @@ mod tests {
 
         let active = |outcome: &CookieOutcome| {
             let mut state = CookieState::Active(src.clone());
-            state.observe(outcome);
+            state.observe(outcome, TIMEOUT);
             state
         };
         for outcome in [
