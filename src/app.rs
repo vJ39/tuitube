@@ -5,7 +5,7 @@ use crate::display::{DisplayMode, FpsCap};
 use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
 use crate::rgb::RgbImage;
-use crate::search::{SearchReport, SearchResult};
+use crate::search::{ChannelRef, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::{
     EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_LIMIT, MAX_SEARCH_TIMEOUT_SECS,
@@ -78,6 +78,13 @@ pub enum AppEvent {
         nonce: u64,
         video_id: String,
         comments: Result<Vec<Comment>, String>,
+    },
+    /// 選択中の 1 本からチャンネルを引き終わった。Ok(None) は channel_id を
+    /// 持たない動画。video_id で今の行のものかを見分ける。
+    ChannelLookupDone {
+        nonce: u64,
+        video_id: String,
+        result: Result<Option<ChannelRef>, String>,
     },
 }
 

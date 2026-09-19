@@ -9,6 +9,8 @@ use tokio::process::Command;
 /// [search] timeout_secs を書いていないときの、yt-dlp 1 回ぶんの上限。
 /// cookie 付きの失敗から再試行すると最大 2 回分待つ。
 pub const YT_DLP_TIMEOUT: Duration = Duration::from_secs(30);
+/// 1 本ぶんのチャンネル引きの上限。実測 3〜4 秒で返る。
+pub const CHANNEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResult {
@@ -100,6 +102,47 @@ pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>, limit: usize
         args.extend(cookies.yt_dlp_args());
     }
     args
+}
+
+/// 引き当てたチャンネル。履歴タブの行は名前も持たないので、引いた行から一緒に拾う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelRef {
+    pub id: String,
+    pub uploader: Option<String>,
+}
+
+/// 1 本だけを取る引数。--flat-playlist を付けないので channel_id まで入った行が返る。
+pub fn channel_lookup_args(url: &str) -> Vec<String> {
+    vec![url.to_string(), "--dump-json".to_string()]
+}
+
+/// 選択中の 1 本からチャンネルを引く。フィードの行は channel_id を欠くので、
+/// チャンネルへ移る直前にここで補う。取れたが持っていない動画は Ok(None)。
+pub async fn fetch_channel(runner: &impl YtDlp, url: &str) -> Result<Option<ChannelRef>, String> {
+    let args = channel_lookup_args(url);
+    let output = match tokio::time::timeout(CHANNEL_LOOKUP_TIMEOUT, runner.run(args)).await {
+        Err(_) => {
+            return Err(format!(
+                "チャンネル情報の取得がタイムアウトしました ({} 秒)",
+                CHANNEL_LOOKUP_TIMEOUT.as_secs()
+            ));
+        }
+        Ok(Err(e)) => return Err(launch_error(&e)),
+        Ok(Ok(output)) => output,
+    };
+    let found = parse_lines(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .next()
+        .and_then(|result| {
+            let uploader = result.uploader;
+            result.channel_id.map(|id| ChannelRef { id, uploader })
+        });
+    // 警告つきで終わっても行が揃っていればそれを使う。
+    if found.is_none() && !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("yt-dlp が失敗しました: {}", stderr_detail(&stderr)));
+    }
+    Ok(found)
 }
 
 #[derive(Debug)]
@@ -292,7 +335,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::*;
     use crate::cookies::{CHANNEL_LIMIT, ChannelTab, Feed};
-    use crate::search::fixtures::{FakeYtDlp, Step, done};
+    use crate::search::fixtures::{FakeYtDlp, Step, done, missing};
 
     const LINE_FULL: &str =
         r#"{"id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
@@ -370,6 +413,96 @@ mod tests {
         assert_eq!(parse_lines(without)[0].channel_id, None);
         let null = r#"{"id":"a","title":"t","channel_id":null}"#;
         assert_eq!(parse_lines(null)[0].channel_id, None);
+    }
+
+    const ONE_VIDEO: &str = r#"{"id":"id1","title":"t","channel_id":"UCfeed","uploader":"Up"}"#;
+
+    #[test]
+    fn channel_lookup_args_take_one_video_without_flat_playlist() {
+        // --flat-playlist を付けないから channel_id まで入った 1 行が返る。
+        assert_eq!(
+            channel_lookup_args("https://www.youtube.com/watch?v=id1"),
+            ["https://www.youtube.com/watch?v=id1", "--dump-json"]
+        );
+    }
+
+    fn channel(id: &str, uploader: Option<&str>) -> ChannelRef {
+        ChannelRef {
+            id: id.to_string(),
+            uploader: uploader.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_reads_the_channel_of_a_single_video() {
+        let runner = FakeYtDlp::new([done(0, ONE_VIDEO, "")]);
+        let url = "https://www.youtube.com/watch?v=id1";
+        assert_eq!(
+            fetch_channel(&runner, url).await,
+            Ok(Some(channel("UCfeed", Some("Up"))))
+        );
+        assert_eq!(runner.calls(), [channel_lookup_args(url)]);
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_keeps_the_name_from_the_line_it_read() {
+        // 履歴タブの行は名前を持たないので、引いた行の uploader が唯一の出どころ。
+        let line = r#"{"id":"id1","title":"t","channel_id":"UCfeed","channel":"Some Channel"}"#;
+        let runner = FakeYtDlp::new([done(0, line, "")]);
+        assert_eq!(
+            fetch_channel(&runner, "u").await,
+            Ok(Some(channel("UCfeed", Some("Some Channel"))))
+        );
+        // 引いた行にも無ければ名前は付かない。
+        let runner = FakeYtDlp::new([done(0, r#"{"id":"id1","channel_id":"UCfeed"}"#, "")]);
+        assert_eq!(
+            fetch_channel(&runner, "u").await,
+            Ok(Some(channel("UCfeed", None)))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_is_none_when_the_video_has_no_channel() {
+        let runner = FakeYtDlp::new([done(0, r#"{"id":"id1","title":"t"}"#, "")]);
+        assert_eq!(fetch_channel(&runner, "u").await, Ok(None));
+        // 何も出てこなかったときも失敗ではない。
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+        assert_eq!(fetch_channel(&runner, "u").await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_reports_the_error_line_when_yt_dlp_fails() {
+        let runner = FakeYtDlp::new([done(
+            1,
+            "",
+            "WARNING: falling back\nERROR: Video unavailable\nWARNING: cache\n",
+        )]);
+        let error = fetch_channel(&runner, "u").await.expect_err("失敗する");
+        assert!(error.contains("Video unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_keeps_json_that_arrived_despite_a_non_zero_exit() {
+        let runner = FakeYtDlp::new([done(1, ONE_VIDEO, "WARNING: something\n")]);
+        assert_eq!(
+            fetch_channel(&runner, "u").await,
+            Ok(Some(channel("UCfeed", Some("Up"))))
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_channel_reports_a_missing_binary() {
+        let runner = FakeYtDlp::new([missing()]);
+        let error = fetch_channel(&runner, "u").await.expect_err("起動できない");
+        assert!(error.contains("yt-dlp"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_channel_times_out() {
+        let runner = FakeYtDlp::new([Step::Hang]);
+        let error = fetch_channel(&runner, "u").await.expect_err("返らない");
+        assert!(error.contains("タイムアウト"), "{error}");
+        assert!(error.contains("15"), "{error}");
     }
 
     #[test]

@@ -38,6 +38,7 @@ use geometry::cell_size;
 use input::{handle_key, handle_mouse};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use search::{ChannelRef, RealYtDlp, YtDlp};
 use std::io::Write;
 use std::time::Duration;
 use subtitles::SubtitleState;
@@ -140,6 +141,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         session.search_task.take(),
         session.thumbs_task.take(),
         session.comments_task.take(),
+        session.channel_lookup_task.take(),
     ]
     .into_iter()
     .flatten()
@@ -419,6 +421,62 @@ async fn handle_event(
             session.comments_task = None;
             app.comments.apply(&video_id, comments);
         }
+        AppEvent::ChannelLookupDone {
+            nonce,
+            video_id,
+            result,
+        } => apply_channel_lookup_with(app, tx, session, nonce, video_id, result, RealYtDlp),
+    }
+}
+
+/// 引き終えたチャンネルへ移る。runner はチャンネルのタブを取りに行く側へ渡す。
+fn apply_channel_lookup_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    nonce: u64,
+    video_id: String,
+    result: Result<Option<ChannelRef>, String>,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    if nonce != session.channel_lookup_nonce {
+        return;
+    }
+    session.channel_lookup_task = None;
+    // 待っている間の知らせは、移るときも捨てるときもここで畳む。
+    if app.notice.as_deref() == Some(actions::CHANNEL_LOOKUP_NOTICE) {
+        app.set_notice(None);
+    }
+    // 押した後に再生や設定へ移っていれば、そちらから引きずり出さない。
+    if !matches!(app.mode, Mode::Results | Mode::Channel) {
+        return;
+    }
+    // 押した後に選択が動いていれば、届いたのは今の行のものではない。
+    let Some((selected, uploader)) = app
+        .view_selected_result()
+        .map(|r| (r.id.clone(), r.uploader.clone()))
+    else {
+        return;
+    };
+    if selected != video_id {
+        return;
+    }
+    match result {
+        Ok(Some(channel)) => {
+            // 履歴タブの行は名前を持たないので、引いた行の名前を先に使う。
+            let title = channel
+                .uploader
+                .or(uploader)
+                .unwrap_or_else(|| channel.id.clone());
+            actions::enter_channel_with(app, tx, session, channel.id, title, runner);
+        }
+        Ok(None) => app.set_temporary_notice(
+            actions::NO_CHANNEL_NOTICE.to_string(),
+            std::time::Instant::now(),
+        ),
+        Err(e) => app.set_error(Some(e)),
     }
 }
 
@@ -496,6 +554,7 @@ mod tests {
     use crate::cookies::CookieSource;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
+    use crate::search::fixtures::{FakeYtDlp, done};
     use crate::search::{SearchReport, SearchResult};
     use crate::video::{CellSize, Geometry, MAX_FRAME_PIXELS};
 
@@ -1573,6 +1632,225 @@ mod tests {
             Some(&comments::CommentState::Pending),
             "前の再生ぶんは捨てる"
         );
+    }
+
+    /// チャンネル引きの結果を待っている一覧。1 行目は履歴タブと同じく名前も持たない。
+    fn lookup_app() -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        app.set_results(
+            vec![
+                result("id0"),
+                SearchResult {
+                    uploader: Some("Row Channel".to_string()),
+                    ..result("id1")
+                },
+            ],
+            &Target::Search("q".to_string()),
+        );
+        app.selected = 1;
+        app.set_notice(Some(actions::CHANNEL_LOOKUP_NOTICE.to_string()));
+        app
+    }
+
+    fn found(id: &str, uploader: Option<&str>) -> Result<Option<ChannelRef>, String> {
+        Ok(Some(ChannelRef {
+            id: id.to_string(),
+            uploader: uploader.map(str::to_string),
+        }))
+    }
+
+    /// 引き終えた結果を、実 yt-dlp を起こさない runner で捌く。
+    fn lookup_done(
+        app: &mut App,
+        session: &mut Session,
+        tx: &UnboundedSender<AppEvent>,
+        nonce: u64,
+        video_id: &str,
+        result: Result<Option<ChannelRef>, String>,
+    ) {
+        apply_channel_lookup_with(
+            app,
+            tx,
+            session,
+            nonce,
+            video_id.to_string(),
+            result,
+            FakeYtDlp::new([done(0, "", "")]),
+        );
+    }
+
+    /// チャンネルのタブを取りに行くタスクを終わらせる。
+    async fn finish_search(session: &mut Session) {
+        session
+            .search_task
+            .take()
+            .expect("タブの検索")
+            .await
+            .expect("タスクは panic しない");
+    }
+
+    fn looking_up() -> Session {
+        Session {
+            channel_lookup_nonce: 1,
+            ..Session::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_lookup_moves_to_the_channel_it_found() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+        // 履歴タブの行は名前を持たないので、引いた行の名前を使う。
+        app.selected = 0;
+
+        lookup_done(
+            &mut app,
+            &mut session,
+            &tx,
+            1,
+            "id0",
+            found("UCfeed", Some("History Channel")),
+        );
+
+        assert_eq!(app.mode, Mode::Channel);
+        let channel = app.channel.as_ref().expect("チャンネルへ移る");
+        assert_eq!(channel.channel_id, "UCfeed");
+        assert_eq!(channel.channel_title, "History Channel");
+        assert!(session.channel_lookup_task.is_none());
+        assert!(app.notice.is_none(), "取得中の知らせは残さない");
+        finish_search(&mut session).await;
+    }
+
+    #[tokio::test]
+    async fn a_channel_lookup_takes_the_title_from_the_row_when_the_line_has_no_name() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+
+        lookup_done(&mut app, &mut session, &tx, 1, "id1", found("UCfeed", None));
+
+        let channel = app.channel.as_ref().expect("チャンネルへ移る");
+        assert_eq!(channel.channel_title, "Row Channel");
+        finish_search(&mut session).await;
+    }
+
+    #[tokio::test]
+    async fn a_channel_lookup_falls_back_to_the_channel_id_for_the_title() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+        app.selected = 0;
+
+        lookup_done(&mut app, &mut session, &tx, 1, "id0", found("UCfeed", None));
+
+        let channel = app.channel.as_ref().expect("チャンネルへ移る");
+        assert_eq!(channel.channel_title, "UCfeed");
+        finish_search(&mut session).await;
+    }
+
+    #[tokio::test]
+    async fn a_channel_lookup_for_another_row_is_discarded() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+
+        // 押した後に選択が動いていれば、その結果は今の行のものではない。
+        lookup_done(
+            &mut app,
+            &mut session,
+            &tx,
+            1,
+            "id0",
+            found("UCold", Some("Old Channel")),
+        );
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.mode, Mode::Results);
+        assert!(session.search_task.is_none());
+        assert!(app.notice.is_none(), "取得中の知らせは残さない");
+    }
+
+    #[tokio::test]
+    async fn a_channel_lookup_that_lands_after_moving_on_is_discarded() {
+        // 引いている 3〜4 秒の間に再生や設定へ移ることがある。そこから引きずり出さない。
+        for mode in [Mode::Playing, Mode::Settings, Mode::Input] {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut session = looking_up();
+            let mut app = lookup_app();
+            app.mode = mode;
+
+            lookup_done(
+                &mut app,
+                &mut session,
+                &tx,
+                1,
+                "id1",
+                found("UCfeed", Some("Feed Channel")),
+            );
+
+            assert!(app.channel.is_none(), "{mode:?}");
+            assert_eq!(app.mode, mode, "{mode:?}");
+            assert!(session.search_task.is_none(), "{mode:?}");
+            assert!(app.notice.is_none(), "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_superseded_channel_lookup_is_discarded() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+
+        lookup_done(
+            &mut app,
+            &mut session,
+            &tx,
+            0,
+            "id1",
+            found("UCold", Some("Old Channel")),
+        );
+
+        assert!(app.channel.is_none());
+        // 打ち切った側が知らせを入れ替えるので、ここでは触らない。
+        assert_eq!(app.notice.as_deref(), Some(actions::CHANNEL_LOOKUP_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn a_video_without_a_channel_only_says_so() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+
+        lookup_done(&mut app, &mut session, &tx, 1, "id1", Ok(None));
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.notice.as_deref(), Some(actions::NO_CHANNEL_NOTICE));
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_channel_lookup_is_shown_as_an_error() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+
+        lookup_done(
+            &mut app,
+            &mut session,
+            &tx,
+            1,
+            "id1",
+            Err("boom".to_string()),
+        );
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.error.as_deref(), Some("boom"));
+        assert!(app.notice.is_none(), "取得中の知らせは残さない");
     }
 
     #[test]

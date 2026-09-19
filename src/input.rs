@@ -542,6 +542,17 @@ mod tests {
         }
     }
 
+    /// 積まれたチャンネル引きを、外部プロセスへ届く前に捨てる。
+    fn take_channel_lookup(session: &mut Session) -> bool {
+        match session.channel_lookup_task.take() {
+            Some(task) => {
+                task.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 割り付けを端末の申告で揺らさないための寸法。
     const CELL: CellSize = CellSize {
         width_px: 8,
@@ -1488,7 +1499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn c_does_nothing_when_the_result_has_no_channel_id() {
+    async fn c_looks_the_channel_up_when_the_result_has_no_channel_id() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = grid_app(4);
@@ -1496,10 +1507,11 @@ mod tests {
 
         handle_key(&mut app, key(KeyCode::Char('c')), &tx, &mut session).await;
 
-        assert!(app.channel.is_none());
+        assert!(app.channel.is_none(), "引き終わるまでは移らない");
         assert_eq!(app.mode, Mode::Results, "結果一覧のまま");
         assert_eq!(app.selected, 2, "選択も動かさない");
-        assert!(!take_search(&mut session));
+        assert!(!take_search(&mut session), "一覧の検索は投げ直さない");
+        assert!(take_channel_lookup(&mut session), "その 1 本を引きに行く");
     }
 
     #[tokio::test]
@@ -1606,6 +1618,7 @@ mod tests {
             handle_key_results(&mut app, ctrl(code), &tx, &mut session).await;
             assert!(app.channel.is_none(), "{code:?}");
             assert!(!take_search(&mut session), "{code:?}");
+            assert!(!take_channel_lookup(&mut session), "{code:?}");
             assert!(!app.should_quit, "{code:?}");
         }
     }
