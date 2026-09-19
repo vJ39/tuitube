@@ -2012,7 +2012,7 @@ mod tests {
             mode: Mode::Settings,
             ..App::default()
         };
-        app.settings_selected = 5;
+        app.settings_selected = 6;
         app.settings_edit = Some(raw.to_string());
         app
     }

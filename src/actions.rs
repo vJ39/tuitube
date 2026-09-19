@@ -1099,7 +1099,14 @@ pub async fn copy_url_with<C: Clipboard>(app: &mut App, clipboard: C, now: std::
 
 /// 埋め込み → テキスト → 別ウィンドウ → 埋め込み。
 /// mpv は再起動せず VO を差し替えるので再生は途切れない。
-pub async fn cycle_display_mode(app: &mut App, session: &mut Session) {
+/// 切り替えられたら設定ファイルへも残す。保存先を差し替えられる形にしてあり、
+/// テストはここに一時ファイルを渡して利用者の設定を書き換えない。
+pub async fn cycle_display_mode(
+    app: &mut App,
+    session: &mut Session,
+    config: Option<&Path>,
+    now: std::time::Instant,
+) {
     let from = app.display;
     let to = from.next();
     // 別ウィンドウ中の端末リサイズは mpv へ送っていないので、端末内へ戻るときに現寸法で送り直す。
@@ -1126,6 +1133,9 @@ pub async fn cycle_display_mode(app: &mut App, session: &mut Session) {
             if from == DisplayMode::Embedded {
                 session.owe_clear = true;
             }
+            // 切り替え自体は済んでいるので、保存に失敗しても再生は続ける。
+            // 理由は save_display_mode が期限つきで出す。
+            save_display_mode(app, config, to, now);
         }
         Err(e) => app.set_error(Some(e)),
     }
@@ -1231,10 +1241,14 @@ pub fn adjust_settings_value(app: &mut App, delta: i32) {
 
 /// s での保存。設定ファイルの場所は起動時と同じ規則で決める。
 pub fn save_settings(app: &mut App, now: std::time::Instant) {
+    save_settings_to(app, config_path_from_env().as_deref(), now);
+}
+
+/// 設定ファイルの置き場。起動時と同じ規則で決める。
+pub fn config_path_from_env() -> Option<std::path::PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
     let home = std::env::var_os("HOME");
-    let path = settings::config_path(xdg.as_deref(), home.as_deref());
-    save_settings_to(app, path.as_deref(), now);
+    settings::config_path(xdg.as_deref(), home.as_deref())
 }
 
 /// 保存先を差し替えられる形。テストはここに一時ファイルを渡して利用者の設定を書き換えない。
@@ -1251,6 +1265,29 @@ pub fn save_settings_to(app: &mut App, path: Option<&Path>, now: std::time::Inst
             // 保存した内容が Esc の戻り先になる。
             app.settings_backup = app.settings.clone();
             app.set_temporary_notice(saved_notice(path, &app.env_overridden), now);
+        }
+        Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
+    }
+}
+
+/// w での自動保存。設定画面の s と違い保存を意図した操作ではないので、
+/// display.mode の行だけを差し替え、成功したときは何も出さない。
+/// settings へ入れるのは保存できた値だけ。食い違うと後の s が古い値を焼き付ける。
+fn save_display_mode(
+    app: &mut App,
+    path: Option<&Path>,
+    mode: DisplayMode,
+    now: std::time::Instant,
+) {
+    let Some(path) = path else {
+        app.set_temporary_error(NO_CONFIG_PATH.to_string(), now);
+        return;
+    };
+    match settings::save_display_mode_to(path, mode) {
+        Ok(()) => {
+            app.settings.display.mode = mode;
+            // 保存した値が Esc の戻り先になる。他の項目は開いた時点の値のまま残す。
+            app.settings_backup.display.mode = mode;
         }
         Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
     }
@@ -1334,6 +1371,11 @@ mod tests {
             mode: Mode::Playing,
             ..App::default()
         }
+    }
+
+    /// 自動保存の書き先を一時ファイルにした w 切替。利用者の設定を書き換えない。
+    async fn cycle_to(app: &mut App, session: &mut Session, path: &Path) {
+        cycle_display_mode(app, session, Some(path), std::time::Instant::now()).await;
     }
 
     const CELL: CellSize = CellSize {
@@ -1618,12 +1660,14 @@ mod tests {
             ..App::default()
         };
         let mut session = Session::default();
-        cycle_display_mode(&mut app, &mut session).await;
+        let path = settings_temp_dir("cycle-no-player").join("config.toml");
+        cycle_to(&mut app, &mut session, &path).await;
 
         assert_eq!(app.display, DisplayMode::Embedded);
         assert_eq!(video.kind(), DecoderKind::Kitty);
         assert!(app.error.is_none());
         assert!(!session.owe_clear);
+        assert!(!path.exists(), "切り替えていないので保存もしない");
     }
 
     #[tokio::test]
@@ -1684,7 +1728,8 @@ mod tests {
         };
         let mut session = Session::default();
         let sent = record(&mut session, Ok(()));
-        cycle_display_mode(&mut app, &mut session).await;
+        let path = settings_temp_dir("cycle-embedded-text").join("config.toml");
+        cycle_to(&mut app, &mut session, &path).await;
 
         let geometry = video_geometry(app.settings.display.max_pixels());
         assert_eq!(
@@ -1718,7 +1763,8 @@ mod tests {
         };
         let mut session = Session::default();
         let sent = record(&mut session, Ok(()));
-        cycle_display_mode(&mut app, &mut session).await;
+        let path = settings_temp_dir("cycle-text-window").join("config.toml");
+        cycle_to(&mut app, &mut session, &path).await;
 
         assert_eq!(
             lines(&sent),
@@ -1744,7 +1790,8 @@ mod tests {
         };
         let mut session = Session::default();
         let sent = record(&mut session, Ok(()));
-        cycle_display_mode(&mut app, &mut session).await;
+        let path = settings_temp_dir("cycle-window-embedded").join("config.toml");
+        cycle_to(&mut app, &mut session, &path).await;
 
         let expected = video_geometry(app.settings.display.max_pixels());
         assert_eq!(video.geometry(), expected);
@@ -1772,11 +1819,15 @@ mod tests {
         let mut app = playing_app();
         let mut session = Session::default();
         let _sent = record(&mut session, Err("パイプが閉じました".to_string()));
-        cycle_display_mode(&mut app, &mut session).await;
+        let path = settings_temp_dir("cycle-send-failed").join("config.toml");
+        cycle_to(&mut app, &mut session, &path).await;
 
         assert_eq!(app.display, DisplayMode::Embedded);
         assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
         assert!(!session.owe_clear);
+        // 切り替わっていない表示を設定ファイルへ焼き付けない。
+        assert_eq!(app.settings.display.mode, DisplayMode::Embedded);
+        assert!(!path.exists(), "{path:?}");
     }
 
     #[tokio::test]
@@ -1789,11 +1840,140 @@ mod tests {
         };
         let mut session = Session::default();
         let _sent = record(&mut session, Err("パイプが閉じました".to_string()));
-        cycle_display_mode(&mut app, &mut session).await;
+        let path = settings_temp_dir("cycle-decoder-failed").join("config.toml");
+        cycle_to(&mut app, &mut session, &path).await;
 
         assert_eq!(app.display, DisplayMode::Embedded);
         assert_eq!(video.kind(), DecoderKind::Kitty);
         assert_eq!(app.error.as_deref(), Some("パイプが閉じました"));
+    }
+
+    #[tokio::test]
+    async fn cycling_saves_the_new_mode_to_the_config_file() {
+        let path = settings_temp_dir("cycle-autosave").join("config.toml");
+        std::fs::write(&path, "[display]\nmode = \"embedded\"\n").expect("書ける");
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &path).await;
+
+        assert_eq!(app.display, DisplayMode::Text);
+        assert_eq!(app.settings.display.mode, DisplayMode::Text);
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert_eq!(written, "[display]\nmode = \"text\"\n", "{written}");
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn cycling_keeps_the_rest_of_the_config_file() {
+        // w は保存を意図した操作ではないので、mode 以外の行を書き換えない。
+        let path = settings_temp_dir("cycle-autosave-keep").join("config.toml");
+        let before = "# 自分で書いたコメント\n[display]\nmode = \"embedded\"\n\n[search]\nlimit = 5000\nunknown_key = 1\n";
+        std::fs::write(&path, before).expect("書ける");
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &path).await;
+
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert_eq!(written, before.replace("embedded", "text"), "{written}");
+    }
+
+    #[tokio::test]
+    async fn cycling_creates_the_config_file_when_there_is_none() {
+        let path = settings_temp_dir("cycle-autosave-new").join("config.toml");
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &path).await;
+
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert_eq!(written, crate::settings::render(&app.settings), "{written}");
+    }
+
+    #[tokio::test]
+    async fn cycling_says_nothing_when_the_save_goes_through() {
+        // 再生行を押し出さないよう、成功したときは黙っている。
+        let path = settings_temp_dir("cycle-autosave-quiet").join("config.toml");
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &path).await;
+
+        assert_eq!(app.notice, None);
+        assert_eq!(app.error, None);
+    }
+
+    #[tokio::test]
+    async fn an_autosaved_mode_survives_a_later_escape() {
+        // 設定画面を開いて Esc で戻したときに、直前の自動保存まで巻き戻さない。
+        let path = settings_temp_dir("cycle-autosave-escape").join("config.toml");
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &path).await;
+        assert_eq!(
+            app.settings_backup.display.mode,
+            DisplayMode::Text,
+            "保存した内容が Esc の戻り先になる"
+        );
+
+        open_settings(&mut app, &mut session);
+        close_settings(&mut app);
+        assert_eq!(app.settings.display.mode, DisplayMode::Text);
+    }
+
+    #[tokio::test]
+    async fn a_failed_autosave_still_switches_the_display() {
+        let dir = settings_temp_dir("cycle-autosave-blocked");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "ファイルなので中に書けない").expect("書ける");
+
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &blocker.join("config.toml")).await;
+
+        assert_eq!(app.display, DisplayMode::Text, "再生はそのまま続ける");
+        assert!(!lines(&sent).is_empty(), "mpv へは送れている");
+        let error = app.error.clone().expect("保存できない理由を出す");
+        assert!(error.contains("保存できません"), "{error}");
+        // 保存できていないので、次の保存で焼き付く値も Esc の戻り先も切り替える前のまま。
+        assert_eq!(app.settings.display.mode, DisplayMode::Embedded);
+        assert_eq!(app.settings_backup.display.mode, DisplayMode::Embedded);
+    }
+
+    #[tokio::test]
+    async fn a_failed_autosave_does_not_leave_the_settings_screen_out_of_step() {
+        // 保存できなかった値が settings に残ると、後の s がファイルへ書けない値を焼き付ける。
+        let dir = settings_temp_dir("cycle-autosave-mismatch");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "ファイルなので中に書けない").expect("書ける");
+
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_to(&mut app, &mut session, &blocker.join("config.toml")).await;
+
+        open_settings(&mut app, &mut session);
+        close_settings(&mut app);
+        let path = dir.join("config.toml");
+        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
+
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert!(written.contains("mode = \"embedded\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn cycling_without_a_place_to_save_says_so_and_keeps_playing() {
+        let mut app = playing_app();
+        let mut session = Session::default();
+        let _sent = record(&mut session, Ok(()));
+        cycle_display_mode(&mut app, &mut session, None, std::time::Instant::now()).await;
+
+        assert_eq!(app.display, DisplayMode::Text);
+        assert_eq!(app.error.as_deref(), Some(NO_CONFIG_PATH));
+        assert_eq!(app.settings.display.mode, DisplayMode::Embedded);
     }
 
     #[tokio::test]

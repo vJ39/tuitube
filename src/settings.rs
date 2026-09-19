@@ -1029,13 +1029,86 @@ fn write_new(path: &Path, text: &str) -> Result<(), String> {
 }
 
 /// 途中で落ちても壊れたファイルを残さないよう、一時ファイルへ書いてから置き換える。
-pub fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     let tmp = path.with_extension("toml.tmp");
-    write_new(&tmp, &render(settings))?;
+    write_new(&tmp, text)?;
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         e.to_string()
     })
+}
+
+/// 設定画面の s での保存。render で全文を作り直すので、ファイルに書いてあった
+/// コメントと tuitube が持たないキーは残らない。
+pub fn save_to(path: &Path, settings: &Settings) -> Result<(), String> {
+    write_atomic(path, &render(settings))
+}
+
+/// display.mode の行だけを差し替える。再生中の w は保存を意図した操作ではないので、
+/// 全文の書き直し (= 利用者のコメントと未知のキーが消える) を起こさない。
+pub fn save_display_mode_to(path: &Path, mode: DisplayMode) -> Result<(), String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        // まだファイルが無ければ残すものも無いので、起動時と同じテンプレートを作る。
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let settings = Settings {
+                display: DisplaySettings {
+                    mode,
+                    ..DisplaySettings::default()
+                },
+                ..Settings::default()
+            };
+            return save_to(path, &settings);
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let updated = with_display_mode(&text, mode);
+    // 読み直して値が入っているか確かめてから置き換える。手書きの書き方 (dotted key など)
+    // では行を見つけられず、足した行が重複キーになることがある。
+    if parse(&updated)
+        .ok()
+        .and_then(|raw| raw.display?.mode)
+        .as_deref()
+        != Some(mode.key())
+    {
+        return Err("display.mode の行を書き換えられません".to_string());
+    }
+    write_atomic(path, &updated)
+}
+
+/// `[display]` の mode 行だけを差し替えた全文。行が無ければ節の頭へ、
+/// 節ごと無ければ末尾へ足す。他の行には触らない。
+fn with_display_mode(text: &str, mode: DisplayMode) -> String {
+    let new_line = format!("mode = \"{}\"", mode.key());
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut in_display = false;
+    let (mut header, mut target) = (None, None);
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_display = trimmed == "[display]";
+            if in_display {
+                header = Some(i);
+            }
+        } else if in_display && target.is_none() && is_key_line(trimmed, "mode") {
+            target = Some(i);
+        }
+    }
+    match (target, header) {
+        (Some(i), _) => lines[i] = new_line,
+        (None, Some(i)) => lines.insert(i + 1, new_line),
+        (None, None) => lines.extend([String::new(), "[display]".to_string(), new_line]),
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// `key = ...` の行か。コメント行や前方一致する別のキーには当てない。
+fn is_key_line(trimmed: &str, key: &str) -> bool {
+    trimmed
+        .strip_prefix(key)
+        .is_some_and(|rest| rest.trim_start().starts_with('='))
 }
 
 pub fn load() -> Loaded {
@@ -1806,6 +1879,90 @@ mod tests {
             fs::read_to_string(&path).expect("読める"),
             render(&Settings::default())
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_display_mode_to_rewrites_only_the_mode_line() {
+        let dir = temp_dir("save-mode-line");
+        let path = dir.join("config.toml");
+        // 手で書いたコメント・丸められる値・tuitube が持たないキーを混ぜておく。
+        let before = "# 自分のメモ\n[display]\n# 表示\nmode = \"embedded\"\nquality = \"high\"\n\n[search]\nlimit = 5000\nmy_key = \"残る\"\n";
+        fs::write(&path, before).expect("書ける");
+
+        save_display_mode_to(&path, DisplayMode::Window).expect("保存できる");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("読める"),
+            before.replace("\"embedded\"", "\"window\"")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_display_mode_to_adds_the_line_when_it_is_missing() {
+        let dir = temp_dir("save-mode-add");
+        let path = dir.join("config.toml");
+        for (before, after) in [
+            (
+                "[display]\nquality = \"low\"\n",
+                "[display]\nmode = \"text\"\nquality = \"low\"\n",
+            ),
+            // mode を持つ別の節があっても [display] の側へ書く。
+            (
+                "[search]\nlimit = 5\n",
+                "[search]\nlimit = 5\n\n[display]\nmode = \"text\"\n",
+            ),
+            (
+                "[display]\n# mode = \"window\"\n",
+                "[display]\nmode = \"text\"\n# mode = \"window\"\n",
+            ),
+        ] {
+            fs::write(&path, before).expect("書ける");
+            save_display_mode_to(&path, DisplayMode::Text).expect("保存できる");
+            assert_eq!(
+                fs::read_to_string(&path).expect("読める"),
+                after,
+                "{before}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_display_mode_to_creates_the_template_when_there_is_no_file() {
+        let dir = temp_dir("save-mode-new");
+        let path = dir.join("nested/config.toml");
+
+        save_display_mode_to(&path, DisplayMode::Text).expect("保存できる");
+
+        let expected = Settings {
+            display: DisplaySettings {
+                mode: DisplayMode::Text,
+                ..DisplaySettings::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(
+            fs::read_to_string(&path).expect("読める"),
+            render(&expected),
+            "親ディレクトリごと作る"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_display_mode_to_keeps_the_file_when_the_line_cannot_be_placed() {
+        let dir = temp_dir("save-mode-dotted");
+        let path = dir.join("config.toml");
+        // dotted key の display は節として現れないので、足すと重複キーになる。
+        let before = "display.mode = \"embedded\"\n";
+        fs::write(&path, before).expect("書ける");
+
+        let error = save_display_mode_to(&path, DisplayMode::Text).expect_err("書き換えられない");
+
+        assert!(error.contains("display.mode"), "{error}");
+        assert_eq!(fs::read_to_string(&path).expect("読める"), before);
         let _ = fs::remove_dir_all(&dir);
     }
 

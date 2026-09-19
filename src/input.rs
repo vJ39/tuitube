@@ -2,11 +2,11 @@
 
 use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
-    close_settings, copy_url_with, cycle_display_mode, hide_current_channel, hide_selected,
-    leave_channel, like_video, move_selection, move_settings_selection, open_channel,
-    open_settings, reload_channel_tab, reload_tab, reset_speed, save_settings, scroll_comments,
-    seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player, start_playback,
-    start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
+    close_settings, config_path_from_env, copy_url_with, cycle_display_mode, hide_current_channel,
+    hide_selected, leave_channel, like_video, move_selection, move_settings_selection,
+    open_channel, open_settings, reload_channel_tab, reload_tab, reset_speed, save_settings,
+    scroll_comments, seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player,
+    start_playback, start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
     toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
@@ -19,6 +19,7 @@ use crate::seekbar::{MouseAction, MouseInput};
 use crate::ui;
 use crate::video::CellSize;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::path::Path;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub async fn handle_key(
@@ -270,10 +271,21 @@ async fn handle_key_playing(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
-    handle_key_playing_with(app, key, tx, session, Pbcopy, Oauth::real()).await;
+    let config = config_path_from_env();
+    handle_key_playing_with(
+        app,
+        key,
+        tx,
+        session,
+        Pbcopy,
+        Oauth::real(),
+        config.as_deref(),
+    )
+    .await;
 }
 
-/// クリップボードの書き手を差し替えられる形。テストはここに偽物を渡して pbcopy を起動させない。
+/// クリップボードの書き手と設定ファイルの置き場を差し替えられる形。テストはここに
+/// 偽物と一時ファイルを渡して pbcopy を起動させず、利用者の設定も書き換えない。
 async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     app: &mut App,
     key: KeyEvent,
@@ -281,6 +293,7 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     session: &mut Session,
     clipboard: C,
     deps: Oauth<B>,
+    config: Option<&Path>,
 ) {
     // コメントを読んでいる間の ↑↓ は一覧送り。音量は閉じてから。
     if app.comments.visible()
@@ -303,7 +316,7 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     }
     // 複数コマンドと App の状態更新を伴うので playing_command には入れない。
     if key.code == KeyCode::Char('w') {
-        cycle_display_mode(app, session).await;
+        cycle_display_mode(app, session, config, std::time::Instant::now()).await;
     }
     if key.code == KeyCode::Char('c') {
         copy_url_with(app, clipboard, std::time::Instant::now()).await;
@@ -556,6 +569,13 @@ mod tests {
                 token: dir.join("absent_token.toml"),
             }),
         }
+    }
+
+    /// 表示モードの自動保存の書き先。利用者の設定を書き換えない一時ファイルを渡す。
+    fn temp_config(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tuitube-input-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("config.toml")
     }
 
     fn result(id: &str) -> SearchResult {
@@ -991,6 +1011,7 @@ mod tests {
             &mut session,
             clipboard.clone(),
             fake_oauth(),
+            Some(&temp_config("scratch")),
         )
         .await;
 
@@ -1040,6 +1061,7 @@ mod tests {
             &mut session,
             clipboard.clone(),
             fake_oauth(),
+            Some(&temp_config("scratch")),
         )
         .await;
 
@@ -1068,9 +1090,42 @@ mod tests {
             KeyCode::Up,
             KeyCode::Down,
         ] {
-            handle_key_playing(&mut app, key(code), &tx, &mut session).await;
+            handle_key_playing_with(
+                &mut app,
+                key(code),
+                &tx,
+                &mut session,
+                FakeClipboard::new(CopyResult::Ok),
+                fake_oauth(),
+                Some(&temp_config("scratch")),
+            )
+            .await;
             assert!(app.subtitles.wanted(), "{code:?} で字幕が動いた");
         }
+    }
+
+    #[tokio::test]
+    async fn w_writes_the_new_display_mode_to_the_config_file() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let _sent = record(&mut session);
+        let mut app = playing_app();
+        let path = temp_config("w-autosave");
+
+        handle_key_playing_with(
+            &mut app,
+            key(KeyCode::Char('w')),
+            &tx,
+            &mut session,
+            FakeClipboard::new(CopyResult::Ok),
+            fake_oauth(),
+            Some(&path),
+        )
+        .await;
+
+        assert_eq!(app.display, DisplayMode::Text);
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert!(written.contains("mode = \"text\""), "{written}");
     }
 
     /// チャンネル一覧を見ている状態。
@@ -1164,6 +1219,7 @@ mod tests {
             &mut session,
             clipboard,
             fake_oauth(),
+            Some(&temp_config("scratch")),
         )
         .await;
 
@@ -1186,6 +1242,7 @@ mod tests {
             &mut session,
             clipboard,
             fake_oauth(),
+            Some(&temp_config("scratch")),
         )
         .await;
 
@@ -1212,6 +1269,7 @@ mod tests {
                 &mut session,
                 FakeClipboard::new(CopyResult::Ok),
                 fake_oauth(),
+                Some(&temp_config("scratch")),
             )
             .await;
             assert!(session.oauth_task.is_none(), "{code:?} でいいねが走った");
@@ -1282,6 +1340,7 @@ mod tests {
                 &mut session,
                 clipboard.clone(),
                 fake_oauth(),
+                Some(&temp_config("scratch")),
             )
             .await;
         }
@@ -2483,7 +2542,7 @@ mod tests {
     async fn backspace_takes_back_a_digit_and_an_empty_enter_changes_nothing() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
-        let mut app = settings_at(5, &tx, &mut session).await;
+        let mut app = settings_at(6, &tx, &mut session).await;
         assert_eq!(app.settings_item().label(), "search.limit");
 
         type_digits(&mut app, "12", &tx, &mut session).await;
@@ -2508,7 +2567,7 @@ mod tests {
     async fn a_number_beyond_the_range_is_pulled_back_to_the_edge() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
-        let mut app = settings_at(5, &tx, &mut session).await;
+        let mut app = settings_at(6, &tx, &mut session).await;
 
         type_digits(&mut app, "9999", &tx, &mut session).await;
         handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
@@ -2537,7 +2596,7 @@ mod tests {
     async fn the_other_keys_do_nothing_while_a_number_is_being_typed() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
-        let mut app = settings_at(5, &tx, &mut session).await;
+        let mut app = settings_at(6, &tx, &mut session).await;
         type_digits(&mut app, "1", &tx, &mut session).await;
 
         for code in [
@@ -2552,7 +2611,7 @@ mod tests {
             handle_key(&mut app, key(code), &tx, &mut session).await;
         }
 
-        assert_eq!(app.settings_selected, 5, "行は動かさない");
+        assert_eq!(app.settings_selected, 6, "行は動かさない");
         assert_eq!(app.settings_edit.as_deref(), Some("1"));
         assert_eq!(app.settings, crate::settings::Settings::default());
         assert_eq!(app.mode, Mode::Settings);
@@ -2563,7 +2622,7 @@ mod tests {
     async fn a_digit_with_a_modifier_does_not_start_or_feed_the_typing() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
-        let mut app = settings_at(5, &tx, &mut session).await;
+        let mut app = settings_at(6, &tx, &mut session).await;
 
         for modifiers in [KeyModifiers::ALT, KeyModifiers::SUPER] {
             let event = KeyEvent::new(KeyCode::Char('3'), modifiers);
@@ -2599,7 +2658,7 @@ mod tests {
     async fn the_typing_stops_at_the_digits_the_value_can_take() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
-        let mut app = settings_at(5, &tx, &mut session).await;
+        let mut app = settings_at(6, &tx, &mut session).await;
         assert_eq!(app.settings_item().label(), "search.limit");
 
         // 上限 1000 の 4 桁まで。キーリピートで伸び続けると Enter が効かなくなる。
@@ -2614,7 +2673,7 @@ mod tests {
     async fn opening_and_closing_the_settings_drops_a_half_typed_number() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
-        let mut app = settings_at(5, &tx, &mut session).await;
+        let mut app = settings_at(6, &tx, &mut session).await;
         type_digits(&mut app, "12", &tx, &mut session).await;
 
         // 打ち込み中のまま画面を離れても、次に開いたときは通常の操作から始める。

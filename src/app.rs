@@ -169,14 +169,15 @@ impl ChannelView {
 }
 
 /// 設定画面で編集できる項目。画面の並びはこの順。
-/// ここに無い値 (window.* / cookies.* / mpv.extra_args / subtitles.lang / categories) は
-/// config.toml を直接編集する。
+/// ここに無い値 (window.ontop 以外の window.* / cookies.* / mpv.extra_args /
+/// subtitles.lang / categories) は config.toml を直接編集する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsItem {
     DisplayMode,
     DisplayQuality,
     FpsCap,
     SubtitlesEnabled,
+    WindowOntop,
     SearchLayout,
     SearchLimit,
     SearchTimeoutSecs,
@@ -187,11 +188,12 @@ pub enum SettingsItem {
     ThumbnailsTimeoutSecs,
 }
 
-pub const SETTINGS_ITEMS: [SettingsItem; 12] = [
+pub const SETTINGS_ITEMS: [SettingsItem; 13] = [
     SettingsItem::DisplayMode,
     SettingsItem::DisplayQuality,
     SettingsItem::FpsCap,
     SettingsItem::SubtitlesEnabled,
+    SettingsItem::WindowOntop,
     SettingsItem::SearchLayout,
     SettingsItem::SearchLimit,
     SettingsItem::SearchTimeoutSecs,
@@ -233,6 +235,7 @@ impl SettingsItem {
             Self::DisplayQuality => "display.quality",
             Self::FpsCap => "fps_cap",
             Self::SubtitlesEnabled => "subtitles.enabled",
+            Self::WindowOntop => "window.ontop",
             Self::SearchLayout => "search.layout",
             Self::SearchLimit => "search.limit",
             Self::SearchTimeoutSecs => "search.timeout_secs",
@@ -254,6 +257,7 @@ impl SettingsItem {
                 None => "0 (無制限)".to_string(),
             },
             Self::SubtitlesEnabled => settings.subtitles.enabled.to_string(),
+            Self::WindowOntop => settings.window.ontop.to_string(),
             Self::SearchLayout => settings.search.layout.key().to_string(),
             Self::SearchLimit => settings.search.limit.to_string(),
             Self::SearchTimeoutSecs => settings.search.timeout.as_secs().to_string(),
@@ -304,6 +308,7 @@ impl SettingsItem {
             Self::DisplayMode
             | Self::DisplayQuality
             | Self::SubtitlesEnabled
+            | Self::WindowOntop
             | Self::SearchLayout
             | Self::SearchCacheEnabled
             | Self::ThumbnailsEnabled => return 0,
@@ -346,6 +351,7 @@ impl SettingsItem {
             Self::DisplayMode
             | Self::DisplayQuality
             | Self::SubtitlesEnabled
+            | Self::WindowOntop
             | Self::SearchLayout
             | Self::SearchCacheEnabled
             | Self::ThumbnailsEnabled => return false,
@@ -373,6 +379,7 @@ impl SettingsItem {
                 settings.fps_cap = FpsCap::new(next as u32);
             }
             Self::SubtitlesEnabled => settings.subtitles.enabled = !settings.subtitles.enabled,
+            Self::WindowOntop => settings.window.ontop = !settings.window.ontop,
             Self::SearchLayout => {
                 let layout = settings.search.layout;
                 settings.search.layout = if up { layout.next() } else { layout.prev() };
@@ -1063,7 +1070,7 @@ pub fn format_time(seconds: Option<f64>) -> String {
 mod tests {
     use super::*;
     use crate::cookies::{ChannelTab, CookieSource, Feed};
-    use crate::display::Quality;
+    use crate::display::{Quality, WindowOptions};
     use crate::grid::LayoutMode;
     use crate::speed::Speed;
     use crate::subtitles::{SELECT_GRACE, SubtitleStatus};
@@ -1944,6 +1951,7 @@ mod tests {
                 "display.quality",
                 "fps_cap",
                 "subtitles.enabled",
+                "window.ontop",
                 "search.layout",
                 "search.limit",
                 "search.timeout_secs",
@@ -1966,6 +1974,7 @@ mod tests {
                 "display.quality: medium",
                 "fps_cap: 15",
                 "subtitles.enabled: true",
+                "window.ontop: false",
                 "search.layout: grid",
                 "search.limit: 10",
                 "search.timeout_secs: 30",
@@ -2001,7 +2010,7 @@ mod tests {
         assert!(row.contains("保存しません"), "{row}");
 
         // 上書きされていない行には何も足さない。
-        assert_eq!(app.settings_rows()[5], "search.limit: 10");
+        assert_eq!(app.settings_rows()[6], "search.limit: 10");
         assert_eq!(App::default().settings_rows()[2], "fps_cap: 15");
     }
 
@@ -2073,7 +2082,29 @@ mod tests {
             assert!(!settings.thumbnails.enabled, "{delta}");
             SettingsItem::ThumbnailsEnabled.adjust(&mut settings, delta);
             assert!(settings.thumbnails.enabled, "{delta}");
+
+            SettingsItem::WindowOntop.adjust(&mut settings, delta);
+            assert!(settings.window.ontop, "{delta}");
+            SettingsItem::WindowOntop.adjust(&mut settings, delta);
+            assert!(!settings.window.ontop, "{delta}");
         }
+    }
+
+    #[test]
+    fn the_ontop_row_changes_only_the_window_section() {
+        let settings = Settings::default();
+        let next = adjusted(SettingsItem::WindowOntop, 1, &settings);
+        assert!(next.window.ontop);
+        assert_eq!(
+            next,
+            Settings {
+                window: WindowOptions {
+                    ontop: true,
+                    ..settings.window.clone()
+                },
+                ..settings
+            }
+        );
     }
 
     #[test]
