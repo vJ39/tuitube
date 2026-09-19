@@ -404,9 +404,6 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     if key.code == KeyCode::Char('d') {
         open_download(app, session);
     }
-    if key.code == KeyCode::Char('q') {
-        app.should_quit = true;
-    }
 }
 
 /// マウス。再生中はシーク、入力欄はタブと検索欄のカーソル移動、
@@ -1434,7 +1431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_q_quits_the_app_while_playing() {
+    async fn q_stops_playback_without_quitting_the_app() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
@@ -1443,12 +1440,14 @@ mod tests {
         };
 
         // player が無い間もキー処理は進み、送信だけが飛ばされる。
+        // q は Esc と同じく再生を止めるだけ。アプリごと終了しない。
         handle_key_playing(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
         assert!(!app.should_quit);
         assert!(app.error.is_none());
 
         handle_key_playing(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
-        assert!(app.should_quit);
+        assert!(!app.should_quit);
+        assert!(app.error.is_none());
     }
 
     #[tokio::test]
