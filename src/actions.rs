@@ -16,7 +16,7 @@ use crate::speed::Speed;
 use crate::subtitles::{self, SubtitleLaunch, SubtitleStatus};
 use crate::thumbs;
 use crate::ui;
-use crate::video::{DecoderKind, VideoSink};
+use crate::video::{CellSize, DecoderKind, VideoSink};
 use ratatui::layout::Rect;
 use std::future::Future;
 use std::path::Path;
@@ -347,7 +347,12 @@ pub fn reload_tab_with<R>(
 
 /// 格子の中の移動。リスト表示に落ちているときは既存の巻き戻る移動を使う。
 pub fn move_selection(app: &mut App, dir: Dir) {
-    let Some(layout) = ui::grid_layout(app, cell_size()) else {
+    move_selection_with(app, cell_size(), dir);
+}
+
+/// 指定のセル寸法での移動。端末に聞いた寸法を使わない呼び手はこちら。
+pub fn move_selection_with(app: &mut App, cell: CellSize, dir: Dir) {
+    let Some(layout) = ui::grid_layout(app, cell) else {
         match dir {
             Dir::Down => app.select_next(),
             Dir::Up => app.select_prev(),
@@ -2419,13 +2424,13 @@ mod tests {
     #[test]
     fn move_selection_walks_the_grid_and_scrolls_only_when_needed() {
         let mut app = grid_app(10);
-        move_selection(&mut app, Dir::Right);
+        move_selection_with(&mut app, CELL, Dir::Right);
         assert_eq!(app.selected, 1);
-        move_selection(&mut app, Dir::Down);
+        move_selection_with(&mut app, CELL, Dir::Down);
         assert_eq!(app.selected, 5);
-        move_selection(&mut app, Dir::Up);
+        move_selection_with(&mut app, CELL, Dir::Up);
         assert_eq!(app.selected, 1);
-        move_selection(&mut app, Dir::Left);
+        move_selection_with(&mut app, CELL, Dir::Left);
         assert_eq!(app.selected, 0);
         // 可視範囲の中で動くだけなら貼り直さない。
         assert_eq!(app.scroll, 0);

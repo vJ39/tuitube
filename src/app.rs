@@ -381,6 +381,10 @@ pub struct App {
     pub video: Option<VideoSink>,
     /// 直近の terminal.draw() が描いた画面。マウスの当たり判定はこれで割り付ける。
     pub screen: Rect,
+    /// results を入れ替えた回数。
+    pub results_generation: u64,
+    /// 直近の draw が描いた results_generation。
+    pub drawn_generation: u64,
     pub seek_bar: SeekBarState,
     pub should_quit: bool,
     /// 擬似カテゴリタブ。results / selected / scroll はここの写し。
@@ -426,6 +430,8 @@ impl Default for App {
             settings,
             video: None,
             screen: Rect::default(),
+            results_generation: 0,
+            drawn_generation: 0,
             seek_bar: SeekBarState::default(),
             should_quit: false,
             tabs: Tabs::default(),
@@ -530,9 +536,21 @@ impl App {
         }
     }
 
+    /// 描いたことを控える。ここから結果が入れ替わるまでのクリックは、見えている画面を指す。
+    pub fn mark_drawn(&mut self) {
+        self.drawn_generation = self.results_generation;
+    }
+
+    /// 今の results が、利用者の見ている画面に描かれたものか。
+    /// 偽の間に届いたクリックは、入れ替わる前の画面を狙ったもの。
+    pub fn results_are_drawn(&self) -> bool {
+        self.drawn_generation == self.results_generation
+    }
+
     /// 今のタブの内容を App 側の写しへ取り込む。サムネイルの状態表も入れ替える。
     pub fn sync_from_tab(&mut self) {
         let state = self.tabs.state();
+        self.results_generation = self.results_generation.wrapping_add(1);
         self.results = state.results.clone();
         self.selected = state.selected;
         self.scroll = state.scroll;

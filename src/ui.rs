@@ -396,6 +396,20 @@ pub fn tab_at_point(app: &App, column: u16, row: u16) -> Option<usize> {
     tab_at_column(&labels, width, range, (column - area.x) as usize)
 }
 
+/// 画面のこの位置にある結果。格子の隙間や、リスト表示では None。
+/// 描画と同じ割り付けを通るので、見えているセルと判定がずれない。
+pub fn result_at_point(app: &App, cell: CellSize, column: u16, row: u16) -> Option<usize> {
+    let layout = grid_layout(app, cell)?;
+    let at = Position::new(column, row);
+    layout
+        .cells
+        .iter()
+        .position(|cell| {
+            cell.image.contains(at) || cell.title.contains(at) || cell.meta.contains(at)
+        })
+        .map(|i| layout.offset + i)
+}
+
 /// 可視範囲と総数。スクロールしても今どこを見ているか分かるようにする。
 fn results_title(offset: usize, shown: usize, total: usize) -> String {
     if total == 0 || shown == 0 {
@@ -1138,6 +1152,177 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 割り付けを端末の申告で揺らさないための寸法。
+    const CELL: CellSize = CellSize {
+        width_px: 8,
+        height_px: 16,
+    };
+
+    /// 80x24 の検索画面。CELL なら格子は 4 列 2 行になる。
+    fn grid_app(count: usize) -> App {
+        App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            results: (0..count).map(result).collect(),
+            ..App::default()
+        }
+    }
+
+    /// 矩形の左上と右下。両端が同じセルを指すことを確かめるための 2 点。
+    fn corners(rect: Rect) -> [(u16, u16); 2] {
+        [(rect.x, rect.y), (rect.right() - 1, rect.bottom() - 1)]
+    }
+
+    #[test]
+    fn clicking_a_cell_answers_with_the_result_behind_it() {
+        let app = grid_app(10);
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        assert_eq!(layout.cells.len(), 8, "4 列 2 行");
+
+        for (i, cell) in layout.cells.iter().enumerate() {
+            // 画像・タイトル・時間の行はどれも同じ結果を指す。
+            for rect in [cell.image, cell.title, cell.meta] {
+                for (column, row) in corners(rect) {
+                    assert_eq!(
+                        result_at_point(&app, CELL, column, row),
+                        Some(layout.offset + i),
+                        "{rect:?} の ({column},{row})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_hit_test_agrees_with_the_drawn_cells() {
+        let app = grid_app(10);
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        for row in 0..app.screen.height {
+            for column in 0..app.screen.width {
+                let at = Position::new(column, row);
+                let drawn = layout.cells.iter().position(|cell| {
+                    cell.image.contains(at) || cell.title.contains(at) || cell.meta.contains(at)
+                });
+                assert_eq!(
+                    result_at_point(&app, CELL, column, row),
+                    drawn.map(|i| layout.offset + i),
+                    "({column},{row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_margins_around_a_cell_answer_nothing() {
+        let app = grid_app(10);
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        let first = layout.cells[0];
+        let inner = results_inner(app.screen);
+
+        // セルの右に空けた余白。
+        assert_eq!(
+            result_at_point(&app, CELL, first.image.right(), first.image.y),
+            None
+        );
+        // 時間の行の下に積んだ下余白。
+        assert_eq!(
+            result_at_point(&app, CELL, first.meta.x, first.meta.bottom()),
+            None
+        );
+        // 結果ブロックの枠。
+        assert_eq!(result_at_point(&app, CELL, inner.x - 1, inner.y), None);
+        assert_eq!(result_at_point(&app, CELL, inner.x, inner.y - 1), None);
+    }
+
+    #[test]
+    fn the_list_view_has_no_clickable_cells() {
+        let mut app = grid_app(10);
+        let first = grid_layout(&app, CELL).expect("格子を組める").cells[0].image;
+        assert_eq!(result_at_point(&app, CELL, first.x, first.y), Some(0));
+
+        app.settings.search.layout = LayoutMode::List;
+        for row in 0..app.screen.height {
+            for column in 0..app.screen.width {
+                assert_eq!(
+                    result_at_point(&app, CELL, column, row),
+                    None,
+                    "({column},{row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_too_small_for_a_grid_has_no_clickable_cells() {
+        let mut app = grid_app(10);
+        app.screen = Rect::new(0, 0, 80, 10);
+        assert!(grid_layout(&app, CELL).is_none(), "格子を組めない");
+
+        for row in 0..app.screen.height {
+            for column in 0..app.screen.width {
+                assert_eq!(
+                    result_at_point(&app, CELL, column, row),
+                    None,
+                    "({column},{row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_result_list_has_no_clickable_cells() {
+        let app = grid_app(0);
+        for row in 0..app.screen.height {
+            for column in 0..app.screen.width {
+                assert_eq!(
+                    result_at_point(&app, CELL, column, row),
+                    None,
+                    "({column},{row})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_scrolled_grid_answers_with_the_scrolled_index() {
+        let mut app = grid_app(20);
+        app.scroll = 4;
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        assert_eq!(layout.offset, 4);
+
+        let first = layout.cells[0].image;
+        assert_eq!(result_at_point(&app, CELL, first.x, first.y), Some(4));
+    }
+
+    #[test]
+    fn the_last_page_has_nothing_past_the_last_result() {
+        let mut app = grid_app(10);
+        app.scroll = 8;
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        assert_eq!(layout.cells.len(), 2, "残りは 2 件");
+
+        let image = layout.cells[0].image;
+        assert_eq!(result_at_point(&app, CELL, image.x, image.y), Some(8));
+        // 3 つめが来ていたはずの桁 (セル 1 つぶん右) には何も無い。
+        let pitch = layout.cells[1].image.x - image.x;
+        assert_eq!(
+            result_at_point(&app, CELL, image.x + 2 * pitch, image.y),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cell_without_a_thumbnail_is_still_clickable() {
+        let app = grid_app(10);
+        assert!(app.thumbs.get("id0").is_none(), "画像はまだ届いていない");
+
+        let first = grid_layout(&app, CELL).expect("格子を組める").cells[0];
+        assert_eq!(
+            result_at_point(&app, CELL, first.image.x, first.image.y),
+            Some(0)
+        );
     }
 
     #[test]

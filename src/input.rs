@@ -9,10 +9,12 @@ use crate::actions::{
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
+use crate::geometry::cell_size;
 use crate::grid::Dir;
 use crate::mpv::{self, MpvCommand};
 use crate::seekbar::{MouseAction, MouseInput};
 use crate::ui;
+use crate::video::CellSize;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -254,7 +256,7 @@ async fn handle_key_playing_with<C: Clipboard>(
     }
 }
 
-/// マウス。再生中はシーク、検索画面はタブのクリックだけを見る。
+/// マウス。再生中はシーク、入力欄はタブ、結果一覧はタブと格子のクリックを見る。
 pub async fn handle_mouse(
     app: &mut App,
     mouse: MouseEvent,
@@ -263,7 +265,8 @@ pub async fn handle_mouse(
 ) {
     match app.mode {
         Mode::Playing => handle_mouse_playing(app, mouse, session).await,
-        Mode::Input | Mode::Results => handle_mouse_tabs(app, mouse, tx, session),
+        Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
+        Mode::Input => handle_mouse_tabs(app, mouse, tx, session),
         Mode::Settings => {}
     }
 }
@@ -282,6 +285,45 @@ fn handle_mouse_tabs(
         return;
     };
     select_tab(app, tx, session, index);
+}
+
+/// 結果一覧でのクリックの行き先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultsClick {
+    Tab(usize),
+    Play(usize),
+}
+
+/// タブ行を先に見る。タブ行は結果の格子と重ならないが、既存の選択操作を優先しておく。
+fn results_click(app: &App, cell: CellSize, mouse: MouseEvent) -> Option<ResultsClick> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return None;
+    }
+    if let Some(index) = ui::tab_at_point(app, mouse.column, mouse.row) {
+        return Some(ResultsClick::Tab(index));
+    }
+    // 描いた後に結果が入れ替わっていると、同じ座標が別の動画を指す。
+    // タブ行と違って再生が走ってしまうので、次の描画まで待つ。
+    if !app.results_are_drawn() {
+        return None;
+    }
+    ui::result_at_point(app, cell, mouse.column, mouse.row).map(ResultsClick::Play)
+}
+
+async fn handle_mouse_results(
+    app: &mut App,
+    mouse: MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    match results_click(app, cell_size(), mouse) {
+        Some(ResultsClick::Tab(index)) => select_tab(app, tx, session, index),
+        Some(ResultsClick::Play(index)) => {
+            app.selected = index;
+            start_playback(app, tx, session).await;
+        }
+        None => {}
+    }
 }
 
 async fn handle_mouse_playing(app: &mut App, mouse: MouseEvent, session: &mut Session) {
@@ -422,7 +464,13 @@ mod tests {
         }
     }
 
-    /// 80x24 の検索画面。格子は 4 列 2 行になる。
+    /// 割り付けを端末の申告で揺らさないための寸法。
+    const CELL: CellSize = CellSize {
+        width_px: 8,
+        height_px: 16,
+    };
+
+    /// 80x24 の検索画面。CELL なら格子は 4 列 2 行になる。
     fn grid_app(count: usize) -> App {
         let mut app = App {
             mode: Mode::Results,
@@ -431,6 +479,8 @@ mod tests {
         };
         let results: Vec<SearchResult> = (0..count).map(|i| result(&format!("id{i}"))).collect();
         app.set_results(results, &crate::cookies::Target::Search("q".to_string()));
+        // 本番では set_results の後に必ず draw が挟まる。
+        app.mark_drawn();
         app
     }
 
@@ -1077,11 +1127,11 @@ mod tests {
         let mut session = Session::default();
         let mut app = grid_app(4);
 
-        // 区切りの上、入力ボックス、結果、行の右の余白。
+        // 区切りの上、入力ボックス、結果ブロックの枠、行の右の余白。
         let spots = [
             tab_click(7),
             mouse(MouseEventKind::Down(MouseButton::Left), 9, 1),
-            mouse(MouseEventKind::Down(MouseButton::Left), 9, 10),
+            mouse(MouseEventKind::Down(MouseButton::Left), 0, 10),
             tab_click(79),
         ];
         for spot in spots {
@@ -1109,6 +1159,195 @@ mod tests {
             assert_eq!(app.tabs.selected(), 0, "{kind:?}");
             assert!(!take_search(&mut session), "{kind:?}");
         }
+    }
+
+    /// 格子の `index` 番目のセル (画像の左上) の押し込み。
+    fn cell_click(app: &App, index: usize) -> MouseEvent {
+        let layout = ui::grid_layout(app, CELL).expect("格子を組める");
+        let image = layout.cells[index].image;
+        mouse(MouseEventKind::Down(MouseButton::Left), image.x, image.y)
+    }
+
+    #[test]
+    fn clicking_a_cell_asks_to_play_that_result() {
+        let app = grid_app(10);
+        let cells = ui::grid_layout(&app, CELL)
+            .expect("格子を組める")
+            .cells
+            .len();
+        assert_eq!(cells, 8, "4 列 2 行");
+
+        for index in 0..cells {
+            assert_eq!(
+                results_click(&app, CELL, cell_click(&app, index)),
+                Some(ResultsClick::Play(index)),
+                "{index} 番目のセル"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tab_row_wins_over_the_grid() {
+        let app = grid_app(10);
+        assert_eq!(
+            results_click(&app, CELL, tab_click(9)),
+            Some(ResultsClick::Tab(1))
+        );
+    }
+
+    #[test]
+    fn only_a_left_press_on_a_cell_asks_for_playback() {
+        let app = grid_app(10);
+        let at = cell_click(&app, 0);
+        let kinds = [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollDown,
+        ];
+        for kind in kinds {
+            assert_eq!(
+                results_click(&app, CELL, mouse(kind, at.column, at.row)),
+                None,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_between_the_cells_asks_for_nothing() {
+        let app = grid_app(10);
+        let layout = ui::grid_layout(&app, CELL).expect("格子を組める");
+        let first = layout.cells[0];
+        // セルの右の余白、時間の行の下、結果ブロックの枠。
+        let spots = [
+            (first.image.right(), first.image.y),
+            (first.meta.x, first.meta.bottom()),
+            (0, first.image.y),
+        ];
+        for (column, row) in spots {
+            let at = mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+            assert_eq!(results_click(&app, CELL, at), None, "({column},{row})");
+        }
+    }
+
+    #[test]
+    fn the_list_view_does_not_ask_for_playback() {
+        let mut app = grid_app(10);
+        let at = cell_click(&app, 0);
+        app.settings.search.layout = crate::grid::LayoutMode::List;
+        assert_eq!(results_click(&app, CELL, at), None);
+    }
+
+    #[test]
+    fn a_cell_click_waits_until_the_new_results_are_drawn() {
+        let mut app = grid_app(10);
+        let at = cell_click(&app, 1);
+        swap_in_new_results(&mut app);
+
+        assert_eq!(results_click(&app, CELL, at), None, "描く前のクリック");
+        // タブ行は結果の入れ替わりで動かないので、今までどおり通す。
+        assert_eq!(
+            results_click(&app, CELL, tab_click(9)),
+            Some(ResultsClick::Tab(1))
+        );
+
+        app.mark_drawn();
+        assert_eq!(
+            results_click(&app, CELL, at),
+            Some(ResultsClick::Play(1)),
+            "描き直した後のクリック"
+        );
+    }
+
+    /// 検索のやり直しが届いた状態。描き直す前なので、画面は古い一覧のまま。
+    fn swap_in_new_results(app: &mut App) {
+        let results: Vec<SearchResult> = (0..10).map(|i| result(&format!("new{i}"))).collect();
+        app.set_results(results, &crate::cookies::Target::Search("q".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_click_off_the_cells_does_not_start_playback() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        app.selected = 3;
+
+        // 結果ブロックの枠。タブ行にもセルにも当たらない。
+        let spot = mouse(MouseEventKind::Down(MouseButton::Left), 0, 10);
+        handle_mouse(&mut app, spot, &tx, &mut session).await;
+
+        assert_eq!(app.selected, 3, "選択は動かない");
+        assert_eq!(app.mode, Mode::Results);
+        assert!(session.player.is_none());
+        assert_eq!(session.player_nonce, 0, "再生は始めない");
+    }
+
+    #[tokio::test]
+    async fn the_list_view_ignores_a_click_on_a_row() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        let at = cell_click(&app, 1);
+        app.settings.search.layout = crate::grid::LayoutMode::List;
+        app.selected = 3;
+
+        handle_mouse(&mut app, at, &tx, &mut session).await;
+
+        assert_eq!(app.selected, 3);
+        assert!(session.player.is_none());
+        assert_eq!(session.player_nonce, 0);
+    }
+
+    #[tokio::test]
+    async fn the_input_screen_still_answers_only_tab_clicks() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        let at = cell_click(&app, 2);
+        app.mode = Mode::Input;
+        app.selected = 3;
+
+        handle_mouse(&mut app, at, &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Input, "セルを押しても入力欄のまま");
+        assert_eq!(app.selected, 3);
+        assert_eq!(session.player_nonce, 0);
+
+        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 1, "タブ行は今までどおり");
+        take_search(&mut session);
+    }
+
+    #[tokio::test]
+    async fn a_click_behind_a_finished_search_does_not_start_playback() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        let at = cell_click(&app, 1);
+        app.selected = 3;
+        swap_in_new_results(&mut app);
+
+        handle_mouse(&mut app, at, &tx, &mut session).await;
+
+        assert_eq!(app.selected, 0, "入れ替えが戻した先から動かない");
+        assert!(session.player.is_none());
+        assert_eq!(session.player_nonce, 0, "再生は始めない");
+    }
+
+    #[tokio::test]
+    async fn clicking_a_cell_while_playing_does_not_start_another_playback() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        let at = cell_click(&app, 1);
+        app.mode = Mode::Playing;
+        app.selected = 3;
+
+        handle_mouse(&mut app, at, &tx, &mut session).await;
+
+        assert_eq!(app.selected, 3);
+        assert_eq!(session.player_nonce, 0);
     }
 
     #[tokio::test]
