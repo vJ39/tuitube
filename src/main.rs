@@ -26,7 +26,7 @@ mod video;
 
 use actions::{Session, apply_resize, end_playback, on_tick, schedule_resize, stop_playback};
 use anyhow::Result;
-use app::{App, AppEvent, Mode};
+use app::{App, AppEvent, Mode, ViewKey};
 use category::Tabs;
 use cookies::{CookieOutcome, CookieState, Target};
 use crossterm::event::{
@@ -210,7 +210,7 @@ fn present_thumbs(
     let mut incomplete = false;
     if let Some(layout) = ui::grid_layout(app, cell) {
         for (i, rect) in layout.cells.iter().enumerate() {
-            let Some(result) = app.results.get(layout.offset + i) else {
+            let Some(result) = app.view_results().get(layout.offset + i) else {
                 break;
             };
             let Some(image) = app.thumbs.get(&result.id) else {
@@ -278,9 +278,9 @@ async fn handle_key_event<F>(
 ) where
     F: Fetcher + Send + Sync + 'static,
 {
-    let tab = app.tabs.selected();
+    let before = app.view_key();
     handle_key(app, key, tx, session).await;
-    refetch_thumbnails_if_tab_moved(app, tx, session, fetcher, tab);
+    refetch_thumbnails_if_view_moved(app, tx, session, fetcher, before);
 }
 
 /// マウスを捌き、タブが移っていたらサムネイルを取り直す。
@@ -293,23 +293,23 @@ async fn handle_mouse_event<F>(
 ) where
     F: Fetcher + Send + Sync + 'static,
 {
-    let tab = app.tabs.selected();
+    let before = app.view_key();
     handle_mouse(app, mouse, tx, session).await;
-    refetch_thumbnails_if_tab_moved(app, tx, session, fetcher, tab);
+    refetch_thumbnails_if_view_moved(app, tx, session, fetcher, before);
 }
 
-/// タブを移ると結果集合ごと入れ替わる。読み込み済みのタブでも
+/// タブやチャンネルを移ると結果集合ごと入れ替わる。読み込み済みでも
 /// メモリ上の画像は捨ててあるので、キャッシュから読み直す。
-fn refetch_thumbnails_if_tab_moved<F>(
+fn refetch_thumbnails_if_view_moved<F>(
     app: &mut App,
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
     fetcher: F,
-    before: usize,
+    before: ViewKey,
 ) where
     F: Fetcher + Send + Sync + 'static,
 {
-    if app.tabs.selected() != before {
+    if app.view_key() != before {
         actions::start_thumbnails_with(app, tx, session, fetcher);
     }
 }
@@ -449,7 +449,14 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
 
     match report.results {
         Ok(results) => app.set_results(results, target),
+        // 配信タブを持たないチャンネルでは yt-dlp が「そのタブは無い」と言って失敗する。
+        // 一覧が無いだけなので、タブごとの文言に寄せて 0 件として扱う。
+        // 起動失敗・通信失敗・タイムアウトはここへ入れない。原因が画面から消える。
+        Err(e) if matches!(target, Target::Channel { .. }) && search::is_missing_tab(&e) => {
+            app.set_results(Vec::new(), target)
+        }
         Err(e) => {
+            let in_channel = matches!(target, Target::Channel { .. }) && app.channel.is_some();
             // 初回のタイムアウトはキーチェーンのダイアログ待ちの可能性があるので、そちらを案内する。
             app.set_error(match (&report.outcome, &source) {
                 (CookieOutcome::TimedOut, Some(source)) if armed => {
@@ -457,7 +464,12 @@ fn apply_search_done(app: &mut App, target: &Target, report: search::SearchRepor
                 }
                 _ => Some(e),
             });
-            app.enter_search_mode(Mode::Input);
+            // チャンネルの失敗で検索欄へ落とすと一覧ごと見失う。r で取り直せる場所に留める。
+            app.enter_search_mode(if in_channel {
+                Mode::Channel
+            } else {
+                Mode::Input
+            });
         }
     }
 }
@@ -518,6 +530,7 @@ mod tests {
             title: format!("title {id}"),
             duration: None,
             uploader: None,
+            channel_id: None,
         }
     }
 
@@ -653,6 +666,169 @@ mod tests {
 
     fn source() -> CookieSource {
         CookieSource::from_spec(Some("chrome")).expect("spec")
+    }
+
+    /// チャンネルのタブを取りに行った結果が届いた形。
+    fn channel_done(
+        nonce: u64,
+        tab: cookies::ChannelTab,
+        results: Result<Vec<SearchResult>, String>,
+    ) -> AppEvent {
+        AppEvent::SearchDone {
+            nonce,
+            target: Target::Channel {
+                id: "UCabc".to_string(),
+                tab,
+            },
+            report: SearchReport {
+                results,
+                outcome: CookieOutcome::NotUsed,
+                fell_back: false,
+                timeout: search::YT_DLP_TIMEOUT,
+            },
+        }
+    }
+
+    /// チャンネル一覧を開いた直後の App。
+    fn channel_app() -> App {
+        let mut app = App {
+            mode: Mode::Channel,
+            searching: true,
+            ..App::default()
+        };
+        app.results = vec![result("a")];
+        app.channel = Some(app::ChannelView::new(
+            "UCabc".to_string(),
+            "Some Channel".to_string(),
+        ));
+        app
+    }
+
+    #[tokio::test]
+    async fn a_channel_tab_that_does_not_exist_is_shown_as_empty_not_as_an_error() {
+        // 配信タブを持たないチャンネルでは yt-dlp が失敗で返る。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = channel_app();
+        app.channel.as_mut().expect("channel").tab = cookies::ChannelTab::Streams;
+
+        handle_event(
+            &mut app,
+            channel_done(
+                1,
+                cookies::ChannelTab::Streams,
+                Err("yt-dlp が失敗しました: This channel does not have a streams tab".to_string()),
+            ),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.mode, Mode::Channel, "検索欄へ落とさない");
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let notice = app.notice.as_deref().expect("文言を出す");
+        assert!(notice.contains("ライブ配信"), "{notice}");
+        assert!(app.view_results().is_empty());
+        assert!(!app.searching);
+    }
+
+    #[tokio::test]
+    async fn a_channel_tab_that_fails_for_another_reason_keeps_the_reason_on_screen() {
+        // yt-dlp が無い・通信が切れた等を 0 件に潰すと、原因が画面から消えてしまう。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = channel_app();
+
+        handle_event(
+            &mut app,
+            channel_done(
+                1,
+                cookies::ChannelTab::Videos,
+                Err("yt-dlp が見つかりません (PATH を確認してください)".to_string()),
+            ),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        let error = app.error.as_deref().expect("原因を出す");
+        assert!(error.contains("yt-dlp が見つかりません"), "{error}");
+        assert_eq!(app.mode, Mode::Channel, "検索欄へ落とさない");
+        let state = app.channel.as_ref().expect("channel").state();
+        assert!(!state.loaded, "r で取り直せるよう読み込み済みにしない");
+        assert!(app.notice.is_none(), "{:?}", app.notice);
+    }
+
+    #[tokio::test]
+    async fn a_channel_search_that_times_out_explains_the_stopped_cookies() {
+        // cookie 連携を止める以上、その理由も出す。0 件に潰すと黙って止まる。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            cookies: CookieState::Armed(source()),
+            ..channel_app()
+        };
+
+        handle_event(
+            &mut app,
+            AppEvent::SearchDone {
+                nonce: 1,
+                target: Target::Channel {
+                    id: "UCabc".to_string(),
+                    tab: cookies::ChannelTab::Videos,
+                },
+                report: SearchReport {
+                    results: Err("検索がタイムアウトしました (30 秒)".to_string()),
+                    outcome: CookieOutcome::TimedOut,
+                    fell_back: false,
+                    timeout: Duration::from_secs(30),
+                },
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(matches!(app.cookies, CookieState::Suspended { .. }));
+        let error = app.error.as_deref().expect("説明を出す");
+        assert!(error.contains("30 秒"), "{error}");
+        assert_eq!(app.mode, Mode::Channel);
+    }
+
+    #[tokio::test]
+    async fn a_channel_tab_that_returns_videos_fills_the_channel_list() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = channel_app();
+
+        handle_event(
+            &mut app,
+            channel_done(
+                1,
+                cookies::ChannelTab::Videos,
+                Ok(vec![result("v0"), result("v1")]),
+            ),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.mode, Mode::Channel);
+        assert_eq!(app.view_result_ids(), ["v0", "v1"]);
+        assert_eq!(app.result_ids(), ["a"], "検索結果は残す");
+        assert!(app.error.is_none());
     }
 
     fn search_done(

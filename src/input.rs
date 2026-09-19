@@ -2,10 +2,11 @@
 
 use crate::actions::{
     CommentScroll, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed, close_settings,
-    copy_url_with, cycle_display_mode, move_selection, move_settings_selection, open_settings,
-    reload_tab, reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative,
-    select_tab, send_to_player, start_playback, start_search, stop_playback, switch_tab,
-    toggle_comments, toggle_subtitles,
+    copy_url_with, cycle_display_mode, leave_channel, move_selection, move_settings_selection,
+    open_channel, open_settings, reload_channel_tab, reload_tab, reset_speed, save_settings,
+    scroll_comments, seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player,
+    start_playback, start_search, stop_playback, switch_channel_tab, switch_tab, toggle_comments,
+    toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -33,6 +34,7 @@ pub async fn handle_key(
     match app.mode {
         Mode::Input => handle_key_input(app, key, tx, session),
         Mode::Results => handle_key_results(app, key, tx, session).await,
+        Mode::Channel => handle_key_channel(app, key, tx, session).await,
         Mode::Playing => handle_key_playing(app, key, session).await,
         Mode::Settings => handle_key_settings(app, key),
     }
@@ -87,15 +89,45 @@ async fn handle_key_results(
         KeyCode::Left => move_selection(app, Dir::Left),
         KeyCode::Tab => switch_tab(app, tx, session, true),
         KeyCode::BackTab => switch_tab(app, tx, session, false),
-        KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Enter => start_playback(app, tx, session).await,
         // 結果一覧では文字を打たないので、S 単独でも開ける。
         KeyCode::Char('S') => open_settings(app, session),
         KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
+        // 設定以外の Ctrl 付きは一覧の操作にしない。Ctrl+C のような中断キーで
+        // チャンネルへ移ったり取り直したりすると、押した側の意図と食い違う。
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char('r') => reload_tab(app, tx, session),
+        KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
             app.set_error(None);
         }
+        KeyCode::Char('q') => app.should_quit = true,
+        _ => {}
+    }
+}
+
+/// チャンネル一覧。移動と再生は結果一覧と同じで、タブの中身と戻り先だけが違う。
+async fn handle_key_channel(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    match key.code {
+        KeyCode::Down => move_selection(app, Dir::Down),
+        KeyCode::Up => move_selection(app, Dir::Up),
+        KeyCode::Right => move_selection(app, Dir::Right),
+        KeyCode::Left => move_selection(app, Dir::Left),
+        KeyCode::Tab => switch_channel_tab(app, tx, session, true),
+        KeyCode::BackTab => switch_channel_tab(app, tx, session, false),
+        KeyCode::Enter => start_playback(app, tx, session).await,
+        KeyCode::Char('S') => open_settings(app, session),
+        KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        // 取りそこねたタブはここからしか戻せない。タブを送り直しても読み込み済みのまま。
+        KeyCode::Char('r') => reload_channel_tab(app, tx, session),
+        KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
         KeyCode::Char('q') => app.should_quit = true,
         _ => {}
     }
@@ -276,6 +308,7 @@ pub async fn handle_mouse(
     match app.mode {
         Mode::Playing => handle_mouse_playing(app, mouse, session).await,
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
+        Mode::Channel => handle_mouse_channel(app, mouse, tx, session).await,
         Mode::Input => handle_mouse_input(app, mouse, tx, session),
         Mode::Settings => {}
     }
@@ -345,7 +378,24 @@ async fn handle_mouse_results(
     match results_click(app, cell_size(), mouse) {
         Some(ResultsClick::Tab(index)) => select_tab(app, tx, session, index),
         Some(ResultsClick::Play(index)) => {
-            app.selected = index;
+            app.set_view_selected(index);
+            start_playback(app, tx, session).await;
+        }
+        None => {}
+    }
+}
+
+/// チャンネル一覧のクリック。当たり判定は結果一覧と同じで、タブの行き先だけが違う。
+async fn handle_mouse_channel(
+    app: &mut App,
+    mouse: MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    match results_click(app, cell_size(), mouse) {
+        Some(ResultsClick::Tab(index)) => select_channel_tab(app, tx, session, index),
+        Some(ResultsClick::Play(index)) => {
+            app.set_view_selected(index);
             start_playback(app, tx, session).await;
         }
         None => {}
@@ -428,7 +478,7 @@ fn playing_command(code: KeyCode) -> Option<MpvCommand> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Playback;
+    use crate::app::{ChannelView, Playback};
     use crate::category::{Category, Tabs};
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::display::DisplayMode;
@@ -476,6 +526,7 @@ mod tests {
             title: format!("title {id}"),
             duration: None,
             uploader: None,
+            channel_id: None,
         }
     }
 
@@ -1383,6 +1434,219 @@ mod tests {
     }
 
     /// 格子の `index` 番目のセル (画像の左上) の押し込み。
+    /// チャンネルへ移れる結果を 4 件持つ 80x24 の検索結果画面。
+    fn channel_source_app() -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        let results: Vec<SearchResult> = (0..4)
+            .map(|i| SearchResult {
+                uploader: Some(format!("Channel {i}")),
+                channel_id: Some(format!("UC{i}")),
+                ..result(&format!("id{i}"))
+            })
+            .collect();
+        app.set_results(results, &crate::cookies::Target::Search("q".to_string()));
+        app.mark_drawn();
+        app
+    }
+
+    /// チャンネル一覧を開いて、現在タブに `count` 件持たせた画面。
+    fn channel_app(count: usize) -> App {
+        let mut app = channel_source_app();
+        app.store_to_tab();
+        app.channel = Some(ChannelView::new("UC0".to_string(), "Channel 0".to_string()));
+        app.mode = Mode::Channel;
+        let videos: Vec<SearchResult> = (0..count).map(|i| result(&format!("v{i}"))).collect();
+        app.set_results(
+            videos,
+            &crate::cookies::Target::Channel {
+                id: "UC0".to_string(),
+                tab: crate::cookies::ChannelTab::Videos,
+            },
+        );
+        app.mark_drawn();
+        app
+    }
+
+    #[tokio::test]
+    async fn c_opens_the_channel_of_the_selected_result() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_source_app();
+        app.selected = 2;
+
+        handle_key(&mut app, key(KeyCode::Char('c')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Channel);
+        let view = app.channel.as_ref().expect("チャンネルへ移る");
+        assert_eq!(view.channel_id, "UC2");
+        assert_eq!(view.channel_title, "Channel 2");
+        assert!(take_search(&mut session), "チャンネルの一覧を取りに行く");
+    }
+
+    #[tokio::test]
+    async fn c_does_nothing_when_the_result_has_no_channel_id() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+        app.selected = 2;
+
+        handle_key(&mut app, key(KeyCode::Char('c')), &tx, &mut session).await;
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.mode, Mode::Results, "結果一覧のまま");
+        assert_eq!(app.selected, 2, "選択も動かさない");
+        assert!(!take_search(&mut session));
+    }
+
+    #[tokio::test]
+    async fn tab_moves_between_the_channel_tabs() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(4);
+
+        handle_key(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            crate::cookies::ChannelTab::Shorts
+        );
+        assert!(take_search(&mut session), "未読のタブは取りに行く");
+        assert_eq!(app.tabs.selected(), 0, "カテゴリタブは動かさない");
+
+        handle_key(&mut app, key(KeyCode::BackTab), &tx, &mut session).await;
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            crate::cookies::ChannelTab::Videos
+        );
+        assert!(!take_search(&mut session), "読み込み済みは投げ直さない");
+    }
+
+    #[tokio::test]
+    async fn the_arrow_keys_move_inside_the_channel_list() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(6);
+
+        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 1);
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 5);
+        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 4);
+        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 0);
+        assert_eq!(app.selected, 0, "検索結果側の選択は触らない");
+    }
+
+    #[tokio::test]
+    async fn esc_and_slash_go_back_to_the_search_results() {
+        for code in [KeyCode::Esc, KeyCode::Char('/')] {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = channel_app(4);
+
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+
+            assert!(app.channel.is_none(), "{code:?}");
+            assert_eq!(app.mode, Mode::Results, "{code:?}");
+            assert_eq!(app.view_result_ids(), ["id0", "id1", "id2", "id3"]);
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[tokio::test]
+    async fn q_quits_from_the_channel_list() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(4);
+
+        handle_key(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn r_takes_the_channel_tab_again() {
+        // 取りそこねたタブは読み込み済みのまま残るので、タブを送り直しても取り直せない。
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(4);
+        assert!(app.channel.as_ref().expect("channel").state().loaded);
+
+        handle_key(&mut app, key(KeyCode::Char('r')), &tx, &mut session).await;
+
+        assert!(take_search(&mut session), "同じタブを取りに行く");
+        assert_eq!(app.mode, Mode::Channel);
+        assert_eq!(app.tabs.selected(), 0, "カテゴリタブは動かさない");
+    }
+
+    #[tokio::test]
+    async fn ctrl_keys_do_not_work_the_channel_list() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(4);
+
+        for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
+            handle_key_channel(&mut app, ctrl(code), &tx, &mut session).await;
+            assert!(!take_search(&mut session), "{code:?}");
+            assert!(!app.should_quit, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_keys_do_not_work_the_results_list() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_source_app();
+
+        // Ctrl+C は handle_key が終了として先に捌くので、ここでは通らないことだけ見る。
+        for code in [KeyCode::Char('c'), KeyCode::Char('r'), KeyCode::Char('q')] {
+            handle_key_results(&mut app, ctrl(code), &tx, &mut session).await;
+            assert!(app.channel.is_none(), "{code:?}");
+            assert!(!take_search(&mut session), "{code:?}");
+            assert!(!app.should_quit, "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_still_opens_the_settings_from_both_lists() {
+        for mut app in [channel_source_app(), channel_app(4)] {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let back = app.mode;
+
+            handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
+
+            assert_eq!(app.mode, Mode::Settings, "{back:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clicking_a_channel_cell_asks_to_play_that_video() {
+        let app = channel_app(6);
+        let at = cell_click(&app, 2);
+        assert_eq!(results_click(&app, CELL, at), Some(ResultsClick::Play(2)));
+    }
+
+    #[tokio::test]
+    async fn clicking_the_channel_tab_row_switches_the_channel_tab() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = channel_app(4);
+
+        // 「動画 │ ショート」の 2 つめの上。
+        handle_mouse(&mut app, tab_click(8), &tx, &mut session).await;
+
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            crate::cookies::ChannelTab::Shorts
+        );
+        assert_eq!(app.tabs.selected(), 0, "カテゴリタブは動かさない");
+        take_search(&mut session);
+    }
+
     fn cell_click(app: &App, index: usize) -> MouseEvent {
         let layout = ui::grid_layout(app, CELL).expect("格子を組める");
         let image = layout.cells[index].image;

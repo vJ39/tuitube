@@ -7,6 +7,8 @@ use std::time::Duration;
 pub const ENV_VAR: &str = "TUITUBE_COOKIES_FROM_BROWSER";
 /// フィードは制限しないと 167 件返ることがある (`:ytrec` 実測)。
 pub const FEED_LIMIT: usize = 30;
+/// チャンネルのタブは投稿を全部返すので、同じく上限を付ける。
+pub const CHANNEL_LIMIT: usize = 50;
 
 /// cookie の渡し方。対応ブラウザの一覧も cookies.txt の中身も検証しない
 /// (どちらも yt-dlp の更新で変わるため、検証は yt-dlp に任せる)。
@@ -366,10 +368,60 @@ impl Feed {
     }
 }
 
+/// チャンネル内のタブ。並びはそのまま画面のタブ行の並び。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelTab {
+    Videos,
+    Shorts,
+    Streams,
+}
+
+impl ChannelTab {
+    pub const ALL: [ChannelTab; 3] = [ChannelTab::Videos, ChannelTab::Shorts, ChannelTab::Streams];
+
+    /// チャンネル URL の末尾。
+    pub fn path(self) -> &'static str {
+        match self {
+            ChannelTab::Videos => "videos",
+            ChannelTab::Shorts => "shorts",
+            ChannelTab::Streams => "streams",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ChannelTab::Videos => "動画",
+            ChannelTab::Shorts => "ショート",
+            ChannelTab::Streams => "ライブ配信",
+        }
+    }
+
+    /// ALL の中での位置。タブごとの状態を持つ配列の添字に使う。
+    pub fn index(self) -> usize {
+        match self {
+            ChannelTab::Videos => 0,
+            ChannelTab::Shorts => 1,
+            ChannelTab::Streams => 2,
+        }
+    }
+
+    /// 位置からタブへ戻す。範囲外は None。
+    pub fn from_index(index: usize) -> Option<ChannelTab> {
+        ChannelTab::ALL.get(index).copied()
+    }
+
+    /// 一覧が空のときの文言。配信タブを持たないチャンネルもここへ来るので、
+    /// 失敗ではなく「無い」と伝える。
+    fn empty_message(self) -> String {
+        format!("このチャンネルには{}がありません", self.label())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Search(String),
     Feed(Feed),
+    Channel { id: String, tab: ChannelTab },
 }
 
 impl Target {
@@ -386,6 +438,9 @@ impl Target {
         match self {
             Target::Search(query) => format!("ytsearch{limit}:{query}"),
             Target::Feed(feed) => feed.keyword().to_string(),
+            Target::Channel { id, tab } => {
+                format!("https://www.youtube.com/channel/{id}/{}", tab.path())
+            }
         }
     }
 
@@ -406,6 +461,7 @@ impl Target {
                     feed.label()
                 ),
             },
+            Target::Channel { tab, .. } => tab.empty_message(),
         }
     }
 
@@ -1024,5 +1080,65 @@ mod tests {
         let message = login_required_message(Feed::History, &source("chrome"));
         assert!(message.starts_with("履歴"), "{message}");
         assert!(message.contains("chrome"), "{message}");
+    }
+
+    #[test]
+    fn a_channel_tab_becomes_its_youtube_url() {
+        for (tab, path) in [
+            (ChannelTab::Videos, "videos"),
+            (ChannelTab::Shorts, "shorts"),
+            (ChannelTab::Streams, "streams"),
+        ] {
+            let target = Target::Channel {
+                id: "UCabc".to_string(),
+                tab,
+            };
+            assert_eq!(
+                target.yt_dlp_url(10),
+                format!("https://www.youtube.com/channel/UCabc/{path}")
+            );
+            // 件数は --playlist-end で渡すので limit では変わらない。
+            assert_eq!(target.yt_dlp_url(25), target.yt_dlp_url(10));
+        }
+    }
+
+    #[test]
+    fn a_channel_is_public_and_needs_no_login() {
+        let target = Target::Channel {
+            id: "UCabc".to_string(),
+            tab: ChannelTab::Videos,
+        };
+        assert!(!target.requires_login());
+    }
+
+    #[test]
+    fn an_empty_channel_tab_says_which_tab_is_empty() {
+        for (tab, word) in [
+            (ChannelTab::Videos, "動画"),
+            (ChannelTab::Shorts, "ショート"),
+            (ChannelTab::Streams, "ライブ配信"),
+        ] {
+            let target = Target::Channel {
+                id: "UCabc".to_string(),
+                tab,
+            };
+            // cookie の有無で文言は変わらない (公開情報なのでログイン状態は関係ない)。
+            for source in [None, Some(&source("chrome"))] {
+                let message = target.empty_message(source);
+                assert!(message.contains(word), "{message}");
+                assert!(!message.contains("ログイン"), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_channel_tabs_are_labelled_in_the_tab_row_order() {
+        assert_eq!(
+            ChannelTab::ALL.map(ChannelTab::label),
+            ["動画", "ショート", "ライブ配信"]
+        );
+        for (index, tab) in ChannelTab::ALL.into_iter().enumerate() {
+            assert_eq!(tab.index(), index);
+        }
     }
 }

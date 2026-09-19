@@ -1,4 +1,4 @@
-use crate::cookies::{CookieOutcome, CookieSource, FEED_LIMIT, Target, classify};
+use crate::cookies::{CHANNEL_LIMIT, CookieOutcome, CookieSource, FEED_LIMIT, Target, classify};
 use serde_json::Value;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -16,6 +16,8 @@ pub struct SearchResult {
     pub title: String,
     pub duration: Option<f64>,
     pub uploader: Option<String>,
+    /// チャンネルへ移るための UC... 形式の ID。チャンネルタブ経由の行では入らない。
+    pub channel_id: Option<String>,
 }
 
 impl SearchResult {
@@ -47,11 +49,16 @@ fn parse_line(line: &str) -> Option<SearchResult> {
         .and_then(Value::as_str)
         .or_else(|| value.get("channel").and_then(Value::as_str))
         .map(str::to_string);
+    let channel_id = value
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Some(SearchResult {
         id,
         title,
         duration,
         uploader,
+        channel_id,
     })
 }
 
@@ -78,9 +85,16 @@ pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>, limit: usize
         "--flat-playlist".to_string(),
         "--dump-json".to_string(),
     ];
-    if let Target::Feed(_) = target {
-        args.push("--playlist-end".to_string());
-        args.push(FEED_LIMIT.to_string());
+    match target {
+        Target::Feed(_) => {
+            args.push("--playlist-end".to_string());
+            args.push(FEED_LIMIT.to_string());
+        }
+        Target::Channel { .. } => {
+            args.push("--playlist-end".to_string());
+            args.push(CHANNEL_LIMIT.to_string());
+        }
+        Target::Search(_) => {}
     }
     if let Some(cookies) = cookies {
         args.extend(cookies.yt_dlp_args());
@@ -166,12 +180,33 @@ async fn attempt(
     };
     let results = parse_lines(&String::from_utf8_lossy(&output.stdout));
     let results = if results.is_empty() && !output.status.success() {
-        let detail = stderr.lines().last().unwrap_or("").trim();
-        Err(format!("yt-dlp が失敗しました: {detail}"))
+        Err(format!("yt-dlp が失敗しました: {}", stderr_detail(&stderr)))
     } else {
         Ok(results)
     };
     Attempt { results, outcome }
+}
+
+/// 失敗の理由を伝える一行。yt-dlp は原因を ERROR 行に書き、その後ろに警告が続くことが
+/// あるので、ERROR 行があればそちらを採る。受け取る側はこの一行で原因を見分ける。
+fn stderr_detail(stderr: &str) -> &str {
+    let mut last = "";
+    let mut error = "";
+    for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        last = line;
+        if line.starts_with("ERROR:") {
+            error = line;
+        }
+    }
+    if error.is_empty() { last } else { error }
+}
+
+/// yt-dlp が「そのタブは無い」と言って落ちたか。配信タブを持たないチャンネルの
+/// `/streams` がこれに当たる。起動失敗・通信失敗・タイムアウトを一緒に飲み込まないよう、
+/// 一覧が無いだけの失敗はここでだけ見分ける。
+pub fn is_missing_tab(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("does not have a") && error.contains("tab")
 }
 
 fn outcome_of(used_cookies: bool, outcome: CookieOutcome) -> CookieOutcome {
@@ -256,7 +291,7 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cookies::Feed;
+    use crate::cookies::{CHANNEL_LIMIT, ChannelTab, Feed};
     use crate::search::fixtures::{FakeYtDlp, Step, done};
 
     const LINE_FULL: &str =
@@ -324,6 +359,56 @@ mod tests {
     fn builds_watch_url() {
         let results = parse_lines(LINE_FULL);
         assert_eq!(results[0].url(), "https://www.youtube.com/watch?v=abc123");
+    }
+
+    #[test]
+    fn parse_line_reads_the_channel_id() {
+        let line = r#"{"id":"a","title":"t","channel_id":"UCabc","uploader":"Up"}"#;
+        assert_eq!(parse_lines(line)[0].channel_id.as_deref(), Some("UCabc"));
+        // チャンネルタブ経由の行は channel_id を欠く。c キーは無反応になるだけ。
+        let without = r#"{"id":"a","title":"t"}"#;
+        assert_eq!(parse_lines(without)[0].channel_id, None);
+        let null = r#"{"id":"a","title":"t","channel_id":null}"#;
+        assert_eq!(parse_lines(null)[0].channel_id, None);
+    }
+
+    #[test]
+    fn yt_dlp_args_limit_channel_tabs() {
+        let args = yt_dlp_args(
+            &Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Shorts,
+            },
+            None,
+            10,
+        );
+        assert_eq!(
+            args,
+            [
+                "https://www.youtube.com/channel/UCabc/shorts",
+                "--flat-playlist",
+                "--dump-json",
+                "--playlist-end",
+                &CHANNEL_LIMIT.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn yt_dlp_args_pass_cookies_to_a_channel_when_they_are_set() {
+        // チャンネルは公開情報だが、cookie を切り分けるのは検索と同じ扱いにする。
+        let args = yt_dlp_args(
+            &Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Videos,
+            },
+            Some(&source("chrome")),
+            10,
+        );
+        assert_eq!(
+            args[args.len() - 2..],
+            ["--cookies-from-browser".to_string(), "chrome".to_string()]
+        );
     }
 
     #[test]
@@ -442,6 +527,54 @@ mod tests {
         assert_eq!(report.results.expect("2 回目の結果").len(), 1);
         assert!(report.fell_back);
         assert!(matches!(report.outcome, CookieOutcome::Unreadable(_)));
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_reported_with_the_error_line_not_a_trailing_warning() {
+        // 受け取る側はこの一行で原因を見分けるので、後ろの警告で押し流さない。
+        let runner = FakeYtDlp::new([done(
+            1,
+            "",
+            "WARNING: falling back\nERROR: [youtube:tab] UCabc: This channel does not have a streams tab\nWARNING: unable to write cache\n",
+        )]);
+        let report = run_search(
+            &runner,
+            &Target::Channel {
+                id: "UCabc".to_string(),
+                tab: crate::cookies::ChannelTab::Streams,
+            },
+            None,
+            10,
+            YT_DLP_TIMEOUT,
+        )
+        .await;
+
+        let error = report.results.expect_err("結果は返らない");
+        assert!(error.contains("does not have a streams tab"), "{error}");
+        assert!(is_missing_tab(&error), "{error}");
+    }
+
+    #[test]
+    fn only_a_missing_tab_counts_as_a_missing_tab() {
+        assert!(is_missing_tab(
+            "yt-dlp が失敗しました: ERROR: [youtube:tab] UCabc: This channel does not have a streams tab"
+        ));
+        // 大文字小文字は yt-dlp の版で変わりうる。
+        assert!(is_missing_tab("This Channel Does Not Have A Shorts Tab"));
+        for other in [
+            "yt-dlp が見つかりません (PATH を確認してください)",
+            "検索がタイムアウトしました (30 秒)",
+            "yt-dlp が失敗しました: ERROR: [youtube:tab] Unable to download webpage",
+            "yt-dlp が失敗しました: ERROR: [youtube:tab] UCabc: This channel does not exist",
+        ] {
+            assert!(!is_missing_tab(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_failure_without_an_error_line_still_says_something() {
+        assert_eq!(stderr_detail("WARNING: a\nWARNING: b\n"), "WARNING: b");
+        assert_eq!(stderr_detail(""), "");
     }
 
     #[tokio::test]

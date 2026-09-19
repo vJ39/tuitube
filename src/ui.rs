@@ -1,4 +1,4 @@
-use crate::app::{App, Mode, format_time};
+use crate::app::{App, ChannelView, Mode, format_time};
 use crate::comments;
 use crate::display::DisplayMode;
 use crate::geometry::cell_size;
@@ -67,7 +67,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::Playing => draw_playing(frame, app),
         Mode::Settings => draw_settings(frame, app),
-        Mode::Input | Mode::Results => draw_search(frame, app),
+        // チャンネルも同じ 5 段の画面。中身の参照先だけが app.channel へ移る。
+        Mode::Input | Mode::Results | Mode::Channel => draw_search(frame, app),
     }
 }
 
@@ -176,7 +177,12 @@ pub fn grid_layout_in(app: &App, screen: Rect, cell: CellSize) -> Option<grid::L
     if app.settings.search.layout != LayoutMode::Grid {
         return None;
     }
-    grid::layout(results_inner(screen), cell, app.results.len(), app.scroll)
+    grid::layout(
+        results_inner(screen),
+        cell,
+        app.view_results().len(),
+        app.view_scroll(),
+    )
 }
 
 /// 入力欄のカーソル位置 (0 始まり)。draw と、画像を貼った後の戻し先が同じ計算を使う。
@@ -280,8 +286,8 @@ fn draw_search(frame: &mut Frame, app: &App) {
         grid::layout(
             Block::default().borders(Borders::ALL).inner(areas[2]),
             cell_size(),
-            app.results.len(),
-            app.scroll,
+            app.view_results().len(),
+            app.view_scroll(),
         )
     } else {
         None
@@ -302,12 +308,23 @@ const TAB_GAP: &str = " │ ";
 const TAB_MORE_LEFT: &str = "< ";
 const TAB_MORE_RIGHT: &str = " >";
 
+/// タブ行に並べる見出しと選択位置。チャンネル閲覧中はチャンネルのタブへ差し替える。
+/// 窓の開始位置はカテゴリタブだけが覚える (チャンネルは 3 つなので常に先頭から数える)。
+fn tab_row_source(app: &App) -> (Vec<&str>, usize, usize) {
+    match &app.channel {
+        Some(channel) => (ChannelView::labels().to_vec(), channel.tab.index(), 0),
+        None => (app.tabs.labels(), app.tabs.selected(), app.tabs.window()),
+    }
+}
+
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    let labels = app.tabs.labels();
+    let (labels, selected, window) = tab_row_source(app);
     let width = area.width as usize;
-    let range = visible_tabs(&labels, app.tabs.selected(), width, app.tabs.window());
-    app.tabs.remember_window(range.start);
-    let spans = tab_spans(&labels, app.tabs.selected(), width, range);
+    let range = visible_tabs(&labels, selected, width, window);
+    if app.channel.is_none() {
+        app.tabs.remember_window(range.start);
+    }
+    let spans = tab_spans(&labels, selected, width, range);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -472,10 +489,10 @@ pub fn tab_at_point(app: &App, column: u16, row: u16) -> Option<usize> {
     if !area.contains(Position::new(column, row)) {
         return None;
     }
-    let labels = app.tabs.labels();
+    let (labels, selected, window) = tab_row_source(app);
     let width = area.width as usize;
     // 窓は draw_tabs が覚えたものをそのまま使う。見えている行と判定をずらさない。
-    let range = visible_tabs(&labels, app.tabs.selected(), width, app.tabs.window());
+    let range = visible_tabs(&labels, selected, width, window);
     tab_at_column(&labels, width, range, (column - area.x) as usize)
 }
 
@@ -502,12 +519,13 @@ fn results_title(offset: usize, shown: usize, total: usize) -> String {
 }
 
 fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
-    let title = results_title(layout.offset, layout.cells.len(), app.results.len());
+    let results = app.view_results();
+    let title = results_title(layout.offset, layout.cells.len(), results.len());
     frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
 
     for (i, cell) in layout.cells.iter().enumerate() {
         let index = layout.offset + i;
-        let Some(result) = app.results.get(index) else {
+        let Some(result) = results.get(index) else {
             break;
         };
         // 画像が来ていないセルは枠だけ。来ていれば空けておき、APC が上に載る。
@@ -519,7 +537,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
                 cell.image,
             );
         }
-        let title_style = if index == app.selected {
+        let title_style = if index == app.view_selected() {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()
@@ -542,7 +560,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
 /// Kitty graphics protocol 非対応の端末と、格子を組めない狭さのときの従来表示。
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
-        .results
+        .view_results()
         .iter()
         .map(|r| {
             let uploader = r.uploader.as_deref().unwrap_or("-");
@@ -559,8 +577,8 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("> ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
-    if !app.results.is_empty() {
-        state.select(Some(app.selected));
+    if !app.view_results().is_empty() {
+        state.select(Some(app.view_selected()));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -698,6 +716,7 @@ fn help_text(mode: Mode, display: DisplayMode, comments_open: bool, width: u16) 
     let hints = match mode {
         Mode::Input => input_hints(),
         Mode::Results => results_hints(),
+        Mode::Channel => channel_hints(),
         Mode::Playing => playing_hints(display, comments_open),
         Mode::Settings => settings_hints(),
     };
@@ -721,14 +740,29 @@ fn input_hints() -> Vec<String> {
     ]
 }
 
-/// 結果一覧の案内。全部で 80 桁ちょうどで 80 桁端末に収まる。
+/// 結果一覧の案内。80 桁端末に収まる範囲まで出る。
 fn results_hints() -> Vec<String> {
     vec![
         "↑↓←→:選択".to_string(),
         "Enter:再生".to_string(),
+        "c:チャンネル".to_string(),
         "Tab:カテゴリ".to_string(),
         "r:再取得".to_string(),
-        "/またはEsc:検索へ".to_string(),
+        "Esc:検索へ".to_string(),
+        "q:終了".to_string(),
+        "S:設定".to_string(),
+    ]
+}
+
+/// チャンネル一覧の案内。結果一覧と同じ操作で、タブがチャンネル内の 3 つになる。
+/// 全部で 77 桁ほどで 80 桁端末に収まる。
+fn channel_hints() -> Vec<String> {
+    vec![
+        "↑↓←→:選択".to_string(),
+        "Enter:再生".to_string(),
+        "Tab:動画/ショート/配信".to_string(),
+        "r:再取得".to_string(),
+        "Esc:結果へ".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ]
@@ -803,7 +837,7 @@ fn fit_hints(hints: &[String], width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Playback;
+    use crate::app::{ChannelView, Playback};
     use crate::category::Tabs;
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
@@ -814,6 +848,7 @@ mod tests {
             title: format!("title {index}"),
             duration: None,
             uploader: None,
+            channel_id: None,
         }
     }
 
@@ -1463,6 +1498,106 @@ mod tests {
             results: (0..count).map(result).collect(),
             ..App::default()
         }
+    }
+
+    /// 80x24 のチャンネル画面。現在タブに `count` 件持たせる。
+    fn channel_app(count: usize) -> App {
+        let mut view = ChannelView::new("UCabc".to_string(), "Some Channel".to_string());
+        view.state_mut().results = (0..count).map(result).collect();
+        view.state_mut().loaded = true;
+        App {
+            mode: Mode::Channel,
+            screen: Rect::new(0, 0, 80, 24),
+            // 検索結果は残したまま、画面はチャンネルを見ている。
+            results: vec![result(99)],
+            channel: Some(view),
+            ..App::default()
+        }
+    }
+
+    /// 画面の `row` 行目に描かれている文字。全角の右半分のセルは空白なので飛ばす。
+    fn drawn_row(app: &App, row: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("端末");
+        terminal.draw(|frame| draw(frame, app)).expect("描ける");
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        let mut skip = false;
+        for x in 0..buffer.area.width {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            let symbol = buffer[(x, row)].symbol();
+            skip = grid::display_width(symbol) == 2;
+            out.push_str(symbol);
+        }
+        out.trim_end().to_string()
+    }
+
+    #[test]
+    fn the_channel_screen_shows_the_channel_tabs() {
+        let app = channel_app(2);
+        let row = drawn_row(&app, 3);
+        for label in ChannelView::labels() {
+            assert!(row.contains(label), "{label} が無い: {row}");
+        }
+        assert!(!row.contains("すべて"), "カテゴリタブは出さない: {row}");
+    }
+
+    #[test]
+    fn the_channel_screen_draws_the_channel_results_not_the_search_results() {
+        let app = channel_app(2);
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        assert_eq!(layout.cells.len(), 2, "チャンネルの件数で組む");
+
+        let title = drawn_row(&app, layout.cells[0].title.y);
+        assert!(title.contains("title 0"), "{title}");
+        assert!(!title.contains("title 99"), "{title}");
+    }
+
+    #[test]
+    fn the_channel_grid_hit_test_uses_the_channel_results() {
+        let app = channel_app(10);
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        assert_eq!(layout.cells.len(), 8, "4 列 2 行");
+        let first = layout.cells[0].image;
+        assert_eq!(result_at_point(&app, CELL, first.x, first.y), Some(0));
+
+        // 検索結果は 1 件しかないので、参照先を取り違えるとここが None になる。
+        let last = layout.cells[7].image;
+        assert_eq!(result_at_point(&app, CELL, last.x, last.y), Some(7));
+    }
+
+    #[test]
+    fn a_click_on_the_channel_tab_row_answers_with_the_channel_tab() {
+        let app = channel_app(2);
+        let area = search_areas(app.screen)[1];
+        assert_eq!(tab_at_point(&app, area.x, area.y), Some(0));
+        // 「動画」(4 桁) と区切りの後ろは「ショート」。
+        assert_eq!(tab_at_point(&app, area.x + 8, area.y), Some(1));
+    }
+
+    #[test]
+    fn the_channel_help_names_the_way_back() {
+        let help = help_text(Mode::Channel, DisplayMode::Embedded, false, 80);
+        for key in ["Enter:再生", "Tab:", "Esc", "q:終了"] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
+    }
+
+    #[test]
+    fn the_channel_help_names_the_settings_and_the_reload() {
+        // 80 桁端末で出ないと、設定も取り直しも使えることに気づけない。
+        let help = help_80(Mode::Channel, DisplayMode::Embedded);
+        for key in ["r:再取得", "S:設定"] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
+    }
+
+    #[test]
+    fn the_results_help_names_the_channel_key() {
+        // 80 桁端末で出ないと、チャンネルへ移れること自体に気づけない。
+        assert!(help_80(Mode::Results, DisplayMode::Embedded).contains("c:チャンネル"));
     }
 
     /// 矩形の左上と右下。両端が同じセルを指すことを確かめるための 2 点。

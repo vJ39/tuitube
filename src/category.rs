@@ -153,6 +153,7 @@ mod tests {
             title: format!("title {id}"),
             duration: None,
             uploader: None,
+            channel_id: None,
         }
     }
 

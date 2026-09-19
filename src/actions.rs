@@ -1,6 +1,6 @@
 //! Session を動かすアクション。キー入力もイベント処理もここを通して player を触る。
 
-use crate::app::{App, AppEvent, Mode, Playback, SETTINGS_ITEMS};
+use crate::app::{App, AppEvent, ChannelView, Mode, Playback, SETTINGS_ITEMS};
 use crate::clipboard::{Clipboard, MISSING_PBCOPY};
 use crate::comments;
 use crate::cookies::Target;
@@ -164,7 +164,9 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
     if error.is_some() {
         app.set_error(error);
     }
-    app.enter_search_mode(if app.results.is_empty() {
+    app.enter_search_mode(if app.channel.is_some() {
+        Mode::Channel
+    } else if app.results.is_empty() {
         Mode::Input
     } else {
         Mode::Results
@@ -287,6 +289,178 @@ pub fn switch_tab_with<R>(
     start_tab_search_with(app, tx, session, runner);
 }
 
+pub fn open_channel(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    open_channel_with(app, tx, session, RealYtDlp);
+}
+
+/// 選択中の結果のチャンネルへ移る。チャンネル ID が取れない一覧では何もしない。
+pub fn open_channel_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    let Some(result) = app.view_selected_result() else {
+        return;
+    };
+    let Some(channel_id) = result.channel_id.clone() else {
+        return;
+    };
+    let title = result
+        .uploader
+        .clone()
+        .unwrap_or_else(|| channel_id.clone());
+    // 走らせたままにすると、その結果がチャンネルのタブへ書き込まれる。
+    cancel_search(app, session);
+    // 戻ったときに同じ位置から続けられるよう、検索側の選択を控える。
+    app.store_to_tab();
+    app.channel = Some(ChannelView::new(channel_id, title));
+    app.mode = Mode::Channel;
+    app.set_error(None);
+    app.sync_from_view();
+    start_channel_search_with(app, tx, session, runner);
+}
+
+/// チャンネル一覧を抜けて検索結果へ戻る。
+pub fn leave_channel(app: &mut App, session: &mut Session) {
+    if app.channel.is_none() {
+        return;
+    }
+    // 結果が検索側のタブへ流れ込まないよう、先に打ち切る。
+    cancel_search(app, session);
+    app.channel = None;
+    app.set_error(None);
+    app.sync_from_view();
+    app.mode = if app.results.is_empty() {
+        Mode::Input
+    } else {
+        Mode::Results
+    };
+}
+
+pub fn switch_channel_tab(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    forward: bool,
+) {
+    switch_channel_tab_with(app, tx, session, forward, RealYtDlp);
+}
+
+/// チャンネル内のタブを移る。骨格は switch_tab_with と同じ。
+pub fn switch_channel_tab_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    forward: bool,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    if app.channel.is_none() {
+        return;
+    }
+    cancel_search(app, session);
+    if let Some(channel) = app.channel.as_mut() {
+        if forward {
+            channel.next_tab();
+        } else {
+            channel.prev_tab();
+        }
+    }
+    app.sync_from_view();
+    app.set_error(None);
+    if app.channel.as_ref().is_some_and(|c| c.state().loaded) {
+        return;
+    }
+    start_channel_search_with(app, tx, session, runner);
+}
+
+pub fn select_channel_tab(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    index: usize,
+) {
+    select_channel_tab_with(app, tx, session, index, RealYtDlp);
+}
+
+/// 位置を指してチャンネル内のタブへ移る。骨格は select_tab_with と同じ。
+pub fn select_channel_tab_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    index: usize,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    let Some(channel) = app.channel.as_ref() else {
+        return;
+    };
+    // 押し直し。まだ読めていないタブだけ取り直す。
+    if channel.tab.index() == index {
+        if !channel.state().loaded && !app.searching {
+            app.set_error(None);
+            start_channel_search_with(app, tx, session, runner);
+        }
+        return;
+    }
+    // 範囲外は ChannelView::select_tab が弾く。移れてから打ち切る。
+    if !app
+        .channel
+        .as_mut()
+        .is_some_and(|channel| channel.select_tab(index))
+    {
+        return;
+    }
+    cancel_search(app, session);
+    app.sync_from_view();
+    app.set_error(None);
+    if app.channel.as_ref().is_some_and(|c| c.state().loaded) {
+        return;
+    }
+    start_channel_search_with(app, tx, session, runner);
+}
+
+/// 今のチャンネルタブを取りに行く。
+fn start_channel_search_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    let Some(target) = app.channel.as_ref().map(ChannelView::target) else {
+        return;
+    };
+    spawn_search(app, tx, session, target, runner);
+}
+
+pub fn reload_channel_tab(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    reload_channel_tab_with(app, tx, session, RealYtDlp);
+}
+
+/// 今のチャンネルタブを取り直す。骨格は reload_tab_with と同じ。
+/// 失敗したタブは読み込み済みのまま残るので、ここが取り直しの入口になる。
+pub fn reload_channel_tab_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    let Some(channel) = app.channel.as_mut() else {
+        return;
+    };
+    channel.state_mut().loaded = false;
+    start_channel_search_with(app, tx, session, runner);
+}
+
 pub fn select_tab(
     app: &mut App,
     tx: &UnboundedSender<AppEvent>,
@@ -361,11 +535,17 @@ pub fn move_selection_with(app: &mut App, cell: CellSize, dir: Dir) {
         }
         return;
     };
-    app.selected = grid::move_selection(app.selected, app.results.len(), layout.columns, dir);
-    let scroll = grid::ensure_visible(app.selected, layout.columns, layout.rows, app.scroll);
+    let selected = grid::move_selection(
+        app.view_selected(),
+        app.view_results().len(),
+        layout.columns,
+        dir,
+    );
+    app.set_view_selected(selected);
+    let scroll = grid::ensure_visible(selected, layout.columns, layout.rows, app.view_scroll());
     // 選択の強調は画像の外に描くので、可視範囲が動いたときだけ貼り直す。
-    if scroll != app.scroll {
-        app.scroll = scroll;
+    if scroll != app.view_scroll() {
+        app.set_view_scroll(scroll);
         app.thumbs.mark_dirty();
     }
 }
@@ -394,7 +574,7 @@ pub fn start_thumbnails_with<F>(
         return;
     };
     let target_px = layout.image_px;
-    let ids = app.thumbs.wanted(&app.result_ids(), target_px);
+    let ids = app.thumbs.wanted(&app.view_result_ids(), target_px);
     if ids.is_empty() {
         return;
     }
@@ -537,7 +717,7 @@ pub fn enter_playback(
 }
 
 pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
-    let Some(result) = app.selected_result().cloned() else {
+    let Some(result) = app.view_selected_result().cloned() else {
         return;
     };
     stop_playback(session).await;
@@ -698,8 +878,13 @@ pub async fn apply_resize_with<F>(
         // 非再生中。ratatui の 2J で画像が消えているので、新しい寸法で貼り直す。
         // 列数・行数が変わると選択が可視範囲の外へ出るので、新しい割り付けで追い直す。
         if let Some(layout) = ui::grid_layout_in(app, Rect::new(0, 0, cols, rows), cell_size()) {
-            app.scroll =
-                grid::ensure_visible(app.selected, layout.columns, layout.rows, app.scroll);
+            let scroll = grid::ensure_visible(
+                app.view_selected(),
+                layout.columns,
+                layout.rows,
+                app.view_scroll(),
+            );
+            app.set_view_scroll(scroll);
         }
         app.thumbs.mark_dirty();
         start_thumbnails_with(app, tx, session, fetcher);
@@ -815,7 +1000,7 @@ mod tests {
     use super::*;
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::comments::CommentState;
-    use crate::cookies::{CookieSource, CookieState};
+    use crate::cookies::{ChannelTab, CookieSource, CookieState};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::query::QueryEditor;
@@ -890,6 +1075,7 @@ mod tests {
             title: format!("title {id}"),
             duration: None,
             uploader: None,
+            channel_id: None,
         }
     }
 
@@ -1624,6 +1810,260 @@ mod tests {
         app.set_results(results, &Target::Search("q".to_string()));
         app.thumbs.take_dirty();
         app
+    }
+
+    /// チャンネルへ移れる結果を持つ 80x24 の検索結果画面。
+    fn channel_grid_app() -> App {
+        let mut app = App {
+            mode: Mode::Results,
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        let results = vec![
+            SearchResult {
+                uploader: Some("One Channel".to_string()),
+                channel_id: Some("UCone".to_string()),
+                ..result("id0")
+            },
+            SearchResult {
+                uploader: Some("Two Channel".to_string()),
+                channel_id: Some("UCtwo".to_string()),
+                ..result("id1")
+            },
+        ];
+        app.set_results(results, &Target::Search("q".to_string()));
+        app.thumbs.take_dirty();
+        app
+    }
+
+    /// 積まれた検索を走らせて、yt-dlp へ渡った引数を読む。
+    async fn finish_search(session: &mut Session) {
+        session
+            .search_task
+            .take()
+            .expect("検索タスク")
+            .await
+            .expect("完走");
+    }
+
+    #[tokio::test]
+    async fn open_channel_searches_the_video_tab_of_the_selected_result() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        app.selected = 1;
+        app.scroll = 0;
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+
+        open_channel_with(&mut app, &tx, &mut session, runner.clone());
+
+        assert_eq!(app.mode, Mode::Channel);
+        let channel = app.channel.as_ref().expect("チャンネルへ移る");
+        assert_eq!(channel.channel_id, "UCtwo");
+        assert_eq!(channel.channel_title, "Two Channel");
+        assert_eq!(channel.tab, ChannelTab::Videos);
+        assert_eq!(app.result_ids(), ["id0", "id1"], "検索結果は残す");
+        assert_eq!(app.tabs.state().selected, 1, "戻る位置を控える");
+
+        finish_search(&mut session).await;
+        let args = runner.calls();
+        assert_eq!(args[0][0], "https://www.youtube.com/channel/UCtwo/videos");
+        assert!(args[0].iter().any(|a| a == "--playlist-end"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn open_channel_does_nothing_without_a_channel_id() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        // 履歴などチャンネル ID が取れない一覧では c は無反応。
+        let mut app = grid_app(2);
+        let nonce = session.search_nonce;
+
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.mode, Mode::Results);
+        assert!(session.search_task.is_none());
+        assert_eq!(session.search_nonce, nonce, "走っている検索も止めない");
+    }
+
+    #[tokio::test]
+    async fn switching_channel_tabs_searches_each_tab_once() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        let runner = FakeYtDlp::new([done(0, "", ""), done(0, "", "")]);
+
+        open_channel_with(&mut app, &tx, &mut session, runner.clone());
+        finish_search(&mut session).await;
+        app.set_results(vec![result("v0"), result("v1")], &channel_target(&app));
+        app.set_view_selected(1);
+
+        switch_channel_tab_with(&mut app, &tx, &mut session, true, runner.clone());
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            ChannelTab::Shorts
+        );
+        assert!(session.search_task.is_some(), "未読のタブは検索する");
+        finish_search(&mut session).await;
+        assert_eq!(
+            runner.calls()[1][0],
+            "https://www.youtube.com/channel/UCone/shorts"
+        );
+        app.set_results(vec![result("s0")], &channel_target(&app));
+
+        switch_channel_tab_with(&mut app, &tx, &mut session, false, runner.clone());
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            ChannelTab::Videos
+        );
+        assert!(
+            session.search_task.is_none(),
+            "読み込み済みのタブは投げ直さない"
+        );
+        assert_eq!(app.view_result_ids(), ["v0", "v1"]);
+        assert_eq!(app.view_selected(), 1, "タブごとの選択を持ち越す");
+    }
+
+    #[tokio::test]
+    async fn reloading_a_channel_tab_searches_it_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        session.search_task.take().expect("タスク").abort();
+        // 取れなかったタブも読み込み済みで残ることがある。そこからでも取り直せる。
+        app.set_results(Vec::new(), &channel_target(&app));
+        assert!(app.channel.as_ref().expect("channel").state().loaded);
+
+        reload_channel_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_some(), "同じタブを取りに行く");
+        assert!(!app.channel.as_ref().expect("channel").state().loaded);
+        assert!(app.searching);
+    }
+
+    #[tokio::test]
+    async fn reloading_does_nothing_outside_a_channel() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+
+        reload_channel_tab_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none());
+        assert!(!app.searching);
+    }
+
+    #[tokio::test]
+    async fn switching_channel_tabs_drops_the_running_search() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        let running = session.search_nonce;
+
+        switch_channel_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
+        assert_ne!(
+            session.search_nonce, running,
+            "先に走っていた検索を移った先のタブへ書き込ませない"
+        );
+        assert!(app.searching, "移った先の検索が走る");
+    }
+
+    #[tokio::test]
+    async fn selecting_a_channel_tab_by_position_ignores_the_ones_that_do_not_exist() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        session.search_task.take().expect("タスク").abort();
+
+        select_channel_tab_with(&mut app, &tx, &mut session, 2, StubYtDlp);
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            ChannelTab::Streams
+        );
+        assert!(session.search_task.is_some());
+        let running = session.search_nonce;
+
+        select_channel_tab_with(&mut app, &tx, &mut session, 9, StubYtDlp);
+        assert_eq!(
+            app.channel.as_ref().expect("channel").tab,
+            ChannelTab::Streams,
+            "範囲外では動かさない"
+        );
+        assert_eq!(session.search_nonce, running, "走っている検索も止めない");
+    }
+
+    #[tokio::test]
+    async fn leaving_the_channel_returns_to_the_search_results() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        app.selected = 1;
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        let running = session.search_nonce;
+        app.set_results(vec![result("v0")], &channel_target(&app));
+
+        leave_channel(&mut app, &mut session);
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.mode, Mode::Results);
+        assert_eq!(app.view_result_ids(), ["id0", "id1"]);
+        assert_eq!(app.view_selected(), 1, "元の選択へ戻る");
+        assert_ne!(session.search_nonce, running, "走らせたままにしない");
+        assert!(!app.searching);
+    }
+
+    #[tokio::test]
+    async fn moving_the_selection_stays_inside_the_channel_tab() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        let videos: Vec<SearchResult> = (0..6).map(|i| result(&format!("v{i}"))).collect();
+        app.set_results(videos, &channel_target(&app));
+
+        move_selection_with(&mut app, CELL, Dir::Right);
+        assert_eq!(app.view_selected(), 1);
+        move_selection_with(&mut app, CELL, Dir::Down);
+        assert_eq!(app.view_selected(), 5, "格子の下の行へ");
+        assert_eq!(app.selected, 0, "検索結果側の選択は触らない");
+    }
+
+    #[tokio::test]
+    async fn the_channel_thumbnails_are_fetched_for_the_channel_videos() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        app.set_results(vec![result("v0"), result("v1")], &channel_target(&app));
+
+        assert_eq!(
+            app.thumbs.wanted(&app.view_result_ids(), (144, 80)),
+            ["v0", "v1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn end_playback_returns_to_the_channel_it_started_from() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+        app.set_results(vec![result("v0")], &channel_target(&app));
+        app.mode = Mode::Playing;
+        app.video = Some(sink());
+
+        end_playback(&mut app, &mut session, None).await;
+        assert_eq!(app.mode, Mode::Channel, "チャンネル一覧へ戻る");
+        assert!(app.channel.is_some());
+    }
+
+    /// 今のチャンネルタブの target。set_results へ渡す。
+    fn channel_target(app: &App) -> Target {
+        app.channel.as_ref().expect("channel").target()
     }
 
     fn thumb_dir(name: &str) -> std::path::PathBuf {
@@ -2516,7 +2956,7 @@ mod tests {
 
     #[test]
     fn the_settings_screen_returns_to_the_mode_it_was_opened_from() {
-        for origin in [Mode::Input, Mode::Results] {
+        for origin in [Mode::Input, Mode::Results, Mode::Channel] {
             let mut session = Session::default();
             let mut app = App {
                 mode: origin,

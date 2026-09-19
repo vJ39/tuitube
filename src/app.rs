@@ -1,6 +1,6 @@
-use crate::category::Tabs;
+use crate::category::{TabState, Tabs};
 use crate::comments::{Comment, Comments};
-use crate::cookies::{CookieState, Target};
+use crate::cookies::{ChannelTab, CookieState, Target};
 use crate::display::{DisplayMode, FpsCap};
 use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
@@ -87,6 +87,71 @@ pub enum Mode {
     Results,
     Playing,
     Settings,
+    Channel,
+}
+
+/// 一覧の出どころ (チャンネルのタブ位置, カテゴリタブの位置)。
+pub type ViewKey = (Option<usize>, usize);
+
+/// チャンネル閲覧中の状態。タブごとの一覧はカテゴリタブと同じ TabState に持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelView {
+    pub channel_id: String,
+    pub channel_title: String,
+    pub tab: ChannelTab,
+    /// ChannelTab::ALL と同じ並び。
+    pub states: [TabState; 3],
+}
+
+impl ChannelView {
+    pub fn new(channel_id: String, channel_title: String) -> Self {
+        Self {
+            channel_id,
+            channel_title,
+            tab: ChannelTab::Videos,
+            states: Default::default(),
+        }
+    }
+
+    pub fn state(&self) -> &TabState {
+        &self.states[self.tab.index()]
+    }
+
+    pub fn state_mut(&mut self) -> &mut TabState {
+        &mut self.states[self.tab.index()]
+    }
+
+    pub fn next_tab(&mut self) {
+        let next = (self.tab.index() + 1) % ChannelTab::ALL.len();
+        self.tab = ChannelTab::ALL[next];
+    }
+
+    pub fn prev_tab(&mut self) {
+        let prev = (self.tab.index() + ChannelTab::ALL.len() - 1) % ChannelTab::ALL.len();
+        self.tab = ChannelTab::ALL[prev];
+    }
+
+    /// 位置を指して移る。範囲外は黙って無視し、選べたかどうかを返す。
+    pub fn select_tab(&mut self, index: usize) -> bool {
+        match ChannelTab::from_index(index) {
+            Some(tab) => {
+                self.tab = tab;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn labels() -> [&'static str; 3] {
+        ChannelTab::ALL.map(ChannelTab::label)
+    }
+
+    pub fn target(&self) -> Target {
+        Target::Channel {
+            id: self.channel_id.clone(),
+            tab: self.tab,
+        }
+    }
 }
 
 /// 設定画面で編集できる項目。画面の並びはこの順。
@@ -414,6 +479,8 @@ pub struct App {
     pub should_quit: bool,
     /// 擬似カテゴリタブ。results / selected / scroll はここの写し。
     pub tabs: Tabs,
+    /// チャンネル閲覧中だけ入る。入っている間は一覧の参照先がこちらへ移る。
+    pub channel: Option<ChannelView>,
     pub thumbs: Thumbs,
     /// 再生中の動画のコメント。取得状態と表示の on/off。
     pub comments: Comments,
@@ -460,6 +527,7 @@ impl Default for App {
             seek_bar: SeekBarState::default(),
             should_quit: false,
             tabs: Tabs::default(),
+            channel: None,
             thumbs: Thumbs::default(),
             comments: Comments::default(),
             scroll: 0,
@@ -517,32 +585,93 @@ impl App {
         self.set_error(None);
     }
 
+    /// 今の画面が見ている一覧。チャンネル閲覧中はその現在タブ、それ以外は検索結果。
+    pub fn view_results(&self) -> &[SearchResult] {
+        match &self.channel {
+            Some(channel) => &channel.state().results,
+            None => &self.results,
+        }
+    }
+
+    pub fn view_selected(&self) -> usize {
+        match &self.channel {
+            Some(channel) => channel.state().selected,
+            None => self.selected,
+        }
+    }
+
+    pub fn view_scroll(&self) -> usize {
+        match &self.channel {
+            Some(channel) => channel.state().scroll,
+            None => self.scroll,
+        }
+    }
+
+    pub fn set_view_selected(&mut self, index: usize) {
+        match &mut self.channel {
+            Some(channel) => channel.state_mut().selected = index,
+            None => self.selected = index,
+        }
+    }
+
+    pub fn set_view_scroll(&mut self, scroll: usize) {
+        match &mut self.channel {
+            Some(channel) => channel.state_mut().scroll = scroll,
+            None => self.scroll = scroll,
+        }
+    }
+
+    pub fn view_selected_result(&self) -> Option<&SearchResult> {
+        self.view_results().get(self.view_selected())
+    }
+
+    pub fn view_result_ids(&self) -> Vec<String> {
+        self.view_results().iter().map(|r| r.id.clone()).collect()
+    }
+
     pub fn select_next(&mut self) {
-        if self.results.is_empty() {
+        let len = self.view_results().len();
+        if len == 0 {
             return;
         }
-        self.selected = (self.selected + 1) % self.results.len();
+        self.set_view_selected((self.view_selected() + 1) % len);
     }
 
     pub fn select_prev(&mut self) {
-        if self.results.is_empty() {
+        let len = self.view_results().len();
+        if len == 0 {
             return;
         }
-        self.selected = (self.selected + self.results.len() - 1) % self.results.len();
-    }
-
-    pub fn selected_result(&self) -> Option<&SearchResult> {
-        self.results.get(self.selected)
+        self.set_view_selected((self.view_selected() + len - 1) % len);
     }
 
     pub fn set_results(&mut self, results: Vec<SearchResult>, target: &Target) {
-        let state = self.tabs.state_mut();
-        state.results = results;
-        state.selected = 0;
-        state.scroll = 0;
-        // 0 件でも読み込み済みにする。戻るたびに同じ検索を投げ直さないため。
-        state.loaded = true;
-        self.sync_from_tab();
+        match &mut self.channel {
+            Some(channel) => {
+                let state = channel.state_mut();
+                state.results = results;
+                state.selected = 0;
+                state.scroll = 0;
+                state.loaded = true;
+            }
+            None => {
+                let state = self.tabs.state_mut();
+                state.results = results;
+                state.selected = 0;
+                state.scroll = 0;
+                // 0 件でも読み込み済みにする。戻るたびに同じ検索を投げ直さないため。
+                state.loaded = true;
+            }
+        }
+        self.sync_from_view();
+        if self.channel.is_some() {
+            // 配信を持たないチャンネルも 0 件で来る。失敗ではないのでエラーにしない。
+            if self.view_results().is_empty() {
+                self.set_notice(Some(target.empty_message(self.cookies.for_search())));
+            }
+            self.enter_search_mode(Mode::Channel);
+            return;
+        }
         if self.results.is_empty() {
             self.error = Some(target.empty_message(self.cookies.for_search()));
             self.enter_search_mode(Mode::Input);
@@ -559,6 +688,14 @@ impl App {
         } else {
             self.mode = mode;
         }
+    }
+
+    /// 今の一覧の出どころ。変わっていれば結果集合ごと入れ替わっている。
+    pub fn view_key(&self) -> ViewKey {
+        (
+            self.channel.as_ref().map(|channel| channel.tab.index()),
+            self.tabs.selected(),
+        )
     }
 
     /// 描いたことを控える。ここから結果が入れ替わるまでのクリックは、見えている画面を指す。
@@ -580,6 +717,19 @@ impl App {
         self.selected = state.selected;
         self.scroll = state.scroll;
         let ids = self.result_ids();
+        self.thumbs.reset(&ids);
+        self.thumbs.mark_dirty();
+    }
+
+    /// 一覧を入れ替えた後の取り込み。チャンネル閲覧中は検索結果の写しを保ったまま、
+    /// 世代とサムネイルの状態表だけをチャンネルの一覧へ向ける。
+    pub fn sync_from_view(&mut self) {
+        if self.channel.is_none() {
+            self.sync_from_tab();
+            return;
+        }
+        self.results_generation = self.results_generation.wrapping_add(1);
+        let ids = self.view_result_ids();
         self.thumbs.reset(&ids);
         self.thumbs.mark_dirty();
     }
@@ -678,6 +828,7 @@ impl App {
             Mode::Playing => self.playing_status(),
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
             Mode::Results => self.search_status(self.results_status()),
+            Mode::Channel => self.search_status(self.channel_status()),
             Mode::Settings => self.settings_status(),
         };
         // エラーが出ている行に足すと読みにくいので、そのときは譲る。
@@ -698,14 +849,27 @@ impl App {
 
     /// 格子のタイトルは 18 桁ほどで切れるので、選択中の完全なタイトルはここに出す。
     fn results_status(&self) -> String {
-        let count = format!("{} 件", self.results.len());
+        let count = format!("{} 件", self.view_results().len());
         if self.thumbs.is_fetching() {
             return format!("{count}  |  サムネイル取得中...");
         }
-        match self.selected_result() {
+        match self.view_selected_result() {
             Some(result) => format!("{count}  |  {}", result.title),
             None => count,
         }
+    }
+
+    /// チャンネル名とタブは検索欄に出ないので、状態行の先頭に出す。
+    fn channel_status(&self) -> String {
+        let Some(channel) = &self.channel else {
+            return self.results_status();
+        };
+        format!(
+            "{} [{}]  |  {}",
+            channel.channel_title,
+            channel.tab.label(),
+            self.results_status()
+        )
     }
 
     /// 設定画面は保存の成否をここで返す。ポーリングが上書きしない画面なので、
@@ -802,7 +966,7 @@ pub fn format_time(seconds: Option<f64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cookies::{CookieSource, Feed};
+    use crate::cookies::{ChannelTab, CookieSource, Feed};
     use crate::display::Quality;
     use crate::grid::LayoutMode;
     use crate::speed::Speed;
@@ -823,6 +987,7 @@ mod tests {
             title: format!("title {id}"),
             duration: None,
             uploader: None,
+            channel_id: None,
         }
     }
 
@@ -960,7 +1125,7 @@ mod tests {
         app.select_next();
         app.select_prev();
         assert_eq!(app.selected, 0);
-        assert!(app.selected_result().is_none());
+        assert!(app.view_selected_result().is_none());
     }
 
     #[test]
@@ -1050,6 +1215,158 @@ mod tests {
         let mut app = App::default();
         app.set_results(Vec::new(), &search_target());
         assert_eq!(app.error.as_deref(), Some("検索結果が0件でした"));
+    }
+
+    /// 検索結果を 2 件持ち、そこからチャンネルを開いた App。
+    fn channel_app() -> App {
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.selected = 1;
+        app.scroll = 4;
+        app.store_to_tab();
+        app.channel = Some(ChannelView::new(
+            "UCabc".to_string(),
+            "Some Channel".to_string(),
+        ));
+        app.mode = Mode::Channel;
+        app.sync_from_view();
+        app
+    }
+
+    #[test]
+    fn a_channel_view_keeps_one_state_per_tab() {
+        let mut view = ChannelView::new("UCabc".to_string(), "Some Channel".to_string());
+        assert_eq!(view.tab, ChannelTab::Videos);
+        assert_eq!(
+            view.target(),
+            Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Videos
+            }
+        );
+
+        view.state_mut().results = vec![result("v")];
+        view.state_mut().selected = 1;
+        view.state_mut().loaded = true;
+
+        view.next_tab();
+        assert_eq!(view.tab, ChannelTab::Shorts);
+        assert!(view.state().results.is_empty(), "タブごとに別の一覧");
+        assert!(!view.state().loaded);
+
+        view.prev_tab();
+        assert_eq!(view.state().results.len(), 1, "戻ると持ち越した一覧");
+        assert_eq!(view.state().selected, 1);
+
+        // 端では巻き戻る。
+        view.prev_tab();
+        assert_eq!(view.tab, ChannelTab::Streams);
+        view.next_tab();
+        assert_eq!(view.tab, ChannelTab::Videos);
+    }
+
+    #[test]
+    fn selecting_a_channel_tab_by_position_ignores_the_ones_that_do_not_exist() {
+        let mut view = ChannelView::new("UCabc".to_string(), "c".to_string());
+        assert!(view.select_tab(2));
+        assert_eq!(view.tab, ChannelTab::Streams);
+        assert!(!view.select_tab(3));
+        assert!(!view.select_tab(usize::MAX));
+        assert_eq!(view.tab, ChannelTab::Streams, "範囲外では動かさない");
+    }
+
+    #[test]
+    fn the_view_follows_the_channel_and_leaves_the_search_results_alone() {
+        let mut app = channel_app();
+        app.channel.as_mut().expect("channel").state_mut().results =
+            vec![result("v0"), result("v1"), result("v2")];
+
+        assert_eq!(app.view_result_ids(), ["v0", "v1", "v2"]);
+        assert_eq!(app.result_ids(), ["a", "b"], "検索結果はそのまま");
+
+        app.set_view_selected(2);
+        app.set_view_scroll(3);
+        assert_eq!(app.view_selected(), 2);
+        assert_eq!(app.view_scroll(), 3);
+        assert_eq!(
+            app.view_selected_result().map(|r| r.id.as_str()),
+            Some("v2")
+        );
+        assert_eq!(app.selected, 1, "検索結果側の選択は動かさない");
+        assert_eq!(app.scroll, 4);
+
+        // チャンネルを閉じれば検索結果へ戻る。
+        app.channel = None;
+        assert_eq!(app.view_result_ids(), ["a", "b"]);
+        assert_eq!(app.view_selected(), 1);
+        assert_eq!(app.view_scroll(), 4);
+        assert_eq!(app.view_selected_result().map(|r| r.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn the_view_selection_wraps_inside_the_channel_tab() {
+        let mut app = channel_app();
+        app.channel.as_mut().expect("channel").state_mut().results =
+            vec![result("v0"), result("v1")];
+
+        app.select_next();
+        assert_eq!(app.view_selected(), 1);
+        app.select_next();
+        assert_eq!(app.view_selected(), 0, "巻き戻る");
+        app.select_prev();
+        assert_eq!(app.view_selected(), 1);
+        assert_eq!(app.selected, 1, "検索結果側は触らない");
+    }
+
+    #[test]
+    fn set_results_writes_through_to_the_current_channel_tab() {
+        let mut app = channel_app();
+        app.set_results(
+            vec![result("v0")],
+            &Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Videos,
+            },
+        );
+
+        let channel = app.channel.as_ref().expect("channel");
+        assert_eq!(channel.states[0].results.len(), 1);
+        assert!(channel.states[0].loaded);
+        assert!(channel.states[1].results.is_empty(), "他のタブは空のまま");
+        assert_eq!(app.mode, Mode::Channel);
+        assert_eq!(app.result_ids(), ["a", "b"], "検索結果は残す");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn an_empty_channel_tab_is_told_as_a_notice_not_an_error() {
+        // 配信を持たないチャンネルでも 0 件になるだけ。エラー表示にはしない。
+        let mut app = channel_app();
+        app.channel.as_mut().expect("channel").tab = ChannelTab::Streams;
+        app.set_results(
+            Vec::new(),
+            &Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Streams,
+            },
+        );
+
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let notice = app.notice.as_deref().expect("文言を出す");
+        assert!(notice.contains("ライブ配信"), "{notice}");
+        assert_eq!(app.mode, Mode::Channel, "検索欄へ落とさない");
+        let channel = app.channel.as_ref().expect("channel");
+        assert!(channel.states[2].loaded, "0 件でも読み込み済みにする");
+    }
+
+    #[test]
+    fn the_status_line_names_the_channel_and_the_tab() {
+        let mut app = channel_app();
+        app.channel.as_mut().expect("channel").state_mut().results = vec![result("v0")];
+        let line = app.status_line();
+        assert!(line.contains("Some Channel"), "{line}");
+        assert!(line.contains("動画"), "{line}");
+        assert!(line.contains("1 件"), "{line}");
     }
 
     #[test]
