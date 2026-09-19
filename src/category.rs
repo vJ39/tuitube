@@ -45,6 +45,9 @@ pub struct TabState {
     /// r で取り直しを頼まれた印。読み込めるまで下りないので、途中で打ち切っても
     /// 次の入口が控えを出さない。
     pub reload: bool,
+    /// このタブの一覧を取得したときに yt-dlp へ実際に要求した件数。既定 0 は未取得。
+    /// Target::Feed / Target::Channel のタブは立てないまま (0 のまま) にする。
+    pub requested_limit: usize,
 }
 
 #[derive(Debug)]
@@ -163,6 +166,11 @@ mod tests {
             uploader: None,
             channel_id: None,
         }
+    }
+
+    #[test]
+    fn a_fresh_tab_state_has_not_requested_anything_yet() {
+        assert_eq!(TabState::default().requested_limit, 0);
     }
 
     #[test]

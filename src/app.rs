@@ -43,6 +43,8 @@ pub enum AppEvent {
         nonce: u64,
         target: Target,
         report: SearchReport,
+        /// yt-dlp へ実際に要求した件数。TabState::requested_limit へそのまま渡す。
+        requested_limit: usize,
     },
     // nonce identifies the mpv instance, so events from an already replaced player are ignored.
     MpvProperty {
@@ -716,6 +718,15 @@ impl App {
         self.view_results().get(self.view_selected())
     }
 
+    /// 今のタブで「もっと見る」ができる状態か。Target::Feed / Target::Channel のタブは
+    /// requested_limit を立てないままにしているので、個別の場合分けなしで弾かれる。
+    pub fn can_load_more(&self) -> bool {
+        let state = self.view_state();
+        state.requested_limit > 0
+            && state.results.len() >= state.requested_limit
+            && state.requested_limit < MAX_SEARCH_LIMIT
+    }
+
     pub fn view_result_ids(&self) -> Vec<String> {
         self.view_results().iter().map(|r| r.id.clone()).collect()
     }
@@ -742,8 +753,16 @@ impl App {
             .filter(|result| !self.hidden.hides(result))
             .collect();
         let state = self.view_state_mut();
+        // 選んでいた動画がまだ新しい一覧にあればそこへ。通常の新規検索では
+        // まったく違う一覧になるため ID がほぼ一致せず、これまでどおり先頭へ。
+        let selected_id = state
+            .results
+            .get(state.selected)
+            .map(|result| result.id.clone());
         state.results = results;
-        state.selected = 0;
+        state.selected = selected_id
+            .and_then(|id| state.results.iter().position(|result| result.id == id))
+            .unwrap_or(0);
         state.scroll = 0;
         // 0 件でも読み込み済みにする。戻るたびに同じ検索を投げ直さないため。
         state.loaded = true;
@@ -1277,6 +1296,65 @@ mod tests {
         // 0 件でも読み込み済みにする。
         app.set_results(Vec::new(), &search_target());
         assert!(app.tabs.state().loaded);
+    }
+
+    #[test]
+    fn set_results_keeps_the_selected_video_when_it_is_still_in_the_new_list() {
+        // 「もっと見る」で件数が増えて並びが変わっても、選んでいた動画を追い続ける。
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.tabs.state_mut().selected = 1; // "b" を選んでいた
+
+        app.set_results(
+            vec![result("c"), result("b"), result("a")],
+            &search_target(),
+        );
+        assert_eq!(app.tabs.state().selected, 1, "b の新しい位置へ移る");
+    }
+
+    #[test]
+    fn set_results_falls_back_to_the_top_when_the_selected_video_is_gone() {
+        // 通常の新規検索では ID がほぼ一致しないため、これまでどおり先頭へ戻る。
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.tabs.state_mut().selected = 1;
+
+        app.set_results(vec![result("x"), result("y")], &search_target());
+        assert_eq!(app.tabs.state().selected, 0);
+    }
+
+    #[test]
+    fn can_load_more_is_false_until_a_tab_has_actually_requested_a_count() {
+        let app = App::default();
+        assert!(!app.can_load_more(), "取得前は requested_limit が 0");
+    }
+
+    #[test]
+    fn can_load_more_is_true_when_the_full_requested_count_came_back() {
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.tabs.state_mut().requested_limit = 2;
+        assert!(app.can_load_more());
+    }
+
+    #[test]
+    fn can_load_more_is_false_once_the_results_run_short_of_the_request() {
+        // 要求件数より実際の結果が少なければ、それ以上無いと分かる。
+        let mut app = App::default();
+        app.set_results(vec![result("a")], &search_target());
+        app.tabs.state_mut().requested_limit = 2;
+        assert!(!app.can_load_more());
+    }
+
+    #[test]
+    fn can_load_more_is_false_once_the_cap_is_reached() {
+        let max = crate::settings::MAX_SEARCH_LIMIT;
+        let mut app = App::default();
+        let results: Vec<SearchResult> = (0..max).map(|i| result(&i.to_string())).collect();
+        app.set_results(results, &search_target());
+        app.tabs.state_mut().requested_limit = max;
+        // 要求件数どおり満額で返っていても、上限まで要求済みならこれ以上は無い。
+        assert!(!app.can_load_more(), "上限まで要求済み");
     }
 
     #[test]

@@ -693,7 +693,13 @@ fn help_line(app: &App, width: u16) -> String {
     if app.mode == Mode::Settings && app.settings_edit.is_some() {
         return fit_hints(&settings_typing_hints(), width as usize);
     }
-    help_text(app.mode, app.display, app.comments.visible(), width)
+    help_text(
+        app.mode,
+        app.display,
+        app.comments.visible(),
+        app.can_load_more(),
+        width,
+    )
 }
 
 /// ステータス行は 1 行で折り返さないので、入らないぶんは "…" にする。
@@ -712,10 +718,16 @@ fn cursor_x(input_area: Rect, column: usize) -> u16 {
         .min(input_area.right().saturating_sub(2))
 }
 
-fn help_text(mode: Mode, display: DisplayMode, comments_open: bool, width: u16) -> String {
+fn help_text(
+    mode: Mode,
+    display: DisplayMode,
+    comments_open: bool,
+    can_load_more: bool,
+    width: u16,
+) -> String {
     let hints = match mode {
         Mode::Input => input_hints(),
-        Mode::Results => results_hints(),
+        Mode::Results => results_hints(can_load_more),
         Mode::Channel => channel_hints(),
         Mode::Playing => playing_hints(display, comments_open),
         Mode::Settings => settings_hints(),
@@ -742,8 +754,9 @@ fn input_hints() -> Vec<String> {
 
 /// 結果一覧の案内。ちょうど 80 桁で、80 桁端末に全部入る。
 /// h は押さないと気づけないので、矢印と Esc の言葉を削ってでも入れる。
-fn results_hints() -> Vec<String> {
-    vec![
+/// もっと見られる間だけ末尾に m を足す (狭い端末では他より先に落ちる)。
+fn results_hints(can_load_more: bool) -> Vec<String> {
+    let mut hints = vec![
         "↑↓←→".to_string(),
         "Enter:再生".to_string(),
         "c:チャンネル".to_string(),
@@ -753,7 +766,11 @@ fn results_hints() -> Vec<String> {
         "Esc:検索".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
-    ]
+    ];
+    if can_load_more {
+        hints.push("m:もっと見る".to_string());
+    }
+    hints
 }
 
 /// チャンネル一覧の案内。全部で 79 桁で 80 桁端末に収まる。
@@ -1092,13 +1109,13 @@ mod tests {
 
     /// 80 桁端末のヘルプ。案内が落ちるかどうかはここで決まる。
     fn help_80(mode: Mode, display: DisplayMode) -> String {
-        help_text(mode, display, false, 80)
+        help_text(mode, display, false, false, 80)
     }
 
     #[test]
     fn input_help_mentions_the_editing_keys() {
         // 既存の案内で 80 桁が埋まっているので、編集キーは幅のある端末でだけ出る。
-        let help = help_text(Mode::Input, DisplayMode::Embedded, false, 140);
+        let help = help_text(Mode::Input, DisplayMode::Embedded, false, false, 140);
         for key in [
             "Ctrl+A:全選択",
             "Shift+←→:選択",
@@ -1140,7 +1157,7 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_speed_keys() {
         // 80 桁では入らないので、広い端末での案内で見る。
-        let help = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        let help = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
         assert!(help.contains("[ ]"), "{help}");
         assert!(help.contains("BS"), "{help}");
         assert!(help.contains("速度"), "{help}");
@@ -1583,7 +1600,7 @@ mod tests {
 
     #[test]
     fn the_channel_help_names_the_way_back() {
-        let help = help_text(Mode::Channel, DisplayMode::Embedded, false, 80);
+        let help = help_text(Mode::Channel, DisplayMode::Embedded, false, false, 80);
         for key in ["Enter:再生", "Tab:", "Esc", "q:終了"] {
             assert!(help.contains(key), "{key} が無い: {help}");
         }
@@ -1622,6 +1639,22 @@ mod tests {
     fn the_results_help_names_the_channel_key() {
         // 80 桁端末で出ないと、チャンネルへ移れること自体に気づけない。
         assert!(help_80(Mode::Results, DisplayMode::Embedded).contains("c:チャンネル"));
+    }
+
+    #[test]
+    fn the_results_help_never_offers_more_when_it_cannot_load_more() {
+        let help = help_text(Mode::Results, DisplayMode::Embedded, false, false, 200);
+        assert!(!help.contains("m:もっと見る"), "{help}");
+    }
+
+    #[test]
+    fn the_more_hint_shows_up_once_there_is_room_and_more_to_load() {
+        let wide = help_text(Mode::Results, DisplayMode::Embedded, false, true, 200);
+        assert!(wide.contains("m:もっと見る"), "{wide}");
+
+        // 既存の案内だけでちょうど 80 桁が埋まるので、80 桁端末ではまだ出ない。
+        let narrow = help_text(Mode::Results, DisplayMode::Embedded, false, true, 80);
+        assert!(!narrow.contains("m:もっと見る"), "{narrow}");
     }
 
     /// 矩形の左上と右下。両端が同じセルを指すことを確かめるための 2 点。
@@ -1880,13 +1913,13 @@ mod tests {
 
     #[test]
     fn playing_help_drops_whole_hints_when_the_terminal_is_narrow() {
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
         assert!(wide.contains("クリック:シーク"), "{wide}");
 
-        let narrow = help_text(Mode::Playing, DisplayMode::Embedded, false, 30);
+        let narrow = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 30);
         assert_eq!(narrow, "space:一時停止 ←→:シーク");
         assert_eq!(
-            help_text(Mode::Playing, DisplayMode::Embedded, false, 0),
+            help_text(Mode::Playing, DisplayMode::Embedded, false, false, 0),
             ""
         );
     }
@@ -1894,7 +1927,7 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_subtitle_key() {
         // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
         assert!(wide.contains("s:字幕"), "{wide}");
         // 幅に入らないぶんは丸ごと落ちる。途中で切れた案内は出さない。
         let narrow = help_80(Mode::Playing, DisplayMode::Text);
@@ -1969,7 +2002,7 @@ mod tests {
         assert!(grid::display_width(&help) <= 80, "{help}");
         // 狭い端末では途中で切らず丸ごと落とす。
         assert_eq!(
-            help_text(Mode::Settings, DisplayMode::Embedded, false, 0),
+            help_text(Mode::Settings, DisplayMode::Embedded, false, false, 0),
             ""
         );
     }
@@ -1977,7 +2010,7 @@ mod tests {
     #[test]
     fn a_narrow_settings_help_drops_the_direct_input_before_the_way_out() {
         // 直接入力を足す前の 5 つは 58 桁に収まる。足りないぶんは末尾から落とす。
-        let narrow = help_text(Mode::Settings, DisplayMode::Embedded, false, 58);
+        let narrow = help_text(Mode::Settings, DisplayMode::Embedded, false, false, 58);
         for key in ["↑↓:選択", "←→:値変更", "Enter/Space:切替", "s:保存"] {
             assert!(narrow.contains(key), "{key} が落ちた: {narrow}");
         }
@@ -2177,17 +2210,17 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_comment_key() {
         // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        let wide = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
         assert!(wide.contains("o:コメント"), "{wide}");
     }
 
     #[test]
     fn the_arrow_hint_switches_to_the_comment_list_while_it_is_open() {
-        let open = help_text(Mode::Playing, DisplayMode::Embedded, true, 200);
+        let open = help_text(Mode::Playing, DisplayMode::Embedded, true, false, 200);
         assert!(open.contains("↑↓:行送り"), "{open}");
         assert!(!open.contains("↑↓:音量"), "{open}");
 
-        let closed = help_text(Mode::Playing, DisplayMode::Embedded, false, 200);
+        let closed = help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200);
         assert!(closed.contains("↑↓:音量"), "{closed}");
     }
 
@@ -2235,7 +2268,9 @@ mod tests {
     #[test]
     fn playing_help_mentions_the_mouse() {
         // マウスの案内は幅が余ったときだけ出す。
-        assert!(help_text(Mode::Playing, DisplayMode::Embedded, false, 200).contains("クリック"));
+        assert!(
+            help_text(Mode::Playing, DisplayMode::Embedded, false, false, 200).contains("クリック")
+        );
         assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
     }
 }

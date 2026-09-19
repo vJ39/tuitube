@@ -13,6 +13,7 @@ use crate::oauth;
 use crate::search::{self, RealYtDlp, SearchResult, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::settings;
+use crate::settings::MAX_SEARCH_LIMIT;
 use crate::speed::Speed;
 use crate::subtitles::{self, SubtitleLaunch, SubtitleStatus};
 use crate::thumbs;
@@ -270,7 +271,14 @@ pub fn start_search_with<R>(
         app.tabs.select_all();
         app.sync_from_tab();
     }
-    spawn_search(app, tx, session, Target::for_query(&query), runner);
+    spawn_search(
+        app,
+        tx,
+        session,
+        Target::for_query(&query),
+        app.settings.search.limit,
+        runner,
+    );
 }
 
 /// 今のタブのクエリで検索する。「すべて」タブでは検索ボックスの文字列を使う。
@@ -282,12 +290,26 @@ pub fn start_tab_search_with<R>(
 ) where
     R: YtDlp + Send + Sync + 'static,
 {
+    let limit = app.settings.search.limit;
+    start_tab_search_with_limit(app, tx, session, limit, runner);
+}
+
+/// 要求件数を指定してタブのクエリで検索する。`start_tab_search_with` の中身。
+fn start_tab_search_with_limit<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    limit: usize,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
     let Some(target) = app.tabs.target(app.query.text()) else {
         // 検索できないタブでも先行検索は打ち切る。残すと結果がこのタブへ流れ込む。
         cancel_search(app, session);
         return;
     };
-    spawn_search(app, tx, session, target, runner);
+    spawn_search(app, tx, session, target, limit, runner);
 }
 
 fn spawn_search<R>(
@@ -295,6 +317,7 @@ fn spawn_search<R>(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
     target: Target,
+    limit: usize,
     runner: R,
 ) where
     R: YtDlp + Send + Sync + 'static,
@@ -312,7 +335,6 @@ fn spawn_search<R>(
         return;
     }
     let nonce = session.search_nonce;
-    let limit = app.settings.search.limit;
     let timeout = app.settings.search.timeout;
     let cookies = app.cookies.for_search().cloned();
     // off の間は鍵を作らない。読み出しも控えも鍵の有無で決まるので、溜まりもしない。
@@ -329,6 +351,13 @@ fn spawn_search<R>(
         // 取りに行っていないので cookie の状態は確かめない。
         app.set_error(None);
         app.set_results(results, &target);
+        // AppEvent::SearchDone を経由しないこの経路でも、requested_limit の更新は
+        // apply_search_done と同じ条件で行う。ここを飛ばすと、「もっと見る」で
+        // 増やした後に同じ語を検索し直した際、件数の少ないキャッシュへ古い
+        // requested_limit が残って can_load_more の判定がずれる。
+        if matches!(target, Target::Search(_)) {
+            app.view_state_mut().requested_limit = limit;
+        }
         start_thumbnails(app, tx, session);
         return;
     }
@@ -342,6 +371,7 @@ fn spawn_search<R>(
             nonce,
             target,
             report,
+            requested_limit: limit,
         });
     }));
 }
@@ -703,7 +733,7 @@ fn start_channel_search_with<R>(
     let Some(target) = app.channel.as_ref().map(ChannelView::target) else {
         return;
     };
-    spawn_search(app, tx, session, target, runner);
+    spawn_search(app, tx, session, target, app.settings.search.limit, runner);
 }
 
 pub fn reload_channel_tab(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
@@ -790,7 +820,41 @@ pub fn reload_tab_with<R>(
     R: YtDlp + Send + Sync + 'static,
 {
     request_reload(app);
-    start_tab_search_with(app, tx, session, runner);
+    // 「もっと見る」で伸ばした件数を、取り直し(r)でも維持する。r は「今の中身を
+    // 見たい」意思表示であって、件数を初期値へ戻す意図ではないため。Feed/Channel の
+    // タブは requested_limit を立てないままなので settings.search.limit のままになる。
+    let limit = app
+        .view_state()
+        .requested_limit
+        .max(app.settings.search.limit);
+    start_tab_search_with_limit(app, tx, session, limit, runner);
+}
+
+pub fn load_more(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    load_more_with(app, tx, session, RealYtDlp);
+}
+
+/// 「もっと見る」。今表示中の件数 + search.limit を新しい要求件数とし (MAX_SEARCH_LIMIT で
+/// 丸める)、一覧を丸ごと取り直す。差分追記ではない。Target::Search のタブでだけ動く。
+pub fn load_more_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    if !app.can_load_more() {
+        return;
+    }
+    let Some(target) = app.tabs.target(app.query.text()) else {
+        return;
+    };
+    if !matches!(target, Target::Search(_)) {
+        return;
+    }
+    let limit = (app.view_results().len() + app.settings.search.limit).min(MAX_SEARCH_LIMIT);
+    spawn_search(app, tx, session, target, limit, runner);
 }
 
 /// 格子の中の移動。リスト表示に落ちているときは既存の巻き戻る移動を使う。
@@ -3698,6 +3762,158 @@ mod tests {
         assert!(!app.tabs.state().loaded);
     }
 
+    #[tokio::test]
+    async fn reload_keeps_the_count_that_load_more_had_reached() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        app.query.set("ラーメン");
+        // 「もっと見る」で 20 件まで伸ばしていた状態を模す。
+        app.tabs.state_mut().requested_limit = 20;
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+
+        reload_tab_with(&mut app, &tx, &mut session, runner.clone());
+        finish_search(&mut session).await;
+
+        let args = runner.calls();
+        assert_eq!(
+            args[0][0], "ytsearch20:ラーメン",
+            "取り直し(r)でも伸ばした件数のまま取りに行く"
+        );
+        let Some(AppEvent::SearchDone {
+            requested_limit, ..
+        }) = rx.recv().await
+        else {
+            panic!("SearchDone が届く");
+        };
+        assert_eq!(requested_limit, 20);
+    }
+
+    #[tokio::test]
+    async fn spawn_search_reports_the_limit_it_actually_requested() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: QueryEditor::from("ラーメン"),
+            ..App::default()
+        };
+        app.settings.search.limit = 7;
+
+        start_search_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeYtDlp::new([done(0, "", "")]),
+        );
+        finish_search(&mut session).await;
+
+        let Some(AppEvent::SearchDone {
+            requested_limit, ..
+        }) = rx.recv().await
+        else {
+            panic!("SearchDone が届く");
+        };
+        assert_eq!(requested_limit, 7);
+    }
+
+    #[tokio::test]
+    async fn load_more_does_nothing_before_a_tab_has_requested_a_count() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        app.query.set("ラーメン");
+        // まだ一度も取得しておらず requested_limit は 0 のまま。
+
+        load_more_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(
+            session.search_task.is_none(),
+            "もっと見られない間は動かない"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_more_does_nothing_while_results_still_fall_short_of_the_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        app.query.set("ラーメン");
+        // 要求 5 件に対し実際は 3 件しか返らなかった = それ以上は無いと分かっている。
+        app.tabs.state_mut().requested_limit = 5;
+
+        load_more_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn load_more_requests_the_shown_count_plus_the_setting_limit() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        app.query.set("ラーメン");
+        // 前回ちょうど 10 件を要求して 10 件満額で返ってきた状態。
+        app.tabs.state_mut().requested_limit = 10;
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+
+        load_more_with(&mut app, &tx, &mut session, runner.clone());
+        assert!(app.searching);
+
+        finish_search(&mut session).await;
+        let args = runner.calls();
+        assert_eq!(
+            args[0][0], "ytsearch20:ラーメン",
+            "表示中 10 件 + limit(10) で 20 件要求"
+        );
+
+        let Some(AppEvent::SearchDone {
+            requested_limit, ..
+        }) = rx.recv().await
+        else {
+            panic!("SearchDone が届く");
+        };
+        assert_eq!(requested_limit, 20);
+    }
+
+    #[tokio::test]
+    async fn load_more_rounds_the_request_down_to_the_max_search_limit() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(1);
+        app.query.set("ラーメン");
+        app.settings.search.limit = MAX_SEARCH_LIMIT;
+        app.tabs.state_mut().requested_limit = 1;
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+
+        load_more_with(&mut app, &tx, &mut session, runner.clone());
+
+        finish_search(&mut session).await;
+        let args = runner.calls();
+        assert_eq!(args[0][0], format!("ytsearch{MAX_SEARCH_LIMIT}:ラーメン"));
+    }
+
+    #[tokio::test]
+    async fn load_more_does_nothing_outside_a_search_tab() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        let feed_index = app
+            .tabs
+            .labels()
+            .iter()
+            .position(|label| *label == "履歴")
+            .expect("履歴タブがある");
+        app.tabs.select(feed_index);
+        // 実運用では Target::Feed のタブに requested_limit は立たないが、
+        // Target::Search のタブでだけ動く条件を単独で確かめるために強制的に立てる。
+        app.tabs.state_mut().requested_limit = 5;
+        app.tabs.state_mut().results = (0..5).map(|i| result(&i.to_string())).collect();
+
+        load_more_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none(), "Feed タブでは動かない");
+    }
+
     /// キャッシュを効かせた検索画面。サムネイルは別の話なので取りに行かせない。
     fn cache_app(ttl_secs: u64) -> App {
         let mut app = App {
@@ -3766,6 +3982,25 @@ mod tests {
         assert!(!app.searching);
         assert_eq!(app.result_ids(), ["a", "b"]);
         assert_eq!(app.mode, Mode::Results);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_still_updates_the_requested_limit() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = cache_app(300);
+        // 「もっと見る」で 20 件まで伸ばした後、同じ語をもう一度検索した状況を模す。
+        app.tabs.state_mut().requested_limit = 20;
+        prime_cache(&app, &mut session, &ramen(), vec![result("a"), result("b")]);
+
+        start_search_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        assert!(session.search_task.is_none(), "yt-dlp を起動しない");
+        assert_eq!(
+            app.tabs.state().requested_limit,
+            app.settings.search.limit,
+            "AppEvent::SearchDone を経由しない控え命中でも今回の要求件数に更新される"
+        );
     }
 
     #[tokio::test]

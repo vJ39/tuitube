@@ -3,7 +3,7 @@
 use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
     close_settings, config_path_from_env, copy_url_with, cycle_display_mode, hide_current_channel,
-    hide_selected, leave_channel, like_video, move_selection, move_settings_selection,
+    hide_selected, leave_channel, like_video, load_more, move_selection, move_settings_selection,
     open_channel, open_settings, reload_channel_tab, reload_tab, reset_speed, save_settings,
     scroll_comments, seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player,
     start_playback, start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
@@ -102,6 +102,8 @@ async fn handle_key_results(
         KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
+        // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
+        KeyCode::Char('m') => load_more(app, tx, session),
         KeyCode::Char('/') | KeyCode::Esc => {
             app.mode = Mode::Input;
             app.set_error(None);
@@ -2281,6 +2283,33 @@ mod tests {
         handle_key_results(&mut app, key(KeyCode::Char('r')), &tx, &mut session).await;
         assert!(!app.tabs.state().loaded);
         assert!(take_search(&mut session));
+    }
+
+    #[tokio::test]
+    async fn m_does_nothing_while_the_tab_cannot_load_more() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+        app.query.set("ラーメン");
+        // requested_limit がまだ立っていない。
+
+        handle_key_results(&mut app, key(KeyCode::Char('m')), &tx, &mut session).await;
+
+        assert!(!take_search(&mut session), "もっと見られない間は動かない");
+    }
+
+    #[tokio::test]
+    async fn m_loads_more_once_the_tab_can_load_more() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+        app.query.set("ラーメン");
+        // 前回ちょうど 4 件を要求して満額返ってきた状態。
+        app.tabs.state_mut().requested_limit = 4;
+
+        handle_key_results(&mut app, key(KeyCode::Char('m')), &tx, &mut session).await;
+
+        assert!(take_search(&mut session), "もっと見るを取りに行く");
     }
 
     /// Ctrl を押しながらのキー。

@@ -360,13 +360,14 @@ async fn handle_event(
             nonce,
             target,
             report,
+            requested_limit,
         } => {
             if nonce != session.search_nonce {
                 return;
             }
             session.search_task = None;
             app.searching = false;
-            apply_search_done(app, session, &target, report);
+            apply_search_done(app, session, &target, report, requested_limit);
             actions::start_thumbnails(app, tx, session);
         }
         AppEvent::MpvProperty { nonce, id, data } => {
@@ -516,6 +517,7 @@ fn apply_search_done(
     session: &mut Session,
     target: &Target,
     report: search::SearchReport,
+    requested_limit: usize,
 ) {
     let armed = matches!(app.cookies, CookieState::Armed(_));
     let source = app.cookies.for_search().cloned();
@@ -544,6 +546,11 @@ fn apply_search_done(
         Ok(results) => {
             actions::remember_search(session, &results, app.settings.search.cache_ttl);
             app.set_results(results, target);
+            // Target::Feed / Target::Channel は requested_limit を立てないままにする。
+            // (App::can_load_more の判定式にそのまま乗るので、個別の場合分けが要らない)
+            if matches!(target, Target::Search(_)) {
+                app.view_state_mut().requested_limit = requested_limit;
+            }
         }
         // 配信タブを持たないチャンネルでは yt-dlp が「そのタブは無い」と言って失敗する。
         // 一覧が無いだけなので、タブごとの文言に寄せて 0 件として扱う。
@@ -783,6 +790,8 @@ mod tests {
                 fell_back: false,
                 timeout: search::YT_DLP_TIMEOUT,
             },
+            // Target::Channel には requested_limit を立てないので値は無関係。
+            requested_limit: 0,
         }
     }
 
@@ -889,6 +898,7 @@ mod tests {
                     fell_back: false,
                     timeout: Duration::from_secs(30),
                 },
+                requested_limit: 0,
             },
             &tx,
             &mut session,
@@ -932,6 +942,7 @@ mod tests {
         nonce: u64,
         outcome: CookieOutcome,
         results: Result<Vec<SearchResult>, String>,
+        requested_limit: usize,
     ) -> AppEvent {
         AppEvent::SearchDone {
             nonce,
@@ -942,6 +953,7 @@ mod tests {
                 fell_back: false,
                 timeout: search::YT_DLP_TIMEOUT,
             },
+            requested_limit,
         }
     }
 
@@ -959,7 +971,7 @@ mod tests {
         };
         handle_event(
             &mut app,
-            search_done(1, CookieOutcome::Ok, Ok(vec![result("a")])),
+            search_done(1, CookieOutcome::Ok, Ok(vec![result("a")]), 1),
             &tx,
             &mut session,
         )
@@ -969,6 +981,65 @@ mod tests {
         assert_eq!(app.mode, Mode::Results);
         assert!(!app.searching);
         assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_successful_search_records_the_limit_it_actually_requested() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            ..App::default()
+        };
+
+        handle_event(
+            &mut app,
+            search_done(1, CookieOutcome::Ok, Ok(vec![result("a"), result("b")]), 20),
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.tabs.state().requested_limit, 20);
+    }
+
+    #[tokio::test]
+    async fn a_feed_tab_never_records_a_requested_limit() {
+        // Target::Feed は search.limit と無関係な固定件数を使うので、
+        // App::can_load_more の式に個別の場合分けを足さずに済むよう 0 のままにする。
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            searching: true,
+            cookies: CookieState::Active(source()),
+            ..App::default()
+        };
+
+        handle_event(
+            &mut app,
+            AppEvent::SearchDone {
+                nonce: 1,
+                target: Target::Feed(cookies::Feed::History),
+                report: SearchReport {
+                    results: Ok(vec![result("a")]),
+                    outcome: CookieOutcome::Ok,
+                    fell_back: false,
+                    timeout: search::YT_DLP_TIMEOUT,
+                },
+                requested_limit: 30,
+            },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(app.tabs.state().requested_limit, 0, "Feed タブには立てない");
     }
 
     /// 取りに行った検索の鍵を控えた状態。設定が on のとき spawn_search が置いていくもの。
@@ -997,7 +1068,7 @@ mod tests {
 
         handle_event(
             &mut app,
-            search_done(1, CookieOutcome::NotUsed, Ok(vec![result("a")])),
+            search_done(1, CookieOutcome::NotUsed, Ok(vec![result("a")]), 1),
             &tx,
             &mut session,
         )
@@ -1028,6 +1099,7 @@ mod tests {
                 1,
                 CookieOutcome::TimedOut,
                 Err("検索がタイムアウトしました (30 秒)".to_string()),
+                10,
             ),
             &tx,
             &mut session,
@@ -1064,6 +1136,7 @@ mod tests {
                     fell_back: false,
                     timeout: search::YT_DLP_TIMEOUT,
                 },
+                requested_limit: 0,
             },
             &tx,
             &mut session,
@@ -1138,7 +1211,7 @@ mod tests {
         };
         handle_event(
             &mut app,
-            search_done(1, CookieOutcome::Ok, results),
+            search_done(1, CookieOutcome::Ok, results, 10),
             &tx,
             &mut session,
         )
@@ -1181,6 +1254,7 @@ mod tests {
                 1,
                 CookieOutcome::Unreadable("could not find chrome cookies database".to_string()),
                 Ok(Vec::new()),
+                10,
             ),
             &tx,
             &mut session,
@@ -1214,6 +1288,7 @@ mod tests {
                 fell_back: true,
                 timeout: search::YT_DLP_TIMEOUT,
             },
+            requested_limit: 1,
         };
         handle_event(&mut app, event, &tx, &mut session).await;
 
@@ -1248,6 +1323,7 @@ mod tests {
                 fell_back: false,
                 timeout: Duration::from_secs(30),
             },
+            requested_limit: 10,
         };
         handle_event(&mut app, event, &tx, &mut session).await;
 
