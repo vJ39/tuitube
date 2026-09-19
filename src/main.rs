@@ -212,6 +212,7 @@ fn present_thumbs(
     }
     let mut bytes = Vec::new();
     video::encode_clear(&mut bytes);
+    let mut incomplete = false;
     if let Some(layout) = ui::grid_layout(app, cell) {
         for (i, rect) in layout.cells.iter().enumerate() {
             let Some(result) = app.results.get(layout.offset + i) else {
@@ -220,10 +221,16 @@ fn present_thumbs(
             let Some(image) = app.thumbs.get(&result.id) else {
                 continue;
             };
-            if let Some(at) = video::placement(rect.image, cell, (image.width, image.height)) {
-                rgb::encode_image(image, at, &mut bytes);
+            match video::placement(rect.image, cell, (image.width, image.height)) {
+                Some(at) => rgb::encode_image(image, at, &mut bytes),
+                // セル寸法と噛み合わず描けなかった。次のフレームで取り直す
+                // (take_dirty は成否を見ずに消費済みなので、ここで戻さないと直らない)。
+                None => incomplete = true,
             }
         }
+    }
+    if incomplete {
+        app.thumbs.mark_dirty();
     }
     // 画像は CUP で絶対位置へ寄せる。入力中は検索欄へ戻さないと、
     // 次の draw までカーソルが格子の中で点滅する。
@@ -881,6 +888,25 @@ mod tests {
         // 戻れば貼り直す。再生中に dirty を食い潰さない。
         app.mode = Mode::Results;
         assert_eq!(count_images(&thumbs_bytes(&mut app)), 1);
+    }
+
+    #[test]
+    fn present_thumbs_marks_dirty_again_after_a_placement_failure_so_it_retries() {
+        // 画面に絶対収まらない寸法。cell_size が取得時とズレたケースの代わり。
+        let huge =
+            rgb::RgbImage::new(2000, 2000, vec![9; 2000 * 2000 * 3]).expect("長さは合っている");
+        let mut app = thumb_app(4);
+        app.thumbs
+            .apply(vec![("id0".to_string(), Ok(huge))], (2000, 2000));
+
+        let out = thumbs_bytes(&mut app);
+        assert_eq!(count_images(&out), 0, "サイズが収まらず描けない");
+        assert_eq!(out, clear_bytes(), "描けなかった分は消すだけ書く");
+
+        // 一度失敗しても dirty を戻すので、次のフレームでまた描こうとする
+        // (直せば描けるようになるが、直らない間も食い潰されず毎回試す)。
+        let out2 = thumbs_bytes(&mut app);
+        assert_eq!(out2, clear_bytes(), "再試行が起きるので2回目も空にならない");
     }
 
     #[test]
