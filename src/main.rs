@@ -12,6 +12,7 @@ mod input;
 mod jpeg;
 mod kitty;
 mod mpv;
+mod query;
 mod rgb;
 mod search;
 mod seekbar;
@@ -545,7 +546,7 @@ mod tests {
 
         handle_batch(&mut app, key('a'), &mut rx, &tx, &mut session).await;
 
-        assert_eq!(app.query, "abc");
+        assert_eq!(app.query.text(), "abc");
         assert!(rx.try_recv().is_err(), "溜まっていた分は残さない");
     }
 
@@ -1028,7 +1029,7 @@ mod tests {
         let mut app = thumb_app(4);
         make_ready(&mut app, &["id0"]);
         app.mode = Mode::Input;
-        app.query = "らー".to_string();
+        app.query.set("らー");
         let out = thumbs_bytes(&mut app);
 
         let (x, y) = ui::input_cursor(app.screen, &app.query);

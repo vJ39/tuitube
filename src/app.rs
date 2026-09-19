@@ -3,6 +3,7 @@ use crate::comments::{Comment, Comments};
 use crate::cookies::{CookieState, Target};
 use crate::display::{DisplayMode, FpsCap};
 use crate::mpv::MpvCommand;
+use crate::query::QueryEditor;
 use crate::rgb::RgbImage;
 use crate::search::{SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
@@ -353,7 +354,8 @@ impl Playback {
 
 pub struct App {
     pub mode: Mode,
-    pub query: String,
+    /// 検索欄の文字列・カーソル・選択範囲。
+    pub query: QueryEditor,
     pub results: Vec<SearchResult>,
     pub selected: usize,
     pub searching: bool,
@@ -412,7 +414,7 @@ impl Default for App {
         let settings = Settings::default();
         Self {
             mode: Mode::Input,
-            query: String::new(),
+            query: QueryEditor::default(),
             results: Vec::new(),
             selected: 0,
             searching: false,

@@ -184,7 +184,7 @@ pub fn start_search_with<R>(
 ) where
     R: YtDlp + Send + Sync + 'static,
 {
-    let query = app.query.trim().to_string();
+    let query = app.query.text().trim().to_string();
     if query.is_empty() {
         return;
     }
@@ -206,7 +206,7 @@ pub fn start_tab_search_with<R>(
 ) where
     R: YtDlp + Send + Sync + 'static,
 {
-    let Some(target) = app.tabs.target(&app.query) else {
+    let Some(target) = app.tabs.target(app.query.text()) else {
         // 検索できないタブでも先行検索は打ち切る。残すと結果がこのタブへ流れ込む。
         cancel_search(app, session);
         return;
@@ -817,6 +817,7 @@ mod tests {
     use crate::cookies::{CookieSource, CookieState};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
+    use crate::query::QueryEditor;
     use crate::rgb::RgbImage;
     use crate::search::SearchResult;
     use crate::search::fixtures::{FakeYtDlp, Step, done};
@@ -959,7 +960,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "   ".to_string(),
+            query: QueryEditor::from("   "),
             ..App::default()
         };
         start_search(&mut app, &tx, &mut session);
@@ -974,7 +975,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "  ラーメン  ".to_string(),
+            query: QueryEditor::from("  ラーメン  "),
             error: Some("boom".to_string()),
             ..App::default()
         };
@@ -993,7 +994,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: ":ytrec".to_string(),
+            query: QueryEditor::from(":ytrec"),
             ..App::default()
         };
         start_search_with(&mut app, &tx, &mut session, StubYtDlp);
@@ -1011,7 +1012,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "ラーメン".to_string(),
+            query: QueryEditor::from("ラーメン"),
             notice: Some("前の検索の知らせ".to_string()),
             ..App::default()
         };
@@ -1020,7 +1021,7 @@ mod tests {
         assert!(app.searching);
 
         // 検索中に cookie 無しのフィードを要求する。
-        app.query = ":ytrec".to_string();
+        app.query.set(":ytrec");
         start_search_with(&mut app, &tx, &mut session, StubYtDlp);
 
         // 先行タスクは残さず、その結果が後から採用されないよう nonce も進める。
@@ -1037,7 +1038,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: ":ythis".to_string(),
+            query: QueryEditor::from(":ythis"),
             cookies: CookieState::Suspended {
                 source: CookieSource::from_spec(Some("chrome")).expect("spec"),
                 reason: "cookie を読めませんでした".to_string(),
@@ -1057,7 +1058,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "ラーメン".to_string(),
+            query: QueryEditor::from("ラーメン"),
             notice: Some("前の検索の知らせ".to_string()),
             ..App::default()
         };
@@ -1625,7 +1626,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "ラーメン".to_string(),
+            query: QueryEditor::from("ラーメン"),
             ..App::default()
         };
         switch_tab_with(&mut app, &tx, &mut session, true, StubYtDlp);
@@ -1798,13 +1799,13 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = grid_app(1);
-        app.query = "ラーメン".to_string();
+        app.query.set("ラーメン");
         reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
         let running = session.search_nonce;
         assert!(session.search_task.is_some());
 
         // 検索ボックスが空の「すべて」タブは検索を作れない。それでも先行分は止める。
-        app.query.clear();
+        app.query.set("");
         reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
         assert!(session.search_task.is_none());
         assert!(!app.searching);
@@ -2269,7 +2270,7 @@ mod tests {
         let mut app = grid_app(3);
         assert!(app.tabs.state().loaded);
         // query が空だと「すべて」タブは検索できないので、語を入れておく。
-        app.query = "ラーメン".to_string();
+        app.query.set("ラーメン");
 
         reload_tab_with(&mut app, &tx, &mut session, StubYtDlp);
         assert!(session.search_task.is_some());
@@ -2281,7 +2282,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "ラーメン".to_string(),
+            query: QueryEditor::from("ラーメン"),
             ..App::default()
         };
         app.tabs.next();

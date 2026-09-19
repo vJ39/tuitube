@@ -3,6 +3,7 @@ use crate::comments;
 use crate::display::DisplayMode;
 use crate::geometry::cell_size;
 use crate::grid::{self, LayoutMode};
+use crate::query::QueryEditor;
 use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use crate::video::CellSize;
 use ratatui::Frame;
@@ -179,15 +180,97 @@ pub fn grid_layout_in(app: &App, screen: Rect, cell: CellSize) -> Option<grid::L
 }
 
 /// 入力欄のカーソル位置 (0 始まり)。draw と、画像を貼った後の戻し先が同じ計算を使う。
-pub fn input_cursor(screen: Rect, query: &str) -> (u16, u16) {
+pub fn input_cursor(screen: Rect, query: &QueryEditor) -> (u16, u16) {
     let area = search_areas(screen)[0];
-    (cursor_x(area, query), area.y + 1)
+    let column =
+        text_width(query.before_cursor()).saturating_sub(query_scroll(query, input_width(area)));
+    (cursor_x(area, column), area.y + 1)
+}
+
+/// 入力欄の枠の内側の幅 (桁)。文字が並ぶのも送り幅を決めるのもこの幅の中。
+fn input_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+/// 1 文字の表示幅。入力欄の桁計算はすべてこれを積む。
+/// ratatui は書記素クラスタ単位で桁を進めるため、ZWJ 絵文字のように
+/// 複数コードポイントで 1 つの書記素になる文字は対象外 (docs/query-editor-design.md)。
+fn char_width(ch: char) -> usize {
+    grid::display_width(&ch.to_string())
+}
+
+fn text_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+/// 横スクロールの送り幅 (桁)。カーソルが枠の内側に入る最小の幅を、
+/// 全角を半分に割らないよう文字境界で求める。
+fn query_scroll(query: &QueryEditor, width: usize) -> usize {
+    let Some(last) = width.checked_sub(1) else {
+        return 0;
+    };
+    let needed = text_width(query.before_cursor()).saturating_sub(last);
+    let mut scrolled = 0;
+    for ch in query.text().chars() {
+        if scrolled >= needed {
+            break;
+        }
+        scrolled += char_width(ch);
+    }
+    scrolled
+}
+
+/// 画面のこの位置にある検索語の文字。検索欄の外では None。
+pub fn query_index_at_point(app: &App, column: u16, row: u16) -> Option<usize> {
+    let area = search_areas(app.screen)[0];
+    if !area.contains(Position::new(column, row)) {
+        return None;
+    }
+    let width = input_width(area);
+    // 文字は枠の内側 (x+1) から並ぶ。枠を押したら内側の端を押したものとして扱う。
+    let offset =
+        (column.saturating_sub(area.x.saturating_add(1)) as usize).min(width.saturating_sub(1));
+    Some(query_index_at_column(
+        app.query.text(),
+        query_scroll(&app.query, width) + offset,
+    ))
+}
+
+/// 表示幅を積みながら `column` 桁にある文字を探す。末尾より右は文字数を返す。
+fn query_index_at_column(text: &str, column: usize) -> usize {
+    let mut x = 0;
+    for (index, ch) in text.chars().enumerate() {
+        x += char_width(ch);
+        if column < x {
+            return index;
+        }
+    }
+    text.chars().count()
+}
+
+/// 選択範囲だけ反転させた入力行。`from` 文字目より前は横スクロールで隠れている。
+/// 入力中でなければ反転は出さない。カーソルも出ない欄に選択だけ残ると、
+/// どこを編集しているのか分からなくなる。
+fn query_line(query: &QueryEditor, from: usize, editing: bool) -> Line<'_> {
+    if !editing {
+        return Line::from(query.slice_from(from));
+    }
+    let (head, selected, tail) = query.slices_from(from);
+    Line::from(vec![
+        Span::raw(head),
+        Span::styled(selected, Style::default().add_modifier(Modifier::REVERSED)),
+        Span::raw(tail),
+    ])
 }
 
 fn draw_search(frame: &mut Frame, app: &App) {
     let areas = search_areas(frame.area());
 
-    let input = Paragraph::new(app.query.as_str())
+    let scrolled = query_index_at_column(
+        app.query.text(),
+        query_scroll(&app.query, input_width(areas[0])),
+    );
+    let input = Paragraph::new(query_line(&app.query, scrolled, app.mode == Mode::Input))
         .block(Block::default().borders(Borders::ALL).title(" 検索 "));
     frame.render_widget(input, areas[0]);
     draw_tabs(frame, app, areas[1]);
@@ -601,13 +684,13 @@ fn status_text(app: &App, width: usize) -> String {
     grid::truncate(&app.status_line(), width)
 }
 
-/// 全角文字はセル幅2で描画されるため、文字数ではなく表示幅で桁を数える。
-fn cursor_x(input_area: Rect, query: &str) -> u16 {
-    let width = Span::raw(query).width().min(u16::MAX as usize) as u16;
+/// カーソルの桁。`column` は送り幅を引いた後の、枠の内側での位置。
+fn cursor_x(input_area: Rect, column: usize) -> u16 {
+    let column = column.min(u16::MAX as usize) as u16;
     input_area
         .x
         .saturating_add(1)
-        .saturating_add(width)
+        .saturating_add(column)
         .min(input_area.right().saturating_sub(2))
 }
 
@@ -621,8 +704,9 @@ fn help_text(mode: Mode, display: DisplayMode, comments_open: bool, width: u16) 
     fit_hints(&hints, width as usize)
 }
 
-/// 検索入力の案内。全部で 79 桁ほどで 80 桁端末に収まる。
+/// 検索入力の案内。先頭 5 つで 75 桁ほどになり、80 桁端末にはそこまでが出る。
 /// 入力欄では S も検索語なので、設定は Ctrl+S で開く。
+/// 後半の編集キーは 80 桁には入らないので、幅のある端末でだけ出る。
 fn input_hints() -> Vec<String> {
     vec![
         "Enter:検索".to_string(),
@@ -630,6 +714,10 @@ fn input_hints() -> Vec<String> {
         ":yt*:ログイン連動の一覧".to_string(),
         "Esc:結果へ/終了".to_string(),
         "Ctrl+S:設定".to_string(),
+        "Ctrl+A:全選択".to_string(),
+        "Shift+←→:選択".to_string(),
+        "Home/End:先頭/末尾".to_string(),
+        "クリック:カーソル".to_string(),
     ]
 }
 
@@ -757,22 +845,229 @@ mod tests {
 
     #[test]
     fn cursor_follows_display_width_not_char_count() {
-        let area = Rect::new(0, 0, 40, 3);
-        assert_eq!(cursor_x(area, ""), 1);
-        assert_eq!(cursor_x(area, "abc"), 4);
+        let app = input_app("abc");
+        assert_eq!(input_cursor(app.screen, &app.query).0, 4);
+
         // 全角4文字 = 8桁
-        assert_eq!(cursor_x(area, "ラーメン"), 9);
+        let app = input_app("ラーメン");
+        assert_eq!(input_cursor(app.screen, &app.query).0, 9);
+
+        let app = input_app("");
+        assert_eq!(input_cursor(app.screen, &app.query).0, 1);
     }
 
     #[test]
     fn cursor_stops_inside_the_border() {
+        // 送り幅を入れないと枠に重なる位置でも、枠の内側で止める。
         let area = Rect::new(0, 0, 10, 3);
-        assert_eq!(cursor_x(area, "ラーメンラーメン"), 8);
+        assert_eq!(cursor_x(area, 99), 8);
+    }
+
+    /// 検索欄を持つ 40x24 の画面。
+    fn input_app(text: &str) -> App {
+        sized_input_app(text, 40)
+    }
+
+    /// 検索欄を持つ幅 `width` の画面。横スクロールの検証に使う。
+    fn sized_input_app(text: &str, width: u16) -> App {
+        App {
+            screen: Rect::new(0, 0, width, 24),
+            query: QueryEditor::from(text),
+            ..App::default()
+        }
+    }
+
+    /// 入力欄の行に描かれている文字。
+    fn drawn_input_text(app: &App) -> String {
+        let width = app.screen.width;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24)).expect("端末");
+        terminal.draw(|frame| draw(frame, app)).expect("描ける");
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        // 両端の枠を除いた内側だけを読む。全角の右半分のセルは空白なので飛ばす。
+        let mut skip = false;
+        for x in 1..width.saturating_sub(1) {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            let symbol = buffer[(x, 1)].symbol();
+            skip = grid::display_width(symbol) == 2;
+            out.push_str(symbol);
+        }
+        out.trim_end().to_string()
+    }
+
+    #[test]
+    fn the_cursor_follows_the_editing_position_not_the_end_of_the_text() {
+        let mut app = input_app("ラーメン");
+        assert_eq!(input_cursor(app.screen, &app.query).0, 9);
+
+        app.query.move_left(false);
+        assert_eq!(input_cursor(app.screen, &app.query).0, 7, "全角 3 文字ぶん");
+
+        app.query.move_home(false);
+        assert_eq!(input_cursor(app.screen, &app.query).0, 1, "枠の内側の先頭");
+    }
+
+    /// 入力欄の行で反転表示されている文字。
+    fn reversed_input_text(app: &App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 24)).expect("端末");
+        terminal.draw(|frame| draw(frame, app)).expect("描ける");
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, 1)];
+            if cell.modifier.contains(Modifier::REVERSED) {
+                out.push_str(cell.symbol());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_selection_is_drawn_reversed() {
+        let mut app = input_app("ラーメン");
+        assert_eq!(reversed_input_text(&app), "", "選択が無ければ反転しない");
+
+        app.query.move_left(true);
+        app.query.move_left(true);
+        assert_eq!(reversed_input_text(&app), "メン");
+
+        app.query.select_all();
+        assert_eq!(reversed_input_text(&app), "ラーメン");
+    }
+
+    #[test]
+    fn the_selection_is_not_drawn_after_the_focus_leaves_the_search_box() {
+        let mut app = input_app("ラーメン");
+        app.query.select_all();
+        assert_eq!(reversed_input_text(&app), "ラーメン");
+
+        // 結果一覧ではカーソルも出ないので、反転だけ残すと編集中に見える。
+        app.mode = Mode::Results;
+        assert_eq!(reversed_input_text(&app), "");
+    }
+
+    #[test]
+    fn the_input_scrolls_to_keep_the_cursor_in_the_box() {
+        // 枠の内側 8 桁に対して全角 8 文字 (16 桁)。
+        let mut app = sized_input_app("ラーメンラーメン", 10);
+        assert_eq!(drawn_input_text(&app), "ーメン", "末尾が見えている");
+        assert_eq!(input_cursor(app.screen, &app.query).0, 7, "最後の文字の右");
+
+        app.query.move_home(false);
+        assert_eq!(drawn_input_text(&app), "ラーメン", "先頭へ戻れば送りも戻る");
+        assert_eq!(input_cursor(app.screen, &app.query).0, 1);
+    }
+
+    #[test]
+    fn a_query_that_fits_is_not_scrolled() {
+        let app = input_app("ラーメン");
+        assert_eq!(drawn_input_text(&app), "ラーメン");
+        assert_eq!(query_index_at_point(&app, 1, 1), Some(0));
+    }
+
+    #[test]
+    fn clicking_a_scrolled_box_answers_with_the_character_under_it() {
+        let app = sized_input_app("ラーメンラーメン", 10);
+        // 送り幅は 10 桁。内側の先頭に出ているのは 6 文字目 (index 5)。
+        assert_eq!(query_index_at_point(&app, 1, 1), Some(5));
+        assert_eq!(query_index_at_point(&app, 3, 1), Some(6));
+        assert_eq!(
+            query_index_at_point(&app, 7, 1),
+            Some(8),
+            "末尾より右は文字数"
+        );
+    }
+
+    #[test]
+    fn clicking_the_right_border_stops_at_the_last_visible_character() {
+        let mut app = sized_input_app("ラーメンラーメン", 10);
+        app.query.move_home(false);
+        // 内側 8 桁には 4 文字しか出ていない。右枠を押しても 5 文字目は指さない。
+        assert_eq!(query_index_at_point(&app, 9, 1), Some(3));
+        assert_eq!(query_index_at_point(&app, 8, 1), Some(3));
+    }
+
+    /// 桁の数え方が 1 つなら、カーソルのいる桁を押すと同じ位置が返る。
+    #[test]
+    fn the_cursor_column_and_the_click_target_count_the_same_way() {
+        let text = "aあiうe";
+        let mut app = input_app(text);
+        for index in 0..text.chars().count() {
+            app.query.move_to(index);
+            let x = input_cursor(app.screen, &app.query).0;
+            assert_eq!(
+                query_index_at_point(&app, x, 1),
+                Some(index),
+                "{index} 文字目"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_search_box_answers_with_the_character_under_it() {
+        let app = input_app("ラーメン");
+        // 文字は枠の内側 (x=1) から並び、全角 1 文字が 2 桁を占める。
+        assert_eq!(query_index_at_point(&app, 1, 1), Some(0));
+        assert_eq!(query_index_at_point(&app, 2, 1), Some(0));
+        assert_eq!(query_index_at_point(&app, 3, 1), Some(1));
+        assert_eq!(query_index_at_point(&app, 8, 1), Some(3));
+        assert_eq!(query_index_at_point(&app, 9, 1), Some(4), "文字の先は末尾");
+        assert_eq!(query_index_at_point(&app, 30, 1), Some(4));
+        assert_eq!(
+            query_index_at_point(&app, 0, 1),
+            Some(0),
+            "左の枠は先頭扱い"
+        );
+    }
+
+    #[test]
+    fn clicking_an_empty_search_box_answers_with_the_head() {
+        let app = input_app("");
+        assert_eq!(query_index_at_point(&app, 10, 1), Some(0));
+    }
+
+    #[test]
+    fn the_search_box_hit_test_only_answers_where_it_is_drawn() {
+        // 全段が入らない高さでは割り付けが潰れる。どこへ潰れても描いた行の中だけで応じる。
+        for height in 0..8u16 {
+            let app = App {
+                screen: Rect::new(0, 0, 40, height),
+                ..App::default()
+            };
+            let area = search_areas(app.screen)[0];
+            for row in 0..8u16 {
+                let drawn = row >= area.y && row < area.bottom();
+                let hit = query_index_at_point(&app, 1, row);
+                assert_eq!(
+                    hit.is_some(),
+                    drawn,
+                    "{height} 行 / {row} 行目 (入力欄 {area:?}): {hit:?}"
+                );
+            }
+        }
     }
 
     /// 80 桁端末のヘルプ。案内が落ちるかどうかはここで決まる。
     fn help_80(mode: Mode, display: DisplayMode) -> String {
         help_text(mode, display, false, 80)
+    }
+
+    #[test]
+    fn input_help_mentions_the_editing_keys() {
+        // 既存の案内で 80 桁が埋まっているので、編集キーは幅のある端末でだけ出る。
+        let help = help_text(Mode::Input, DisplayMode::Embedded, false, 140);
+        for key in [
+            "Ctrl+A:全選択",
+            "Shift+←→:選択",
+            "Home/End:先頭/末尾",
+            "クリック:カーソル",
+        ] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
     }
 
     #[test]
@@ -1656,7 +1951,7 @@ mod tests {
         // 検索画面の上に重ねず、設定だけの画面にする。
         let app = App {
             mode: Mode::Settings,
-            query: "ラーメン".to_string(),
+            query: QueryEditor::from("ラーメン"),
             ..App::default()
         };
         let screen = rendered(&app, 80, 24);

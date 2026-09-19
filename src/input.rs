@@ -44,19 +44,23 @@ fn handle_key_input(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
+    let extend = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
         KeyCode::Enter => start_search(app, tx, session),
         KeyCode::Tab => switch_tab(app, tx, session, true),
         KeyCode::BackTab => switch_tab(app, tx, session, false),
-        KeyCode::Backspace => {
-            app.query.pop();
-        }
+        KeyCode::Backspace => app.query.backspace(),
+        KeyCode::Left => app.query.move_left(extend),
+        KeyCode::Right => app.query.move_right(extend),
+        KeyCode::Home => app.query.move_home(extend),
+        KeyCode::End => app.query.move_end(extend),
         // 入力欄では大文字の S も検索語なので、設定は Ctrl+S で開く。
         KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
+        KeyCode::Char(c) if is_select_all_key(c, key.modifiers) => app.query.select_all(),
         // 他の Ctrl 付きは検索語に入れない。制御文字が混ざると検索が通らない。
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char(c) => {
-            app.query.push(c);
+            app.query.insert(c);
             app.set_error(None);
         }
         KeyCode::Esc => {
@@ -100,6 +104,11 @@ async fn handle_key_results(
 /// 設定画面を開くキー。Ctrl+S はどちらの検索画面でも使える。
 fn is_settings_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'s')
+}
+
+/// 検索語を全選択するキー。
+fn is_select_all_key(c: char, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'a')
 }
 
 /// 設定画面の操作。保存以外は app.settings をその場で書き換えるだけ。
@@ -256,7 +265,8 @@ async fn handle_key_playing_with<C: Clipboard>(
     }
 }
 
-/// マウス。再生中はシーク、入力欄はタブ、結果一覧はタブと格子のクリックを見る。
+/// マウス。再生中はシーク、入力欄はタブと検索欄のカーソル移動、
+/// 結果一覧はタブと格子のクリックを見る。
 pub async fn handle_mouse(
     app: &mut App,
     mouse: MouseEvent,
@@ -266,25 +276,41 @@ pub async fn handle_mouse(
     match app.mode {
         Mode::Playing => handle_mouse_playing(app, mouse, session).await,
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
-        Mode::Input => handle_mouse_tabs(app, mouse, tx, session),
+        Mode::Input => handle_mouse_input(app, mouse, tx, session),
         Mode::Settings => {}
     }
 }
 
-/// タブ行のクリック。押し込みだけを見るので、ドラッグや離した位置では動かない。
-fn handle_mouse_tabs(
+/// 入力モードでのクリックの行き先。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputClick {
+    Tab(usize),
+    Cursor(usize),
+}
+
+/// 押し込みだけを見るので、ドラッグや離した位置では動かない。
+/// タブ行と入力欄は重ならないが、既存のタブ選択を先に見る。
+fn input_click(app: &App, mouse: MouseEvent) -> Option<InputClick> {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return None;
+    }
+    if let Some(index) = ui::tab_at_point(app, mouse.column, mouse.row) {
+        return Some(InputClick::Tab(index));
+    }
+    ui::query_index_at_point(app, mouse.column, mouse.row).map(InputClick::Cursor)
+}
+
+fn handle_mouse_input(
     app: &mut App,
     mouse: MouseEvent,
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
-    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-        return;
+    match input_click(app, mouse) {
+        Some(InputClick::Tab(index)) => select_tab(app, tx, session, index),
+        Some(InputClick::Cursor(index)) => app.query.move_to(index),
+        None => {}
     }
-    let Some(index) = ui::tab_at_point(app, mouse.column, mouse.row) else {
-        return;
-    };
-    select_tab(app, tx, session, index);
 }
 
 /// 結果一覧でのクリックの行き先。
@@ -406,6 +432,7 @@ mod tests {
     use crate::category::{Category, Tabs};
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::display::DisplayMode;
+    use crate::query::QueryEditor;
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
     use crossterm::event::MouseButton;
@@ -564,7 +591,7 @@ mod tests {
         // 入力欄では検索語の 1 文字。
         let mut app = App::default();
         handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
-        assert_eq!(app.query, "o");
+        assert_eq!(app.query.text(), "o");
         assert!(!app.comments.visible());
 
         let mut app = App {
@@ -586,7 +613,7 @@ mod tests {
         handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session);
         handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session);
 
-        assert_eq!(app.query, "ラー");
+        assert_eq!(app.query.text(), "ラー");
         assert!(app.error.is_none());
     }
 
@@ -595,14 +622,14 @@ mod tests {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "ラー".to_string(),
+            query: QueryEditor::from("ラー"),
             ..App::default()
         };
         handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session);
-        assert_eq!(app.query, "ラ");
+        assert_eq!(app.query.text(), "ラ");
         handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session);
         handle_key_input(&mut app, key(KeyCode::Backspace), &tx, &mut session);
-        assert!(app.query.is_empty());
+        assert!(app.query.text().is_empty());
     }
 
     #[test]
@@ -653,7 +680,7 @@ mod tests {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "   ".to_string(),
+            query: QueryEditor::from("   "),
             ..App::default()
         };
         handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session);
@@ -751,7 +778,7 @@ mod tests {
         let mut app = App::default();
         handle_key(&mut app, key(KeyCode::Char(']')), &tx, &mut session).await;
         assert_eq!(app.speed, crate::speed::Speed::NORMAL);
-        assert_eq!(app.query, "]");
+        assert_eq!(app.query.text(), "]");
     }
 
     /// 送った内容だけを溜める偽の player。外部プロセスへは届かない。
@@ -832,7 +859,7 @@ mod tests {
         let mut app = App::default();
         handle_key(&mut app, key(KeyCode::Char('w')), &tx, &mut session).await;
         assert_eq!(app.display, crate::display::DisplayMode::Embedded);
-        assert_eq!(app.query, "w", "入力モードでは文字として入る");
+        assert_eq!(app.query.text(), "w", "入力モードでは文字として入る");
     }
 
     const URL: &str = "https://www.youtube.com/watch?v=abc";
@@ -944,7 +971,7 @@ mod tests {
         // 検索入力中は検索語の文字として入る。
         let mut app = App::default();
         handle_key(&mut app, key(KeyCode::Char('s')), &tx, &mut session).await;
-        assert_eq!(app.query, "s");
+        assert_eq!(app.query.text(), "s");
         assert!(app.subtitles.wanted());
 
         // 結果一覧では何も起きない。
@@ -994,7 +1021,7 @@ mod tests {
         let mut app = App::default();
         handle_key(&mut app, key(KeyCode::Char('c')), &tx, &mut session).await;
 
-        assert_eq!(app.query, "c");
+        assert_eq!(app.query.text(), "c");
         assert!(app.notice.is_none());
     }
 
@@ -1158,6 +1185,200 @@ mod tests {
             handle_mouse(&mut app, mouse(kind, 9, 3), &tx, &mut session).await;
             assert_eq!(app.tabs.selected(), 0, "{kind:?}");
             assert!(!take_search(&mut session), "{kind:?}");
+        }
+    }
+
+    /// Shift を押しながらのキー。
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    /// 検索語の入った 80x24 の入力モード。
+    fn query_app(text: &str) -> App {
+        App {
+            screen: Rect::new(0, 0, 80, 24),
+            query: QueryEditor::from(text),
+            ..App::default()
+        }
+    }
+
+    /// 入力欄 (80x24 の端末では y=1) の押し込み。
+    fn box_click(column: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, 1)
+    }
+
+    #[tokio::test]
+    async fn arrows_move_the_cursor_and_typing_lands_there() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "ラー丼メン");
+
+        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "ラー丼ン", "カーソルの前を消す");
+    }
+
+    #[tokio::test]
+    async fn home_and_end_jump_to_the_edges_of_the_query() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, key(KeyCode::Home), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('大')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "大ラーメン");
+
+        handle_key(&mut app, key(KeyCode::End), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "大ラーメン丼");
+    }
+
+    #[tokio::test]
+    async fn cursor_keys_on_an_empty_query_change_nothing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        for code in [KeyCode::Home, KeyCode::End, KeyCode::Left, KeyCode::Right] {
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+            handle_key(&mut app, shift(code), &tx, &mut session).await;
+        }
+        assert!(app.query.text().is_empty());
+        assert_eq!(app.mode, Mode::Input);
+        assert!(!app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn shift_arrows_select_and_typing_replaces_the_selection() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, shift(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, shift(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "ラー丼");
+    }
+
+    #[tokio::test]
+    async fn shift_home_and_shift_end_select_up_to_the_edges() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        let mut app = query_app("ラーメン");
+        handle_key(&mut app, shift(KeyCode::Home), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert!(app.query.text().is_empty(), "末尾から先頭まで消える");
+
+        let mut app = query_app("ラーメン");
+        handle_key(&mut app, key(KeyCode::Home), &tx, &mut session).await;
+        handle_key(&mut app, shift(KeyCode::End), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert!(app.query.text().is_empty(), "先頭から末尾まで消える");
+    }
+
+    #[tokio::test]
+    async fn an_arrow_without_shift_drops_the_selection() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, shift(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, shift(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "ラメン", "選択は消さず 1 文字だけ消える");
+    }
+
+    #[tokio::test]
+    async fn ctrl_a_selects_everything_without_typing_an_a() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, ctrl(KeyCode::Char('a')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "ラーメン", "a は検索語に入れない");
+
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+        assert_eq!(app.query.text(), "丼", "全選択のうえ打てば入れ替わる");
+    }
+
+    #[tokio::test]
+    async fn backspace_deletes_the_whole_selection() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, ctrl(KeyCode::Char('a')), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert!(app.query.text().is_empty());
+
+        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
+        assert!(app.query.text().is_empty(), "空でも落ちない");
+    }
+
+    #[tokio::test]
+    async fn clicking_the_search_box_moves_the_cursor_there() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        // 全角 1 文字が 2 桁。枠の内側 x=1 から数えて x=3 は 2 文字目の頭。
+        handle_mouse(&mut app, box_click(3), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+
+        assert_eq!(app.query.text(), "ラ丼ーメン");
+        assert_eq!(app.tabs.selected(), 0, "タブは動かさない");
+        assert!(!take_search(&mut session), "検索も走らせない");
+    }
+
+    #[tokio::test]
+    async fn clicking_past_the_end_of_the_query_puts_the_cursor_at_the_end() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, key(KeyCode::Home), &tx, &mut session).await;
+        handle_mouse(&mut app, box_click(60), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+
+        assert_eq!(app.query.text(), "ラーメン丼");
+    }
+
+    #[tokio::test]
+    async fn clicking_the_search_box_drops_the_selection() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = query_app("ラーメン");
+
+        handle_key(&mut app, ctrl(KeyCode::Char('a')), &tx, &mut session).await;
+        handle_mouse(&mut app, box_click(1), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+
+        assert_eq!(app.query.text(), "丼ラーメン", "全置換にはならない");
+    }
+
+    #[tokio::test]
+    async fn only_a_left_press_in_the_search_box_moves_the_cursor() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let kinds = [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollDown,
+        ];
+        for kind in kinds {
+            let mut app = query_app("ラーメン");
+            handle_mouse(&mut app, mouse(kind, 1, 1), &tx, &mut session).await;
+            handle_key(&mut app, key(KeyCode::Char('丼')), &tx, &mut session).await;
+            assert_eq!(app.query.text(), "ラーメン丼", "{kind:?}");
         }
     }
 
@@ -1453,7 +1674,7 @@ mod tests {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
-            query: "ラーメン".to_string(),
+            query: QueryEditor::from("ラーメン"),
             ..App::default()
         };
         handle_key_input(&mut app, key(KeyCode::Tab), &tx, &mut session);
@@ -1475,7 +1696,7 @@ mod tests {
 
         handle_key_input(&mut app, key(KeyCode::Char('ラ')), &tx, &mut session);
         handle_key_input(&mut app, key(KeyCode::Char('ー')), &tx, &mut session);
-        assert_eq!(app.query, "ラー", "戻れば元の入力が残っている");
+        assert_eq!(app.query.text(), "ラー", "戻れば元の入力が残っている");
         assert!(!app.tabs.is_all());
     }
 
@@ -1503,7 +1724,7 @@ mod tests {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = grid_app(4);
-        app.query = "ラーメン".to_string();
+        app.query.set("ラーメン");
         assert!(app.tabs.state().loaded);
 
         handle_key_results(&mut app, key(KeyCode::Char('r')), &tx, &mut session).await;
@@ -1524,7 +1745,7 @@ mod tests {
         let mut app = App::default();
         handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
         assert_eq!(app.mode, Mode::Settings);
-        assert!(app.query.is_empty(), "検索語には入れない");
+        assert!(app.query.text().is_empty(), "検索語には入れない");
 
         let mut app = App {
             mode: Mode::Results,
@@ -1545,7 +1766,7 @@ mod tests {
         for c in "SEKIRO".chars() {
             handle_key(&mut app, key(KeyCode::Char(c)), &tx, &mut session).await;
         }
-        assert_eq!(app.query, "SEKIRO");
+        assert_eq!(app.query.text(), "SEKIRO");
         assert_eq!(app.mode, Mode::Input);
 
         // 結果一覧では文字を打たないので、そのまま設定を開く。
@@ -1567,7 +1788,7 @@ mod tests {
         for code in [KeyCode::Char('a'), KeyCode::Char('u'), KeyCode::Char('w')] {
             handle_key(&mut app, ctrl(code), &tx, &mut session).await;
         }
-        assert!(app.query.is_empty(), "制御文字は検索語に入れない");
+        assert!(app.query.text().is_empty(), "制御文字は検索語に入れない");
         assert_eq!(app.mode, Mode::Input);
     }
 
@@ -1649,7 +1870,7 @@ mod tests {
 
         // 設定画面では文字は検索語にならない。
         handle_key(&mut app, key(KeyCode::Char('x')), &tx, &mut session).await;
-        assert!(app.query.is_empty());
+        assert!(app.query.text().is_empty());
 
         handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
         assert_eq!(app.mode, Mode::Input, "保存せず閉じる");
