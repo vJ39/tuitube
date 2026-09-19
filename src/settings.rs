@@ -96,6 +96,8 @@ pub struct RawWindow {
     pub geometry: Option<String>,
     #[serde(default)]
     pub ontop: bool,
+    #[serde(default)]
+    pub fullscreen: bool,
     pub focus_on: Option<String>,
     pub title: Option<String>,
 }
@@ -632,6 +634,7 @@ fn validate_window(window: RawWindow, notices: &mut Vec<String>) -> WindowOption
         autofit: window.autofit,
         geometry: window.geometry,
         ontop: window.ontop,
+        fullscreen: window.fullscreen,
         focus_on: parse_choice(
             "[window] focus_on",
             window.focus_on.as_deref(),
@@ -818,6 +821,11 @@ pub fn render(settings: &Settings) -> String {
         out.push_str("ontop = true\n");
     } else {
         out.push_str("# ontop = false\n");
+    }
+    if window.fullscreen {
+        out.push_str("fullscreen = true\n");
+    } else {
+        out.push_str("# fullscreen = false\n");
     }
     match window.focus_on {
         Some(focus_on) => out.push_str(&format!("focus_on = \"{}\"\n", focus_on.value())),
@@ -1715,6 +1723,34 @@ mod tests {
     }
 
     #[test]
+    fn the_window_is_not_fullscreen_unless_asked() {
+        assert!(!Settings::default().window.fullscreen);
+        assert!(
+            render(&Settings::default()).contains("# fullscreen = false\n"),
+            "既定は書き出しでもコメントのまま"
+        );
+
+        let text = "[window]\nfullscreen = true\n";
+        assert!(settings_of(text).window.fullscreen);
+        assert_eq!(notices_of(text), Vec::<String>::new());
+    }
+
+    #[test]
+    fn render_writes_the_fullscreen_flag_when_it_is_on() {
+        let settings = Settings {
+            window: WindowOptions {
+                fullscreen: true,
+                ..WindowOptions::default()
+            },
+            ..Settings::default()
+        };
+        let text = render(&settings);
+        assert!(text.contains("fullscreen = true\n"), "{text}");
+        assert!(!text.contains("# fullscreen"), "{text}");
+        assert!(settings_of(&text).window.fullscreen);
+    }
+
+    #[test]
     fn extra_args_that_do_not_look_like_options_are_passed_with_a_notice() {
         let text = "[mpv]\nextra_args = [\"--hwdec=no\", \"foo\"]\n";
         assert_eq!(settings_of(text).extra_args, ["--hwdec=no", "foo"]);
@@ -1738,6 +1774,7 @@ mod tests {
                 autofit: Some("640x360".to_string()),
                 geometry: Some("50%+0+0".to_string()),
                 ontop: true,
+                fullscreen: true,
                 focus_on: Some(FocusOn::Never),
                 title: Some("窓".to_string()),
             },

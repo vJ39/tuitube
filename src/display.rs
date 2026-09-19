@@ -210,6 +210,7 @@ pub struct WindowOptions {
     pub autofit: Option<String>,
     pub geometry: Option<String>,
     pub ontop: bool,
+    pub fullscreen: bool,
     pub focus_on: Option<FocusOn>,
     pub title: Option<String>,
 }
@@ -228,6 +229,9 @@ impl WindowOptions {
         }
         if self.ontop {
             args.push("--ontop".to_string());
+        }
+        if self.fullscreen {
+            args.push("--fullscreen".to_string());
         }
         if let Some(focus_on) = self.focus_on {
             args.push(format!("--focus-on={}", focus_on.value()));
@@ -648,6 +652,7 @@ mod tests {
         assert!(!bare.iter().any(|a| a.starts_with("--autofit")));
         assert!(!bare.iter().any(|a| a.starts_with("--geometry")));
         assert!(!bare.iter().any(|a| a == "--ontop"));
+        assert!(!bare.iter().any(|a| a == "--fullscreen"));
         assert!(!bare.iter().any(|a| a.starts_with("--focus-on")));
 
         let full = WindowOptions {
@@ -655,6 +660,7 @@ mod tests {
             autofit: Some("640x360".to_string()),
             geometry: Some("50%+0+0".to_string()),
             ontop: true,
+            fullscreen: true,
             focus_on: Some(FocusOn::Never),
             title: Some("窓".to_string()),
         }
@@ -663,8 +669,52 @@ mod tests {
         assert!(full.contains(&"--autofit=640x360".to_string()));
         assert!(full.contains(&"--geometry=50%+0+0".to_string()));
         assert!(full.contains(&"--ontop".to_string()));
+        assert!(full.contains(&"--fullscreen".to_string()));
         assert!(full.contains(&"--focus-on=never".to_string()));
         assert!(full.contains(&"--title=窓".to_string()));
+    }
+
+    #[test]
+    fn fullscreen_is_a_bare_flag_and_is_independent_of_ontop() {
+        let only_fullscreen = WindowOptions {
+            fullscreen: true,
+            ..WindowOptions::default()
+        }
+        .args();
+        assert!(only_fullscreen.contains(&"--fullscreen".to_string()));
+        assert!(!only_fullscreen.iter().any(|a| a == "--ontop"));
+        assert!(
+            !only_fullscreen
+                .iter()
+                .any(|a| a.starts_with("--fullscreen=")),
+            "値は付けない: {only_fullscreen:?}"
+        );
+
+        let only_ontop = WindowOptions {
+            ontop: true,
+            ..WindowOptions::default()
+        }
+        .args();
+        assert!(!only_ontop.iter().any(|a| a == "--fullscreen"));
+    }
+
+    #[test]
+    fn switching_to_the_window_does_not_carry_the_fullscreen_setting() {
+        let full = WindowOptions {
+            fullscreen: true,
+            ..WindowOptions::default()
+        };
+        let lines: Vec<String> = switch_commands(
+            DisplayMode::Embedded,
+            DisplayMode::Window,
+            geometry(80, 22),
+            None,
+            &full,
+        )
+        .iter()
+        .map(|c| c.to_line())
+        .collect();
+        assert_eq!(lines, ["{\"command\":[\"set_property\",\"vo\",\"\"]}\n"]);
     }
 
     #[test]
