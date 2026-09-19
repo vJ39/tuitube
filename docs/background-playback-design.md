@@ -60,7 +60,9 @@ pub fn video_target_area(app: &App, screen: Rect) -> Option<Rect> {
 
 `MINI_VIDEO_COLS` / `MINI_VIDEO_ROWS` は固定値(例: 32 / 10)とし、設定項目にはしない。
 
-`main.rs` の `run()` ループは、今 `ui::video_area(app.screen)` を固定で渡している箇所を `ui::video_target_area(app, app.screen)` に差し替える。`None` なら `present_video` を呼ばない(何も描かない)。
+`main.rs` の `run()` ループは、今 `ui::video_area(app.screen)` を固定で渡している箇所を `ui::video_target_area(app, app.screen)` に差し替える。
+
+`present_video` は貼ってあるサムネイルを剥がす `session.owe_clear` の処理も兼ねており、映像が無い間(設定画面など)もこの一手だけがそれを処理できる。そのため `video_target_area` が `None` でも `present_video` の呼び出し自体は毎フレーム続ける。`area` は `video_present_area` ヘルパー(`video_target_area` が `None` のとき `ui::video_area(app.screen)` にフォールバックする)を介して渡す。呼び出しごと省くと、映像が無い状態で `Mode::Settings`/`Mode::Download` を開いたときにサムネイルが剥がれず前面に残る。
 
 `draw_search`(Input/Results/Channel共通の画面)は、`ui::video_target_area(app, frame.area())` が `Some` を返す間(=このモードに来る時点で `Mode::Playing` ではないので、必ずミニの方)、結果一覧の矩形(`search_areas` の3番目)からその幅ぶんを右側に切り取ってから `grid::layout`/`draw_list` へ渡す。`grid::layout` は渡された矩形の幅で列数を決め直すだけなので、ここ以外の変更は要らない(端末リサイズで列数が変わるのと同じ仕組み)。
 

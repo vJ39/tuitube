@@ -122,9 +122,14 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         // マウスの当たり判定は「ユーザーが今見ている画面」で行うので、描いた寸法を控える。
         app.screen = terminal.draw(|frame| ui::draw(frame, &app))?.area;
         app.mark_drawn();
-        if let Some(area) = ui::video_target_area(&app, app.screen) {
-            present_video(&mut session, &app, area, terminal.backend_mut())?;
-        }
+        // 映像が無い間 (設定画面など) の owe_clear は present_video でしか処理できない
+        // ので、映像の置き場所が無くても毎フレーム呼ぶ。
+        present_video(
+            &mut session,
+            &app,
+            video_present_area(&app),
+            terminal.backend_mut(),
+        )?;
         // present_video が先。再生終了で持ち越した a=d が、貼ったばかりの画像を消さない順序。
         present_thumbs(&mut app, cell_size(), terminal.backend_mut())?;
         tokio::select! {
@@ -162,6 +167,13 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let _ = backend.write_all(&out);
     let _ = backend.flush();
     Ok(())
+}
+
+/// present_video に渡す area。映像の置き場所が無くても、貼ってあるサムネイルを
+/// 剥がす owe_clear は present_video でしか処理できないので、対象が無い間も
+/// 意味のある矩形を返し、present_video を毎フレーム呼び続けられるようにする。
+fn video_present_area(app: &App) -> Rect {
+    ui::video_target_area(app, app.screen).unwrap_or_else(|| ui::video_area(app.screen))
 }
 
 /// draw の直後に、保留中の画像削除と最新フレームを実端末へ書く。書き手はここだけ。
@@ -766,6 +778,31 @@ mod tests {
         assert!(out.ends_with(b"\x1b\\"), "APC が最後まで書かれていない");
         // 取り出し済みなので次の周では何も書かない。
         assert!(present(&mut session, &app).is_empty());
+    }
+
+    #[test]
+    fn video_present_area_falls_back_to_the_full_video_area_without_a_target() {
+        // 設定画面(映像が無い)でも present_video を毎フレーム呼び続けられるよう、
+        // 対象が無いときも意味のある矩形を返す (呼ぶかどうかは run 側で判断しない)。
+        let mut app = App {
+            mode: Mode::Settings,
+            ..App::default()
+        };
+        app.screen = Rect::new(0, 0, 80, 24);
+        assert!(app.video.is_none());
+        assert_eq!(video_present_area(&app), ui::video_area(app.screen));
+    }
+
+    #[test]
+    fn video_present_area_matches_the_target_area_while_playing() {
+        let video = sink();
+        let mut app = App {
+            mode: Mode::Playing,
+            video: Some(video),
+            ..App::default()
+        };
+        app.screen = Rect::new(0, 0, 80, 24);
+        assert_eq!(video_present_area(&app), ui::video_area(app.screen));
     }
 
     #[test]
