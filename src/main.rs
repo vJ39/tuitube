@@ -122,14 +122,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         tokio::select! {
             event = rx.recv() => {
                 let Some(event) = event else { break };
-                handle_event(&mut app, event, &tx, &mut session).await;
-                for _ in 0..EVENT_DRAIN_LIMIT {
-                    if app.should_quit {
-                        break;
-                    }
-                    let Ok(event) = rx.try_recv() else { break };
-                    handle_event(&mut app, event, &tx, &mut session).await;
-                }
+                handle_batch(&mut app, event, &mut rx, &tx, &mut session).await;
             }
             _ = ticker.tick() => on_tick(&mut app, &mut session, std::time::Instant::now()).await,
             _ = wait_until(session.resize_at) => {
@@ -285,11 +278,64 @@ async fn handle_key_event<F>(
 {
     let tab = app.tabs.selected();
     handle_key(app, key, tx, session).await;
-    // タブを移ると結果集合ごと入れ替わる。読み込み済みのタブでも
-    // メモリ上の画像は捨ててあるので、キャッシュから読み直す。
-    if app.tabs.selected() != tab {
+    refetch_thumbnails_if_tab_moved(app, tx, session, fetcher, tab);
+}
+
+/// マウスを捌き、タブが移っていたらサムネイルを取り直す。
+async fn handle_mouse_event<F>(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    fetcher: F,
+) where
+    F: Fetcher + Send + Sync + 'static,
+{
+    let tab = app.tabs.selected();
+    handle_mouse(app, mouse, tx, session).await;
+    refetch_thumbnails_if_tab_moved(app, tx, session, fetcher, tab);
+}
+
+/// タブを移ると結果集合ごと入れ替わる。読み込み済みのタブでも
+/// メモリ上の画像は捨ててあるので、キャッシュから読み直す。
+fn refetch_thumbnails_if_tab_moved<F>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    fetcher: F,
+    before: usize,
+) where
+    F: Fetcher + Send + Sync + 'static,
+{
+    if app.tabs.selected() != before {
         actions::start_thumbnails_with(app, tx, session, fetcher);
     }
+}
+
+/// 溜まった分をまとめて捌く。Resize はそこで区切る。
+/// マウスの当たり判定は直前に描いた寸法 (app.screen) で行うので、
+/// 同じ束で続けて捌くと、リサイズ前の寸法でクリックを判定してしまう。
+async fn handle_batch(
+    app: &mut App,
+    first: AppEvent,
+    rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    let mut resized = is_resize(&first);
+    handle_event(app, first, tx, session).await;
+    for _ in 0..EVENT_DRAIN_LIMIT {
+        if app.should_quit || resized {
+            return;
+        }
+        let Ok(event) = rx.try_recv() else { return };
+        resized = is_resize(&event);
+        handle_event(app, event, tx, session).await;
+    }
+}
+
+fn is_resize(event: &AppEvent) -> bool {
+    matches!(event, AppEvent::Resize { .. })
 }
 
 async fn handle_event(
@@ -300,7 +346,7 @@ async fn handle_event(
 ) {
     match event {
         AppEvent::Key(key) => handle_key_event(app, key, tx, session, RealCurl).await,
-        AppEvent::Mouse(mouse) => handle_mouse(app, mouse, session).await,
+        AppEvent::Mouse(mouse) => handle_mouse_event(app, mouse, tx, session, RealCurl).await,
         AppEvent::Resize { width, height } => schedule_resize(session, width, height),
         AppEvent::SearchDone {
             nonce,
@@ -469,6 +515,61 @@ mod tests {
             duration: None,
             uploader: None,
         }
+    }
+
+    fn key(c: char) -> AppEvent {
+        AppEvent::Key(event::KeyEvent::new(
+            event::KeyCode::Char(c),
+            event::KeyModifiers::NONE,
+        ))
+    }
+
+    fn click(column: u16, row: u16) -> AppEvent {
+        AppEvent::Mouse(event::MouseEvent {
+            kind: event::MouseEventKind::Down(event::MouseButton::Left),
+            column,
+            row,
+            modifiers: event::KeyModifiers::NONE,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_batch_takes_the_events_that_are_already_waiting() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::default();
+        let mut session = Session::default();
+        for c in ['b', 'c'] {
+            tx.send(key(c)).expect("送れる");
+        }
+
+        handle_batch(&mut app, key('a'), &mut rx, &tx, &mut session).await;
+
+        assert_eq!(app.query, "abc");
+        assert!(rx.try_recv().is_err(), "溜まっていた分は残さない");
+    }
+
+    #[tokio::test]
+    async fn a_resize_ends_the_batch_before_the_next_click() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::default();
+        let mut session = Session::default();
+        tx.send(click(3, 1)).expect("送れる");
+
+        handle_batch(
+            &mut app,
+            AppEvent::Resize {
+                width: 100,
+                height: 40,
+            },
+            &mut rx,
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert_eq!(session.pending_resize, Some((100, 40)));
+        // 描き直して app.screen を入れ替えてから当たり判定に掛けるので、ここでは捌かない。
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::Mouse(_))));
     }
 
     #[test]
@@ -1120,6 +1221,58 @@ mod tests {
         )
         .await;
 
+        assert!(session.search_task.is_none(), "保持していた結果を出すだけ");
+        let task = session.thumbs_task.take().expect("取り直しが積まれる");
+        task.await.expect("タスクは panic しない");
+        let event = rx.try_recv().expect("ThumbsReady が届く");
+        let AppEvent::ThumbsReady { images, .. } = &event else {
+            panic!("ThumbsReady のはず");
+        };
+        assert_eq!(images.len(), 1);
+        assert!(images[0].1.is_ok(), "キャッシュから読めている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_loaded_tab_refetches_its_thumbnails_from_the_cache() {
+        // マウスで移ったときもキー起因と同じく画像を読み直す。
+        let dir = std::env::temp_dir().join(format!("tuitube-main-click-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("id0.jpg"),
+            include_bytes!("testdata/tiny8x4.jpg").as_slice(),
+        )
+        .expect("書ける");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = thumb_app(0);
+        app.settings.thumbnails.cache_dir = Some(dir.clone());
+
+        app.tabs.next();
+        app.set_results(vec![result("id0")], &Target::Search("音楽".to_string()));
+        app.store_to_tab();
+        app.tabs.prev();
+        app.sync_from_tab();
+        app.thumbs.take_dirty();
+
+        // タブ行 (y=3) の「音楽」の桁を押す。
+        handle_mouse_event(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: 9,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Failed, b""),
+        )
+        .await;
+
+        assert_eq!(app.tabs.selected(), 1);
         assert!(session.search_task.is_none(), "保持していた結果を出すだけ");
         let task = session.thumbs_task.take().expect("取り直しが積まれる");
         task.await.expect("タスクは panic しない");

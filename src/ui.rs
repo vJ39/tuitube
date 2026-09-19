@@ -6,7 +6,7 @@ use crate::grid::{self, LayoutMode};
 use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use crate::video::CellSize;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -237,22 +237,38 @@ fn visible_tabs(
     start..tab_window_end(labels, start, width)
 }
 
-fn tab_spans(
-    labels: &[&str],
-    selected: usize,
-    width: usize,
-    range: std::ops::Range<usize>,
-) -> Vec<Span<'static>> {
+/// タブ行に左から並ぶもの。描画とクリックの当たり判定が同じ並びを通るように、
+/// 幅の食い方はここだけで決める。
+enum TabPiece {
+    /// 窓の外にまだタブがあることを示す印。
+    Marker(&'static str),
+    Gap,
+    Label {
+        index: usize,
+        text: String,
+    },
+}
+
+impl TabPiece {
+    fn text(&self) -> &str {
+        match self {
+            TabPiece::Marker(text) => text,
+            TabPiece::Gap => TAB_GAP,
+            TabPiece::Label { text, .. } => text,
+        }
+    }
+}
+
+fn tab_pieces(labels: &[&str], width: usize, range: std::ops::Range<usize>) -> Vec<TabPiece> {
     if range.is_empty() {
         return Vec::new();
     }
-    let dim = Style::default().fg(Color::DarkGray);
     let mut budget = width;
-    let mut spans = Vec::new();
+    let mut pieces = Vec::new();
     // マーカーだけで行を埋めない。1 桁も残らないなら出さない。
     if range.start > 0 && grid::display_width(TAB_MORE_LEFT) < budget {
         budget -= grid::display_width(TAB_MORE_LEFT);
-        spans.push(Span::styled(TAB_MORE_LEFT, dim));
+        pieces.push(TabPiece::Marker(TAB_MORE_LEFT));
     }
     let tail = range.end < labels.len() && grid::display_width(TAB_MORE_RIGHT) < budget;
     if tail {
@@ -264,24 +280,76 @@ fn tab_spans(
                 break;
             }
             budget -= grid::display_width(TAB_GAP);
-            spans.push(Span::styled(TAB_GAP, dim));
+            pieces.push(TabPiece::Gap);
         }
         // 窓は選択中のタブを必ず残すので、端末より広いラベルが来るのはそれ 1 つのときだけ。
-        let label = grid::truncate(labels[index], budget);
-        budget -= grid::display_width(&label);
-        let style = if index == selected {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        spans.push(Span::styled(label, style));
+        let text = grid::truncate(labels[index], budget);
+        budget -= grid::display_width(&text);
+        pieces.push(TabPiece::Label { index, text });
     }
     if tail {
-        spans.push(Span::styled(TAB_MORE_RIGHT, dim));
+        pieces.push(TabPiece::Marker(TAB_MORE_RIGHT));
     }
-    spans
+    pieces
+}
+
+fn tab_spans(
+    labels: &[&str],
+    selected: usize,
+    width: usize,
+    range: std::ops::Range<usize>,
+) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    tab_pieces(labels, width, range)
+        .into_iter()
+        .map(|piece| match piece {
+            TabPiece::Marker(text) => Span::styled(text, dim),
+            TabPiece::Gap => Span::styled(TAB_GAP, dim),
+            TabPiece::Label { index, text } => {
+                let style = if index == selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                Span::styled(text, style)
+            }
+        })
+        .collect()
+}
+
+/// タブ行の `column` 桁にあるタブ。区切り・マーカー・余白の上では None。
+fn tab_at_column(
+    labels: &[&str],
+    width: usize,
+    range: std::ops::Range<usize>,
+    column: usize,
+) -> Option<usize> {
+    let mut x = 0;
+    for piece in tab_pieces(labels, width, range) {
+        let cells = grid::display_width(piece.text());
+        if let TabPiece::Label { index, .. } = piece
+            && (x..x + cells).contains(&column)
+        {
+            return Some(index);
+        }
+        x += cells;
+    }
+    None
+}
+
+/// 画面のこの位置にあるタブ。タブ行の外や、窓の外へ送ったタブの上では None。
+pub fn tab_at_point(app: &App, column: u16, row: u16) -> Option<usize> {
+    let area = search_areas(app.screen)[1];
+    if !area.contains(Position::new(column, row)) {
+        return None;
+    }
+    let labels = app.tabs.labels();
+    let width = area.width as usize;
+    // 窓は draw_tabs が覚えたものをそのまま使う。見えている行と判定をずらさない。
+    let range = visible_tabs(&labels, app.tabs.selected(), width, app.tabs.window());
+    tab_at_column(&labels, width, range, (column - area.x) as usize)
 }
 
 /// 可視範囲と総数。スクロールしても今どこを見ているか分かるようにする。
@@ -865,6 +933,153 @@ mod tests {
     fn a_single_tab_needs_no_window() {
         assert_eq!(tab_row(&["すべて"], 0, 80), "すべて");
         assert_eq!(tab_row(&[], 0, 80), "");
+    }
+
+    /// 窓を先頭から開いた状態での当たり判定。
+    fn tab_hit(labels: &[&str], selected: usize, width: usize, column: usize) -> Option<usize> {
+        let range = visible_tabs(labels, selected, width, 0);
+        tab_at_column(labels, width, range, column)
+    }
+
+    #[test]
+    fn clicking_a_tab_label_selects_that_tab() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        // 「すべて」は 6 桁、区切りが 3 桁、「音楽」が 4 桁と並ぶ。
+        assert_eq!(tab_hit(&labels, 0, 200, 0), Some(0));
+        assert_eq!(tab_hit(&labels, 0, 200, 5), Some(0));
+        assert_eq!(tab_hit(&labels, 0, 200, 9), Some(1));
+        assert_eq!(tab_hit(&labels, 0, 200, 12), Some(1));
+        assert_eq!(tab_hit(&labels, 0, 200, 16), Some(2));
+    }
+
+    #[test]
+    fn clicking_a_separator_or_the_empty_tail_selects_nothing() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        for column in 6..9 {
+            assert_eq!(tab_hit(&labels, 0, 200, column), None, "{column} は区切り");
+        }
+        let row = tab_row(&labels, 0, 200);
+        let end = grid::display_width(&row);
+        assert_eq!(tab_hit(&labels, 0, 200, end), None, "行の右の余白");
+        assert_eq!(tab_hit(&labels, 0, 200, 199), None);
+    }
+
+    #[test]
+    fn clicking_a_scroll_marker_does_not_select_a_tab() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        let last = labels.len() - 1;
+
+        // 先頭を選んでいるので行末に " >" が出る。
+        let head = tab_row(&labels, 0, 80);
+        assert!(head.ends_with('>'), "{head}");
+        let end = grid::display_width(&head);
+        assert_eq!(tab_hit(&labels, 0, 80, end - 1), None);
+        assert_eq!(tab_hit(&labels, 0, 80, end - 2), None);
+
+        // 末尾を選ぶと窓が送られ、行頭に "< " が出る。
+        let range = visible_tabs(&labels, last, 80, 0);
+        assert!(range.start > 0, "80 桁では左が隠れる");
+        assert_eq!(tab_at_column(&labels, 80, range.clone(), 0), None);
+        assert_eq!(tab_at_column(&labels, 80, range, 1), None);
+    }
+
+    #[test]
+    fn the_hit_test_agrees_with_the_drawn_row() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        let dim = Style::default().fg(Color::DarkGray);
+        for width in [0usize, 1, 3, 5, 20, 40, 80, 120, 200] {
+            for selected in 0..labels.len() {
+                let range = visible_tabs(&labels, selected, width, 0);
+                // 描いた行を左から辿り、各桁がどのタブの上かを並べる。
+                // 区切りとマーカーだけが dim なので、そこでラベルと見分けられる。
+                let mut columns: Vec<Option<usize>> = Vec::new();
+                let mut index = range.start;
+                for span in tab_spans(&labels, selected, width, range.clone()) {
+                    let label = span.style != dim;
+                    let cells = grid::display_width(span.content.as_ref());
+                    columns.extend(std::iter::repeat_n(label.then_some(index), cells));
+                    if label {
+                        index += 1;
+                    }
+                }
+                for column in 0..width + 2 {
+                    assert_eq!(
+                        tab_at_column(&labels, width, range.clone(), column),
+                        columns.get(column).copied().flatten(),
+                        "{width} 桁 / 選択 {selected} / {column} 桁目"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_tab_row_answers_the_hit_test() {
+        let app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        assert_eq!(
+            tab_at_point(&app, 0, 3),
+            Some(0),
+            "タブ行の先頭は「すべて」"
+        );
+        for row in [0u16, 1, 2, 4, 12, 23] {
+            assert_eq!(tab_at_point(&app, 0, row), None, "{row} 行目はタブ行でない");
+        }
+    }
+
+    #[test]
+    fn the_hit_test_follows_the_window_that_was_drawn() {
+        let tabs = Tabs::default();
+        let labels = tabs.labels();
+        let last = labels.len() - 1;
+        let range = visible_tabs(&labels, last, 80, 0);
+        assert!(range.start > 0, "80 桁では左が隠れる");
+
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+        app.tabs.select(last);
+        app.tabs.remember_window(range.start);
+
+        // 窓の外のタブは行に出ていないので、どの桁を押しても選べない。
+        for column in 0..80u16 {
+            let hit = tab_at_point(&app, column, 3);
+            assert!(
+                hit.is_none_or(|index| range.contains(&index)),
+                "{column} 桁目で窓の外の {hit:?} を返した"
+            );
+        }
+        // 行頭は "< " なので、窓の先頭のタブはその次から。
+        assert_eq!(tab_at_point(&app, 2, 3), Some(range.start));
+    }
+
+    #[test]
+    fn a_terminal_too_short_for_the_tab_row_answers_only_where_it_is_drawn() {
+        // 全段が入らない高さでは割り付けが潰れ、タブ行が y=3 に来るとは限らない。
+        // どこへ潰れても、当たり判定は描いた行の中だけで応じる。
+        for height in 0..8u16 {
+            let app = App {
+                screen: Rect::new(0, 0, 80, height),
+                ..App::default()
+            };
+            let row_area = search_areas(app.screen)[1];
+            for row in 0..8u16 {
+                let drawn = row >= row_area.y && row < row_area.bottom();
+                let hit = tab_at_point(&app, 0, row);
+                assert_eq!(
+                    hit.is_some(),
+                    drawn,
+                    "{height} 行 / {row} 行目 (タブ行 {row_area:?}): {hit:?}"
+                );
+            }
+        }
     }
 
     #[test]

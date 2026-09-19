@@ -4,8 +4,8 @@ use crate::actions::{
     CommentScroll, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed, close_settings,
     copy_url_with, cycle_display_mode, move_selection, move_settings_selection, open_settings,
     reload_tab, reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative,
-    send_to_player, start_playback, start_search, stop_playback, switch_tab, toggle_comments,
-    toggle_subtitles,
+    select_tab, send_to_player, start_playback, start_search, stop_playback, switch_tab,
+    toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -181,11 +181,37 @@ async fn handle_key_playing_with<C: Clipboard>(
     }
 }
 
-/// 再生中のマウス。再生中以外は受け取るだけで捨てる。
-pub async fn handle_mouse(app: &mut App, mouse: MouseEvent, session: &mut Session) {
-    if app.mode != Mode::Playing {
+/// マウス。再生中はシーク、検索画面はタブのクリックだけを見る。
+pub async fn handle_mouse(
+    app: &mut App,
+    mouse: MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    match app.mode {
+        Mode::Playing => handle_mouse_playing(app, mouse, session).await,
+        Mode::Input | Mode::Results => handle_mouse_tabs(app, mouse, tx, session),
+        Mode::Settings => {}
+    }
+}
+
+/// タブ行のクリック。押し込みだけを見るので、ドラッグや離した位置では動かない。
+fn handle_mouse_tabs(
+    app: &mut App,
+    mouse: MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
     }
+    let Some(index) = ui::tab_at_point(app, mouse.column, mouse.row) else {
+        return;
+    };
+    select_tab(app, tx, session, index);
+}
+
+async fn handle_mouse_playing(app: &mut App, mouse: MouseEvent, session: &mut Session) {
     let Some(input) = mouse_input(mouse.kind) else {
         return;
     };
@@ -868,13 +894,14 @@ mod tests {
 
     #[tokio::test]
     async fn mouse_release_on_the_bar_records_an_optimistic_seek() {
+        let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = playing_app();
 
         let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
-        handle_mouse(&mut app, down, &mut session).await;
+        handle_mouse(&mut app, down, &tx, &mut session).await;
         let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 21);
-        handle_mouse(&mut app, up, &mut session).await;
+        handle_mouse(&mut app, up, &tx, &mut session).await;
 
         assert_eq!(app.playback.time_pos, Some(130.0));
         assert!(app.playback.pending_seek.is_some());
@@ -885,38 +912,142 @@ mod tests {
 
     #[tokio::test]
     async fn a_release_from_another_button_does_not_end_the_drag() {
+        let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = playing_app();
 
         let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
-        handle_mouse(&mut app, down, &mut session).await;
+        handle_mouse(&mut app, down, &tx, &mut session).await;
         // ドラッグ中の右クリックでシークが飛ばない。左ドラッグはそのまま続く。
         let other = mouse(MouseEventKind::Up(MouseButton::Right), 40, 21);
-        handle_mouse(&mut app, other, &mut session).await;
+        handle_mouse(&mut app, other, &tx, &mut session).await;
         assert_eq!(app.playback.time_pos, Some(0.0));
         assert_eq!(app.seek_bar.drag, Some(0));
 
         let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 21);
-        handle_mouse(&mut app, up, &mut session).await;
+        handle_mouse(&mut app, up, &tx, &mut session).await;
         assert_eq!(app.playback.time_pos, Some(130.0));
         assert_eq!(app.seek_bar.drag, None);
     }
 
     #[tokio::test]
-    async fn mouse_is_ignored_outside_playing_mode() {
+    async fn outside_playing_mode_the_mouse_only_picks_tabs() {
+        let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
             mode: Mode::Results,
             ..playing_app()
         };
 
+        // シークバーの行を押しても再生位置は動かない。
         let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
-        handle_mouse(&mut app, down, &mut session).await;
+        handle_mouse(&mut app, down, &tx, &mut session).await;
         let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 21);
-        handle_mouse(&mut app, up, &mut session).await;
+        handle_mouse(&mut app, up, &tx, &mut session).await;
 
         assert_eq!(app.seek_bar, SeekBarState::default());
         assert_eq!(app.playback.time_pos, Some(0.0));
+        assert_eq!(app.tabs.selected(), 0);
+
+        // タブ行のクリックだけが通る。
+        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 1);
+        take_search(&mut session);
+        assert_eq!(app.seek_bar, SeekBarState::default());
+    }
+
+    /// タブ行 (80x24 の端末では y=3) の押し込み。
+    fn tab_click(column: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, 3)
+    }
+
+    #[tokio::test]
+    async fn clicking_a_tab_selects_it_in_the_input_mode() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App {
+            screen: Rect::new(0, 0, 80, 24),
+            ..App::default()
+        };
+
+        // 「すべて」が 0-5 桁、区切りを挟んで「音楽」が 9-12 桁。
+        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 1);
+        assert!(take_search(&mut session), "未読のタブは検索する");
+        assert_eq!(app.mode, Mode::Input, "モードは変えない");
+
+        handle_mouse(&mut app, tab_click(0), &tx, &mut session).await;
+        assert!(app.tabs.is_all());
+        take_search(&mut session);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_tab_selects_it_in_the_results_mode() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+
+        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 1);
+        assert!(take_search(&mut session), "未読のタブは検索する");
+
+        // 戻れば保持していた結果をそのまま出す。
+        handle_mouse(&mut app, tab_click(0), &tx, &mut session).await;
+        assert!(app.tabs.is_all());
+        assert!(!take_search(&mut session));
+        assert_eq!(app.results.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_separator_or_outside_the_tab_row_changes_nothing() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+
+        // 区切りの上、入力ボックス、結果、行の右の余白。
+        let spots = [
+            tab_click(7),
+            mouse(MouseEventKind::Down(MouseButton::Left), 9, 1),
+            mouse(MouseEventKind::Down(MouseButton::Left), 9, 10),
+            tab_click(79),
+        ];
+        for spot in spots {
+            handle_mouse(&mut app, spot, &tx, &mut session).await;
+            assert_eq!(app.tabs.selected(), 0, "{spot:?}");
+            assert!(!take_search(&mut session), "{spot:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_left_press_on_the_tab_row_changes_the_tab() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+
+        let kinds = [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollDown,
+        ];
+        for kind in kinds {
+            handle_mouse(&mut app, mouse(kind, 9, 3), &tx, &mut session).await;
+            assert_eq!(app.tabs.selected(), 0, "{kind:?}");
+            assert!(!take_search(&mut session), "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clicking_the_tab_row_while_playing_does_not_switch_tabs() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playing_app();
+
+        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
+        assert_eq!(app.tabs.selected(), 0, "再生中はシークだけ");
+        assert!(!take_search(&mut session));
+        assert_eq!(app.seek_bar, SeekBarState::default());
     }
 
     #[tokio::test]
@@ -1249,16 +1380,21 @@ mod tests {
 
     #[tokio::test]
     async fn the_mouse_is_ignored_on_the_settings_screen() {
+        let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = App {
             mode: Mode::Settings,
             ..playing_app()
         };
         let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
-        handle_mouse(&mut app, down, &mut session).await;
+        handle_mouse(&mut app, down, &tx, &mut session).await;
+        // 設定画面ではタブ行の桁も設定一覧の一部なので、クリックでタブを移さない。
+        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
 
         assert_eq!(app.seek_bar, SeekBarState::default());
         assert_eq!(app.settings, crate::settings::Settings::default());
+        assert_eq!(app.tabs.selected(), 0);
+        assert!(!take_search(&mut session));
     }
 
     #[tokio::test]

@@ -286,6 +286,49 @@ pub fn switch_tab_with<R>(
     start_tab_search_with(app, tx, session, runner);
 }
 
+pub fn select_tab(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    index: usize,
+) {
+    select_tab_with(app, tx, session, index, RealYtDlp);
+}
+
+/// 位置を指してタブへ移る。中身は switch_tab_with と同じで、選び方だけが違う。
+pub fn select_tab_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    index: usize,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    // 押し直し。cookie 無しで断られた等、まだ読めていないタブだけ取り直す。
+    // Input モードでは r が検索語になるので、ここがクリックからの唯一の取り直し口になる。
+    if index == app.tabs.selected() {
+        if !app.tabs.state().loaded && !app.searching {
+            app.set_error(None);
+            start_tab_search_with(app, tx, session, runner);
+        }
+        return;
+    }
+    app.store_to_tab();
+    // 範囲外は Tabs::select が弾く。走っている検索を巻き込まないよう、移れてから打ち切る。
+    if !app.tabs.select(index) {
+        return;
+    }
+    // 走らせたままにすると、その結果が移った先のタブへ書き込まれる。
+    cancel_search(app, session);
+    app.sync_from_tab();
+    app.set_error(None);
+    if app.tabs.state().loaded {
+        return;
+    }
+    start_tab_search_with(app, tx, session, runner);
+}
+
 pub fn reload_tab(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
     reload_tab_with(app, tx, session, RealYtDlp);
 }
@@ -1600,6 +1643,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn select_tab_jumps_to_the_given_tab_and_searches_it_once() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        select_tab_with(&mut app, &tx, &mut session, 3, StubYtDlp);
+        assert_eq!(app.tabs.selected(), 3, "隣ではなく押されたタブへ移る");
+        assert!(session.search_task.is_some(), "未読のタブは検索する");
+        assert!(app.searching);
+
+        // 読み込み済みにして別のタブへ行き、戻ってきても検索し直さない。
+        app.set_results(vec![result("a")], &Target::Search("ニュース".to_string()));
+        session.search_task = None;
+        app.searching = false;
+        select_tab_with(&mut app, &tx, &mut session, 1, StubYtDlp);
+        session.search_task = None;
+        select_tab_with(&mut app, &tx, &mut session, 3, StubYtDlp);
+        assert!(
+            session.search_task.is_none(),
+            "保持していた結果をそのまま出す"
+        );
+        assert_eq!(app.result_ids(), ["a"]);
+    }
+
+    #[tokio::test]
+    async fn select_tab_drops_the_running_search_of_the_tab_it_leaves() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(1);
+        select_tab_with(&mut app, &tx, &mut session, 2, StubYtDlp);
+        let running = session.search_nonce;
+        assert!(session.search_task.is_some());
+
+        select_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+        assert!(app.tabs.is_all());
+        assert!(session.search_task.is_none(), "走らせたままにしない");
+        assert!(!app.searching);
+        assert_ne!(
+            session.search_nonce, running,
+            "先に走っていた検索の結果を移った先のタブへ書き込ませない"
+        );
+        assert_eq!(app.result_ids(), ["id0"], "保持していた結果のまま");
+    }
+
+    #[tokio::test]
+    async fn select_tab_leaves_the_current_tab_and_its_search_alone() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        select_tab_with(&mut app, &tx, &mut session, 2, StubYtDlp);
+        let running = session.search_nonce;
+        assert!(session.search_task.is_some());
+
+        // 押し直しでは走っている検索を止めない。取り直すのは止まっているときだけ。
+        select_tab_with(&mut app, &tx, &mut session, 2, StubYtDlp);
+        assert_eq!(app.tabs.selected(), 2);
+        assert!(session.search_task.is_some());
+        assert_eq!(session.search_nonce, running);
+        assert!(app.searching);
+    }
+
+    #[tokio::test]
+    async fn select_tab_retries_a_refused_tab_when_it_is_clicked_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        let index = app
+            .tabs
+            .labels()
+            .iter()
+            .position(|it| *it == "おすすめ")
+            .expect("おすすめ");
+
+        // cookie が無いので断られる。読み込み済みにはならない。
+        select_tab_with(&mut app, &tx, &mut session, index, StubYtDlp);
+        assert!(session.search_task.is_none());
+        assert!(app.error.is_some());
+        assert!(!app.tabs.state().loaded);
+
+        // cookie を入れて同じタブを押し直す。Input モードでは r が打てないので、
+        // クリックで取り直せないと手が無くなる。
+        app.cookies = CookieState::Armed(CookieSource::from_spec(Some("chrome")).expect("spec"));
+        select_tab_with(&mut app, &tx, &mut session, index, StubYtDlp);
+        assert!(session.search_task.is_some(), "断られたタブを取り直す");
+        assert!(app.searching);
+        assert!(app.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn select_tab_does_not_search_a_loaded_tab_that_is_clicked_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(2);
+        assert!(app.tabs.state().loaded);
+        let current = app.tabs.selected();
+
+        select_tab_with(&mut app, &tx, &mut session, current, StubYtDlp);
+        assert!(
+            session.search_task.is_none(),
+            "読み込み済みなら投げ直さない"
+        );
+        assert!(!app.searching);
+        assert_eq!(app.result_ids(), ["id0", "id1"]);
+    }
+
+    #[tokio::test]
+    async fn select_tab_ignores_an_index_that_does_not_exist() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+        select_tab_with(&mut app, &tx, &mut session, 1, StubYtDlp);
+        let running = session.search_nonce;
+
+        let outside = app.tabs.labels().len();
+        select_tab_with(&mut app, &tx, &mut session, outside, StubYtDlp);
+        assert_eq!(app.tabs.selected(), 1, "選択は動かさない");
+        assert!(session.search_task.is_some(), "走っている検索も止めない");
+        assert_eq!(session.search_nonce, running);
+    }
+
+    #[tokio::test]
     async fn switching_to_a_loaded_tab_drops_the_running_search() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
@@ -2011,7 +2175,7 @@ mod tests {
     }
 
     /// 既定のタブ列で `label` のタブへ送る。
-    fn select_tab(
+    fn select_tab_by_label(
         app: &mut App,
         tx: &UnboundedSender<AppEvent>,
         session: &mut Session,
@@ -2038,7 +2202,7 @@ mod tests {
             ..App::default()
         };
 
-        select_tab(&mut app, &tx, &mut session, "おすすめ");
+        select_tab_by_label(&mut app, &tx, &mut session, "おすすめ");
 
         assert!(session.search_task.is_none(), "yt-dlp を起動しない");
         assert!(!app.searching);
@@ -2065,7 +2229,7 @@ mod tests {
             ..App::default()
         };
 
-        select_tab(&mut app, &tx, &mut session, "後で見る");
+        select_tab_by_label(&mut app, &tx, &mut session, "後で見る");
 
         assert!(session.search_task.is_none(), "yt-dlp を起動しない");
         let error = app.error.expect("理由を出す");
@@ -2083,7 +2247,7 @@ mod tests {
             ..App::default()
         };
 
-        select_tab(&mut app, &tx, &mut session, "履歴");
+        select_tab_by_label(&mut app, &tx, &mut session, "履歴");
 
         assert!(session.search_task.is_some(), "フィードを取りに行く");
         assert!(app.searching);

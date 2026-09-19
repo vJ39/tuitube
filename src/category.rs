@@ -92,6 +92,16 @@ impl Tabs {
         self.selected = (self.selected + self.categories.len() - 1) % self.categories.len();
     }
 
+    /// 位置を指して移る。クリックの当たり判定から来る index は窓の外を指しうるので、
+    /// 範囲外は黙って無視し、選べたかどうかを返す。範囲の判定はここだけに置く。
+    pub fn select(&mut self, index: usize) -> bool {
+        if index >= self.categories.len() {
+            return false;
+        }
+        self.selected = index;
+        true
+    }
+
     pub fn labels(&self) -> Vec<&str> {
         self.categories
             .iter()
@@ -274,6 +284,27 @@ mod tests {
         tabs.prev();
         tabs.next();
         assert!(tabs.state().loaded, "戻ったタブでは再検索しない");
+    }
+
+    #[test]
+    fn select_jumps_straight_to_a_tab() {
+        let mut tabs = Tabs::default();
+        assert!(tabs.select(3));
+        assert_eq!(tabs.selected(), 3);
+        assert!(tabs.select(0));
+        assert!(tabs.is_all());
+        // 押し直しも選べたものとして扱う。取り直すかどうかは呼ぶ側が決める。
+        assert!(tabs.select(0));
+    }
+
+    #[test]
+    fn select_ignores_an_index_that_does_not_exist() {
+        let mut tabs = Tabs::default();
+        let last = tabs.labels().len() - 1;
+        assert!(tabs.select(last));
+        assert!(!tabs.select(last + 1));
+        assert!(!tabs.select(usize::MAX));
+        assert_eq!(tabs.selected(), last, "範囲外では選択を動かさない");
     }
 
     #[test]
