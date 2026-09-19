@@ -12,6 +12,7 @@ mod input;
 mod jpeg;
 mod kitty;
 mod mpv;
+mod oauth;
 mod query;
 mod rgb;
 mod search;
@@ -142,6 +143,7 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         session.thumbs_task.take(),
         session.comments_task.take(),
         session.channel_lookup_task.take(),
+        session.oauth_task.take(),
     ]
     .into_iter()
     .flatten()
@@ -426,6 +428,32 @@ async fn handle_event(
             video_id,
             result,
         } => apply_channel_lookup_with(app, tx, session, nonce, video_id, result, RealYtDlp),
+        AppEvent::OauthDone { nonce, result } => apply_oauth_done(app, session, nonce, result),
+    }
+}
+
+/// チャンネル登録・いいねの結果を画面へ渡す。
+fn apply_oauth_done(
+    app: &mut App,
+    session: &mut Session,
+    nonce: u64,
+    result: Result<String, String>,
+) {
+    if nonce != session.oauth_nonce {
+        return;
+    }
+    session.oauth_task = None;
+    // 失敗のときはエラーを出すだけでは「…中」が残るので、ここで畳む。
+    if app
+        .notice
+        .as_deref()
+        .is_some_and(|n| n == oauth::SUBSCRIBE_NOTICE || n == oauth::LIKE_NOTICE)
+    {
+        app.set_notice(None);
+    }
+    match result {
+        Ok(notice) => app.set_temporary_notice(notice, std::time::Instant::now()),
+        Err(e) => app.set_error(Some(e)),
     }
 }
 
@@ -936,7 +964,9 @@ mod tests {
     #[test]
     fn saving_from_the_settings_screen_does_not_bake_in_the_environment() {
         // 起動 (設定の読み込み) から保存までの通し。利用者が書いた行を s で消さない。
-        let dir = std::env::temp_dir().join(format!("tuitube-main-{}", std::process::id()));
+        // 置き場はテストごとに分ける。同じ名前だと並列実行で互いのファイルを消し合う。
+        let dir =
+            std::env::temp_dir().join(format!("tuitube-main-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("config.toml");
@@ -1462,7 +1492,7 @@ mod tests {
     #[tokio::test]
     async fn switching_to_a_loaded_tab_refetches_its_thumbnails_from_the_cache() {
         // タブを戻したときメモリ上の画像は捨ててあるので、キャッシュから読み直す。
-        let dir = std::env::temp_dir().join(format!("tuitube-main-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tuitube-main-switch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         std::fs::write(
@@ -1698,6 +1728,81 @@ mod tests {
             channel_lookup_nonce: 1,
             ..Session::default()
         }
+    }
+
+    #[test]
+    fn an_oauth_result_replaces_the_waiting_notice() {
+        let mut app = App {
+            notice: Some(oauth::SUBSCRIBE_NOTICE.to_string()),
+            ..App::default()
+        };
+        let mut session = Session {
+            oauth_nonce: 3,
+            ..Session::default()
+        };
+
+        apply_oauth_done(
+            &mut app,
+            &mut session,
+            3,
+            Ok(oauth::SUBSCRIBED_NOTICE.to_string()),
+        );
+
+        assert_eq!(app.notice.as_deref(), Some(oauth::SUBSCRIBED_NOTICE));
+        assert!(app.notice_until.is_some(), "返事なので期限で消える");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn a_failed_oauth_clears_the_waiting_notice_and_shows_the_reason() {
+        let mut app = App {
+            notice: Some(oauth::LIKE_NOTICE.to_string()),
+            ..App::default()
+        };
+        let mut session = Session {
+            oauth_nonce: 1,
+            ..Session::default()
+        };
+
+        apply_oauth_done(&mut app, &mut session, 1, Err("拒否されました".to_string()));
+
+        assert!(app.notice.is_none(), "「…中」を残さない");
+        assert_eq!(app.error.as_deref(), Some("拒否されました"));
+    }
+
+    #[test]
+    fn an_oauth_result_keeps_an_unrelated_notice() {
+        let mut app = App {
+            notice: Some("別の知らせ".to_string()),
+            ..App::default()
+        };
+        let mut session = Session::default();
+
+        apply_oauth_done(&mut app, &mut session, 0, Err("拒否されました".to_string()));
+
+        assert_eq!(app.notice.as_deref(), Some("別の知らせ"));
+        assert_eq!(app.error.as_deref(), Some("拒否されました"));
+    }
+
+    #[test]
+    fn a_superseded_oauth_result_is_discarded() {
+        let mut app = App {
+            notice: Some(oauth::SUBSCRIBE_NOTICE.to_string()),
+            ..App::default()
+        };
+        let mut session = Session {
+            oauth_nonce: 5,
+            ..Session::default()
+        };
+
+        apply_oauth_done(&mut app, &mut session, 4, Ok("古い返事".to_string()));
+
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(oauth::SUBSCRIBE_NOTICE),
+            "走っている方の知らせを畳まない"
+        );
+        assert!(app.error.is_none());
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use crate::fetch::{Fetcher, RealCurl};
 use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::grid::{self, Dir};
 use crate::mpv::{self, MpvCommand, MpvController};
+use crate::oauth;
 use crate::search::{self, RealYtDlp, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::settings;
@@ -83,6 +84,10 @@ pub struct Session {
     pub channel_lookup_task: Option<JoinHandle<()>>,
     /// 打ち切りごとに進む世代。前の行ぶんが遅れて届いても混ざらない。
     pub channel_lookup_nonce: u64,
+    /// チャンネル登録・いいねの認証と送信。
+    pub oauth_task: Option<JoinHandle<()>>,
+    /// 打ち切りごとに進む世代。前の操作ぶんが遅れて届いても混ざらない。
+    pub oauth_nonce: u64,
     /// 直近の端末サイズと、それを映像へ反映する時刻。
     pub pending_resize: Option<(u16, u16)>,
     pub resize_at: Option<Instant>,
@@ -383,6 +388,86 @@ fn cancel_channel_lookup(session: &mut Session) {
         task.abort();
     }
     session.channel_lookup_nonce += 1;
+}
+
+/// 認証が要る操作の呼び先。テストは偽の Backend と一時ディレクトリを渡す。
+pub struct Oauth<B> {
+    pub backend: B,
+    pub paths: Option<oauth::Paths>,
+}
+
+impl Oauth<oauth::RealBackend> {
+    pub fn real() -> Self {
+        Self {
+            backend: oauth::RealBackend::default(),
+            paths: oauth::Paths::from_env(),
+        }
+    }
+}
+
+/// 表示中のチャンネルを登録する。チャンネルを見ていなければ何もしない。
+pub fn subscribe_channel<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    let Some(channel) = app.channel.as_ref() else {
+        return;
+    };
+    let action = oauth::Action::Subscribe(channel.channel_id.clone());
+    start_oauth(app, tx, session, action, deps);
+}
+
+/// 再生中の動画にいいねする。動画 ID を取れなければ何もしない。
+pub fn like_video<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    let Some(video_id) = oauth::video_id_from_url(&app.playback.url) else {
+        return;
+    };
+    start_oauth(app, tx, session, oauth::Action::Like(video_id), deps);
+}
+
+/// 認証から送信までを 1 タスクで進める。ブラウザでの認可を挟むので待ち時間は読めない。
+/// 知らせは期限では消さず、結果が届いた時点で畳む。
+pub fn start_oauth<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    action: oauth::Action,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    let Some(paths) = deps.paths else {
+        app.set_error(Some(oauth::NO_CONFIG_PATH.to_string()));
+        return;
+    };
+    cancel_oauth(session);
+    let nonce = session.oauth_nonce;
+    app.set_notice(Some(action.notice().to_string()));
+    let backend = deps.backend;
+    let tx = tx.clone();
+    session.oauth_task = Some(tokio::spawn(async move {
+        let result = oauth::run(&backend, &paths, &action).await;
+        let _ = tx.send(AppEvent::OauthDone { nonce, result });
+    }));
+}
+
+/// 先行の認証・送信を打ち切る。nonce を進めるので、送信済みの結果は捨てられる。
+fn cancel_oauth(session: &mut Session) {
+    if let Some(task) = session.oauth_task.take() {
+        task.abort();
+    }
+    session.oauth_nonce += 1;
 }
 
 /// チャンネル一覧を抜けて検索結果へ戻る。
@@ -740,6 +825,9 @@ fn cancel_search(app: &mut App, session: &mut Session) {
     app.set_notice(None);
     // 一覧が入れ替わる操作では、引いている最中のチャンネルも用済み。
     cancel_channel_lookup(session);
+    // 知らせを畳む以上、認証待ちも残さない。残すと待っていることが見えないまま
+    // ブラウザの認可だけ生き、127.0.0.1 のポートも掴んだままになる。
+    cancel_oauth(session);
 }
 
 /// 再生開始時の映像スロットと起動計画。mpv を起動せずに検証できるよう切り出してある。
@@ -1067,6 +1155,7 @@ mod tests {
     use crate::cookies::{ChannelTab, CookieSource, CookieState};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
+    use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
     use crate::rgb::RgbImage;
     use crate::search::fixtures::{FakeYtDlp, Step, done};
@@ -1933,6 +2022,252 @@ mod tests {
         let args = runner.calls();
         assert_eq!(args[0][0], "https://www.youtube.com/channel/UCtwo/videos");
         assert!(args[0].iter().any(|a| a == "--playlist-end"), "{args:?}");
+    }
+
+    // ---- チャンネル登録・いいね ----
+
+    const OAUTH_CLIENT_TOML: &str =
+        "client_id = \"dummy-id.apps.googleusercontent.com\"\nclient_secret = \"dummy-secret\"\n";
+    const OAUTH_ACCESS_JSON: &str = r#"{"access_token":"at-1","expires_in":3599}"#;
+
+    /// 資格情報と保存済みトークンを置いた一時ディレクトリ。ブラウザは開かない経路になる。
+    fn oauth_paths(name: &str) -> crate::oauth::Paths {
+        let dir = std::env::temp_dir().join(format!(
+            "tuitube-actions-oauth-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let client = dir.join("oauth_client.toml");
+        std::fs::write(&client, OAUTH_CLIENT_TOML).expect("書ける");
+        let token = dir.join("oauth_token.toml");
+        crate::oauth::save_refresh_token(&token, "rt-1").expect("書ける");
+        crate::oauth::Paths { client, token }
+    }
+
+    fn oauth_deps(
+        name: &str,
+        responses: Vec<Result<crate::oauth::Response, String>>,
+    ) -> Oauth<FakeBackend> {
+        Oauth {
+            backend: FakeBackend::new().with_responses(responses),
+            paths: Some(oauth_paths(name)),
+        }
+    }
+
+    /// 返らない送信を積む依頼先。打ち切りの検証に使う。
+    fn hanging_oauth(name: &str) -> Oauth<FakeBackend> {
+        Oauth {
+            backend: FakeBackend::new(),
+            paths: Some(oauth_paths(name)),
+        }
+    }
+
+    fn channel_view_app() -> App {
+        App {
+            mode: Mode::Channel,
+            channel: Some(ChannelView::new("UC1".to_string(), "One".to_string())),
+            ..App::default()
+        }
+    }
+
+    /// OauthDone を 1 件受け取る。
+    async fn next_oauth(
+        rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        session: &mut Session,
+    ) -> Option<AppEvent> {
+        let task = session.oauth_task.take()?;
+        task.await.expect("タスクは panic しない");
+        rx.try_recv().ok()
+    }
+
+    #[tokio::test]
+    async fn subscribing_announces_the_wait_and_reports_the_result() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+        let deps = oauth_deps(
+            "subscribe",
+            vec![
+                Ok(crate::oauth::Response {
+                    status: 200,
+                    body: OAUTH_ACCESS_JSON.to_string(),
+                }),
+                Ok(crate::oauth::Response {
+                    status: 204,
+                    body: String::new(),
+                }),
+            ],
+        );
+        let backend = deps.backend.clone();
+
+        subscribe_channel(&mut app, &tx, &mut session, deps);
+        assert_eq!(app.notice.as_deref(), Some(crate::oauth::SUBSCRIBE_NOTICE));
+        let nonce = session.oauth_nonce;
+
+        let event = next_oauth(&mut rx, &mut session).await.expect("結果が届く");
+        let AppEvent::OauthDone { nonce: got, result } = event else {
+            panic!("OauthDone でない");
+        };
+        assert_eq!(got, nonce);
+        assert_eq!(result.expect("通る"), crate::oauth::SUBSCRIBED_NOTICE);
+        assert!(
+            backend.opened().is_empty(),
+            "保存済みトークンではブラウザを開かない"
+        );
+        let calls = backend.calls();
+        assert_eq!(
+            calls[1].url(),
+            format!("{}?part=snippet", crate::oauth::SUBSCRIPTIONS_ENDPOINT)
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_without_a_channel_does_nothing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        subscribe_channel(&mut app, &tx, &mut session, hanging_oauth("no-channel"));
+
+        assert!(session.oauth_task.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn liking_sends_the_playing_video_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Playing,
+            playback: Playback {
+                url: "https://www.youtube.com/watch?v=vid1".to_string(),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        let deps = oauth_deps(
+            "like",
+            vec![
+                Ok(crate::oauth::Response {
+                    status: 200,
+                    body: OAUTH_ACCESS_JSON.to_string(),
+                }),
+                Ok(crate::oauth::Response {
+                    status: 204,
+                    body: String::new(),
+                }),
+            ],
+        );
+        let backend = deps.backend.clone();
+
+        like_video(&mut app, &tx, &mut session, deps);
+        assert_eq!(app.notice.as_deref(), Some(crate::oauth::LIKE_NOTICE));
+
+        let event = next_oauth(&mut rx, &mut session).await.expect("結果が届く");
+        let AppEvent::OauthDone { result, .. } = event else {
+            panic!("OauthDone でない");
+        };
+        assert_eq!(result.expect("通る"), crate::oauth::LIKED_NOTICE);
+        assert_eq!(
+            backend.calls()[1].url(),
+            format!("{}?id=vid1&rating=like", crate::oauth::RATE_ENDPOINT)
+        );
+    }
+
+    #[tokio::test]
+    async fn liking_without_a_playing_url_does_nothing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing_app();
+
+        like_video(&mut app, &tx, &mut session, hanging_oauth("no-url"));
+
+        assert!(session.oauth_task.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failure_comes_back_as_an_error_result() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+        let deps = oauth_deps(
+            "failure",
+            vec![
+                Ok(crate::oauth::Response {
+                    status: 200,
+                    body: OAUTH_ACCESS_JSON.to_string(),
+                }),
+                Ok(crate::oauth::Response {
+                    status: 403,
+                    body: r#"{"error":{"message":"quota","errors":[{"reason":"quotaExceeded"}]}}"#
+                        .to_string(),
+                }),
+            ],
+        );
+
+        subscribe_channel(&mut app, &tx, &mut session, deps);
+        let event = next_oauth(&mut rx, &mut session).await.expect("結果が届く");
+        let AppEvent::OauthDone { result, .. } = event else {
+            panic!("OauthDone でない");
+        };
+        assert!(result.expect_err("失敗").contains("403"));
+    }
+
+    #[tokio::test]
+    async fn starting_another_one_drops_the_running_send() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+
+        subscribe_channel(&mut app, &tx, &mut session, hanging_oauth("first"));
+        let first = session.oauth_nonce;
+        assert!(session.oauth_task.is_some());
+
+        subscribe_channel(&mut app, &tx, &mut session, hanging_oauth("second"));
+
+        assert_ne!(session.oauth_nonce, first, "世代が進む");
+        assert!(session.oauth_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn leaving_the_channel_drops_the_waiting_authorization() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+
+        subscribe_channel(&mut app, &tx, &mut session, hanging_oauth("leave"));
+        let nonce = session.oauth_nonce;
+        assert!(session.oauth_task.is_some());
+
+        leave_channel(&mut app, &mut session);
+
+        // 「…中」だけ消えて待ち続ける状態を残さない。
+        assert!(session.oauth_task.is_none(), "認証待ちも畳む");
+        assert_ne!(session.oauth_nonce, nonce, "世代が進む");
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_location_is_reported_without_starting_anything() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+
+        subscribe_channel(
+            &mut app,
+            &tx,
+            &mut session,
+            Oauth {
+                backend: FakeBackend::new(),
+                paths: None,
+            },
+        );
+
+        assert_eq!(app.error.as_deref(), Some(crate::oauth::NO_CONFIG_PATH));
+        assert!(session.oauth_task.is_none());
+        assert!(app.notice.is_none());
     }
 
     /// フィード系の 1 本ぶんの非 flat 出力。

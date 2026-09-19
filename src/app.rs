@@ -86,6 +86,11 @@ pub enum AppEvent {
         video_id: String,
         result: Result<Option<ChannelRef>, String>,
     },
+    /// チャンネル登録・いいねが終わった。Ok は画面に出す文言。
+    OauthDone {
+        nonce: u64,
+        result: Result<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
