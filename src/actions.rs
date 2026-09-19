@@ -1417,11 +1417,17 @@ pub fn save_settings_to(app: &mut App, path: Option<&Path>, now: std::time::Inst
     };
     // 環境変数が効いている項目はファイル側の値のまま書く。一時的な指定を焼き付けない。
     let to_write = app.env_overridden.restore(&app.settings);
+    // display.mode は app.display (今の実行中の値) と別物で、次回起動でしか動かない。
+    // 設定画面での編集だけでは今の画面に何も起きないので、保存の知らせに添えて伝える。
+    let display_mode_deferred = app.settings.display.mode != app.display;
     match settings::save_to(path, &to_write) {
         Ok(()) => {
             // 保存した内容が Esc の戻り先になる。
             app.settings_backup = app.settings.clone();
-            app.set_temporary_notice(saved_notice(path, &app.env_overridden), now);
+            app.set_temporary_notice(
+                saved_notice(path, &app.env_overridden, display_mode_deferred),
+                now,
+            );
         }
         Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
     }
@@ -1451,15 +1457,27 @@ fn save_display_mode(
 }
 
 /// 保存できた旨。書き換えなかった項目があれば、その名前も出す。
-fn saved_notice(path: &Path, overridden: &settings::EnvOverridden) -> String {
+fn saved_notice(
+    path: &Path,
+    overridden: &settings::EnvOverridden,
+    display_mode_deferred: bool,
+) -> String {
     let saved = format!("{} に保存しました", path.display());
-    if overridden.is_empty() {
-        return saved;
+    let mut notes = Vec::new();
+    if !overridden.is_empty() {
+        notes.push(format!(
+            "{} は環境変数の指定中で書き換えません",
+            overridden.keys().join("、")
+        ));
     }
-    format!(
-        "{saved} ({} は環境変数の指定中で書き換えません)",
-        overridden.keys().join("、")
-    )
+    if display_mode_deferred {
+        notes.push("display.mode は次回起動から反映されます".to_string());
+    }
+    if notes.is_empty() {
+        saved
+    } else {
+        format!("{saved} ({})", notes.join("。"))
+    }
 }
 
 /// quit を送って手放す。届かなくても終了待ちタスクが猶予後に kill するので取り残さない。
@@ -4638,6 +4656,45 @@ mod tests {
         close_settings(&mut app);
 
         assert_eq!(app.settings.search.limit, 25);
+    }
+
+    #[test]
+    fn saving_a_changed_display_mode_notes_it_takes_effect_on_next_launch() {
+        // 設定画面での編集は app.settings.display.mode だけを進める。
+        // app.display (今の実行中の値) は次回起動まで動かないので、その旨を保存の知らせに添える。
+        let dir = settings_temp_dir("save-display-mode-deferred");
+        let path = dir.join("config.toml");
+        let mut app = App::default();
+        assert_eq!(app.display, crate::display::DisplayMode::Embedded);
+        app.settings.display.mode = crate::display::DisplayMode::Window;
+
+        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
+
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("次回起動")),
+            "{:?}",
+            app.notice
+        );
+    }
+
+    #[test]
+    fn saving_an_unchanged_display_mode_does_not_mention_next_launch() {
+        let dir = settings_temp_dir("save-display-mode-unchanged");
+        let path = dir.join("config.toml");
+        let mut app = App::default();
+        app.settings.search.limit = 25;
+
+        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
+
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| !n.contains("次回起動")),
+            "{:?}",
+            app.notice
+        );
     }
 
     #[test]

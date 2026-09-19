@@ -13,7 +13,7 @@ TUI 上で設定を一覧・編集できる画面。`Mode::Settings` として�
 
 保存した値が効き始める時点は項目で違う。
 
-- `display.mode`: 次回起動から。実行中の表示モードは `app.display` が持ち、再生中の `w` で切り替える。
+- `display.mode`: 次回起動から。実行中の表示モードは `app.display` が持ち、再生中の `w` で切り替える。保存した値が `app.display` と違う間は、保存の知らせに「display.mode は次回起動から反映されます」を添える。
 - `display.quality` / `fps_cap` / `subtitles.enabled`: 次の再生から(`LaunchPlan` が起動時に読む)。
 - `search.limit` / `search.layout` / `search.timeout_secs` / `thumbnails.*`: 保存した時点から。
 
