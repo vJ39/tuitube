@@ -37,11 +37,20 @@ pub fn video_area(area: Rect) -> Rect {
 const MINI_VIDEO_COLS: u16 = 32;
 const MINI_VIDEO_ROWS: u16 = 10;
 
+/// text は文字セルの数がそのまま解像度になるため、embedded (画像) より広く取らないと
+/// 映像に見えない (実機で確認した不具合。#62)。
+const TEXT_MINI_VIDEO_COLS: u16 = 64;
+const TEXT_MINI_VIDEO_ROWS: u16 = 18;
+
 /// 結果一覧の右上に切り出す、隅のミニプレイヤー用の矩形。
-pub fn mini_video_area(screen: Rect) -> Rect {
+pub fn mini_video_area(screen: Rect, display: DisplayMode) -> Rect {
+    let (max_cols, max_rows) = match display {
+        DisplayMode::Text => (TEXT_MINI_VIDEO_COLS, TEXT_MINI_VIDEO_ROWS),
+        DisplayMode::Embedded | DisplayMode::Window => (MINI_VIDEO_COLS, MINI_VIDEO_ROWS),
+    };
     let results = search_areas(screen)[2];
-    let cols = MINI_VIDEO_COLS.min(results.width / 2).max(1);
-    let rows = MINI_VIDEO_ROWS.min(results.height).max(1);
+    let cols = max_cols.min(results.width / 2).max(1);
+    let rows = max_rows.min(results.height).max(1);
     Rect::new(results.right().saturating_sub(cols), results.y, cols, rows)
 }
 
@@ -53,7 +62,7 @@ pub fn video_target_area(app: &App, screen: Rect) -> Option<Rect> {
     }
     match app.display {
         DisplayMode::Window => None,
-        DisplayMode::Embedded | DisplayMode::Text => Some(mini_video_area(screen)),
+        DisplayMode::Embedded | DisplayMode::Text => Some(mini_video_area(screen, app.display)),
     }
 }
 
@@ -1350,7 +1359,7 @@ mod tests {
     fn mini_video_area_sits_at_the_top_right_of_the_results_block() {
         let screen = Rect::new(0, 0, 80, 24);
         let results = search_areas(screen)[2];
-        let mini = mini_video_area(screen);
+        let mini = mini_video_area(screen, DisplayMode::Embedded);
         assert_eq!(mini.y, results.y);
         assert_eq!(mini.right(), results.right());
         assert_eq!(mini.width, 32);
@@ -1361,7 +1370,32 @@ mod tests {
     fn mini_video_area_shrinks_to_fit_a_small_results_block() {
         let screen = Rect::new(0, 0, 20, 10);
         let results = search_areas(screen)[2];
-        let mini = mini_video_area(screen);
+        let mini = mini_video_area(screen, DisplayMode::Embedded);
+        assert!(
+            mini.width <= results.width / 2 && mini.width >= 1,
+            "{mini:?}"
+        );
+        assert!(
+            mini.height <= results.height && mini.height >= 1,
+            "{mini:?}"
+        );
+    }
+
+    #[test]
+    fn mini_video_area_is_larger_for_text_than_embedded() {
+        // text は文字グリッドがそのまま解像度になるため、embedded より広く取る (#62)。
+        let screen = Rect::new(0, 0, 80, 24);
+        let embedded = mini_video_area(screen, DisplayMode::Embedded);
+        let text = mini_video_area(screen, DisplayMode::Text);
+        assert!(text.width > embedded.width, "{text:?} vs {embedded:?}");
+        assert!(text.height > embedded.height, "{text:?} vs {embedded:?}");
+    }
+
+    #[test]
+    fn mini_video_area_for_text_shrinks_to_fit_a_small_results_block() {
+        let screen = Rect::new(0, 0, 20, 10);
+        let results = search_areas(screen)[2];
+        let mini = mini_video_area(screen, DisplayMode::Text);
         assert!(
             mini.width <= results.width / 2 && mini.width >= 1,
             "{mini:?}"
@@ -1420,7 +1454,7 @@ mod tests {
             let app = video_app(Mode::Results, display);
             assert_eq!(
                 video_target_area(&app, app.screen),
-                Some(mini_video_area(app.screen)),
+                Some(mini_video_area(app.screen, display)),
                 "{display:?}"
             );
         }

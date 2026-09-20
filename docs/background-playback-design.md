@@ -38,10 +38,16 @@
 
 ```rust
 /// 結果一覧の右上に切り出す、隅のミニプレイヤー用の矩形。
-pub fn mini_video_area(screen: Rect) -> Rect {
+/// text は文字セルの数がそのまま解像度になるため、embedded より広い上限を使う
+/// (実機で確認した不具合。2026/09/20 修正、詳細は #62)。
+pub fn mini_video_area(screen: Rect, display: DisplayMode) -> Rect {
+    let (max_cols, max_rows) = match display {
+        DisplayMode::Text => (TEXT_MINI_VIDEO_COLS, TEXT_MINI_VIDEO_ROWS),
+        DisplayMode::Embedded | DisplayMode::Window => (MINI_VIDEO_COLS, MINI_VIDEO_ROWS),
+    };
     let results = search_areas(screen)[2];
-    let cols = MINI_VIDEO_COLS.min(results.width / 2).max(1);
-    let rows = MINI_VIDEO_ROWS.min(results.height).max(1);
+    let cols = max_cols.min(results.width / 2).max(1);
+    let rows = max_rows.min(results.height).max(1);
     Rect::new(results.right().saturating_sub(cols), results.y, cols, rows)
 }
 
@@ -58,7 +64,7 @@ pub fn video_target_area(app: &App, screen: Rect) -> Option<Rect> {
 }
 ```
 
-`MINI_VIDEO_COLS` / `MINI_VIDEO_ROWS` は固定値(例: 32 / 10)とし、設定項目にはしない。
+`MINI_VIDEO_COLS` / `MINI_VIDEO_ROWS` は固定値(例: 32 / 10)とし、設定項目にはしない。`TEXT_MINI_VIDEO_COLS` / `TEXT_MINI_VIDEO_ROWS` (例: 64 / 18) は text 表示のときだけ使う、より広い上限。
 
 `main.rs` の `run()` ループは、今 `ui::video_area(app.screen)` を固定で渡している箇所を `ui::video_target_area(app, app.screen)` に差し替える。
 

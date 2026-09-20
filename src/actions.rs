@@ -1886,7 +1886,7 @@ mod tests {
         assert!(app.thumbs.take_dirty());
 
         let geometry = Geometry::new(
-            ui::mini_video_area(app.screen),
+            ui::mini_video_area(app.screen, app.display),
             cell_size(),
             MAX_FRAME_PIXELS,
         );
