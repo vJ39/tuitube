@@ -23,6 +23,8 @@ pub struct SearchResult {
     pub uploader: Option<String>,
     /// チャンネルへ移るための UC... 形式の ID。チャンネルタブ経由の行では入らない。
     pub channel_id: Option<String>,
+    /// 配信中か。--flat-playlist でも返るので、どの画面でも行ごとに判定できる。
+    pub is_live: bool,
 }
 
 impl SearchResult {
@@ -58,12 +60,17 @@ fn parse_line(line: &str) -> Option<SearchResult> {
         .get("channel_id")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let is_live = value
+        .get("is_live")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(SearchResult {
         id,
         title,
         duration,
         uploader,
         channel_id,
+        is_live,
     })
 }
 
@@ -488,6 +495,20 @@ mod tests {
         assert_eq!(parse_lines(null)[0].channel_id, None);
     }
 
+    #[test]
+    fn parse_line_reads_the_live_flag() {
+        let live = r#"{"id":"a","title":"t","is_live":true}"#;
+        assert!(parse_lines(live)[0].is_live);
+        // 欠け・null・false はどれもライブでない扱いにする。
+        for not_live in [
+            r#"{"id":"a","title":"t","is_live":false}"#,
+            r#"{"id":"a","title":"t","is_live":null}"#,
+            r#"{"id":"a","title":"t"}"#,
+        ] {
+            assert!(!parse_lines(not_live)[0].is_live, "{not_live}");
+        }
+    }
+
     const ONE_VIDEO: &str = r#"{"id":"id1","title":"t","channel_id":"UCfeed","uploader":"Up"}"#;
 
     #[test]
@@ -779,6 +800,7 @@ mod tests {
                 duration: Some(2404.0),
                 uploader: Some("Green Tea Coding".to_string()),
                 channel_id: Some("UCxxx".to_string()),
+                is_live: false,
             }]
         );
     }

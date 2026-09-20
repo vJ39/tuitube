@@ -1,6 +1,7 @@
 use crate::app::{App, ChannelView, DownloadField, Mode, format_time};
 use crate::badge;
 use crate::comments;
+use crate::cookies::ChannelTab;
 use crate::display::DisplayMode;
 use crate::geometry::cell_size;
 use crate::grid::{self, LayoutMode};
@@ -664,10 +665,18 @@ fn results_title(offset: usize, shown: usize, total: usize) -> String {
     format!(" 結果 {}-{}/{total} ", offset + 1, offset + shown)
 }
 
+/// ショートのタブを見ているか。ショートは行ごとには判定できないので、
+/// 見ている画面で決める。
+pub fn viewing_shorts(app: &App) -> bool {
+    app.mode == Mode::Channel
+        && app.channel.as_ref().map(|view| view.tab) == Some(ChannelTab::Shorts)
+}
+
 fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
     let results = app.view_results();
     let title = results_title(layout.offset, layout.cells.len(), results.len());
     frame.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+    let shorts = viewing_shorts(app);
 
     for (i, cell) in layout.cells.iter().enumerate() {
         let index = layout.offset + i;
@@ -681,6 +690,18 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
                 cell.image,
+            );
+        }
+        // サムネイルが来る前でも種別が分かるよう文字でも出す。来たら APC が上に載る。
+        if shorts && cell.image.width > 0 && cell.image.height > 0 {
+            let at = Rect::new(cell.image.right() - 1, cell.image.y, 1, 1);
+            frame.render_widget(
+                Paragraph::new(badge::Badge::Shorts.symbol()).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                at,
             );
         }
         let title_style = if index == app.view_selected() {
@@ -705,6 +726,7 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
 
 /// Kitty graphics protocol 非対応の端末と、格子を組めない狭さのときの従来表示。
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
+    let shorts = viewing_shorts(app);
     let items: Vec<ListItem> = app
         .view_results()
         .iter()
@@ -712,8 +734,10 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
             let uploader = r.uploader.as_deref().unwrap_or("-");
             // サムネイルを描かない list 表示では present_thumbs のバッジ (#66) が
             // 乗らないので、行の文字に印を足す。
-            let marks: String = badge::badges_for(&app.engagement, r)
-                .iter()
+            let marks: String = shorts
+                .then_some(badge::Badge::Shorts)
+                .into_iter()
+                .chain(badge::badges_for(&app.engagement, r))
                 .map(|b| b.symbol())
                 .collect();
             let prefix = if marks.is_empty() {
@@ -1258,6 +1282,7 @@ mod tests {
             duration: None,
             uploader: None,
             channel_id: None,
+            is_live: false,
         }
     }
 
@@ -2093,6 +2118,24 @@ mod tests {
         }
     }
 
+    /// ショートのタブを見ている 80x24 のチャンネル画面。
+    fn shorts_app(count: usize) -> App {
+        let mut app = channel_app(count);
+        let view = app.channel.as_mut().expect("チャンネル");
+        view.tab = ChannelTab::Shorts;
+        view.state_mut().results = (0..count).map(result).collect();
+        view.state_mut().loaded = true;
+        app
+    }
+
+    /// 画面の (`x`, `y`) に描かれている 1 文字。
+    fn drawn_symbol(app: &App, x: u16, y: u16) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("端末");
+        terminal.draw(|frame| draw(frame, app)).expect("描ける");
+        terminal.backend().buffer()[(x, y)].symbol().to_string()
+    }
+
     /// 画面の `row` 行目に描かれている文字。全角の右半分のセルは空白なので飛ばす。
     fn drawn_row(app: &App, row: u16) -> String {
         let mut terminal =
@@ -2491,6 +2534,68 @@ mod tests {
             .find(|line| line.contains("title 1"))
             .expect("2 行目がある");
         assert!(!line1.contains(Badge::Liked.symbol()), "{line1}");
+    }
+
+    #[test]
+    fn the_list_view_marks_a_live_row() {
+        let mut app = grid_app(2);
+        app.settings.search.layout = LayoutMode::List;
+        app.results[0].is_live = true;
+
+        let text = rendered(&app, 80, 24);
+        let line0 = text
+            .lines()
+            .find(|line| line.contains("title 0"))
+            .expect("1 行目がある");
+        assert!(line0.contains(Badge::Live.symbol()), "{line0}");
+        let line1 = text
+            .lines()
+            .find(|line| line.contains("title 1"))
+            .expect("2 行目がある");
+        assert!(!line1.contains(Badge::Live.symbol()), "{line1}");
+    }
+
+    #[test]
+    fn the_list_view_marks_every_row_of_the_shorts_tab() {
+        // ショートは行では判定できないので、タブを見ている間は全行に印を出す。
+        let mut app = shorts_app(2);
+        app.settings.search.layout = LayoutMode::List;
+
+        let text = rendered(&app, 80, 24);
+        for title in ["title 0", "title 1"] {
+            let line = text
+                .lines()
+                .find(|line| line.contains(title))
+                .expect("行がある");
+            assert!(line.contains(Badge::Shorts.symbol()), "{line}");
+        }
+
+        app.channel.as_mut().expect("チャンネル").tab = ChannelTab::Videos;
+        let text = rendered(&app, 80, 24);
+        let line0 = text
+            .lines()
+            .find(|line| line.contains("title 0"))
+            .expect("1 行目がある");
+        assert!(!line0.contains(Badge::Shorts.symbol()), "{line0}");
+    }
+
+    #[test]
+    fn the_grid_marks_every_cell_of_the_shorts_tab() {
+        let mut app = shorts_app(3);
+        let layout = grid_layout(&app, CELL).expect("格子を組める");
+        assert_eq!(layout.cells.len(), 3);
+
+        for cell in &layout.cells {
+            // いいね/登録の印 (present_thumbs が左上へ重ねる) と被らない右上に置く。
+            let mark = drawn_symbol(&app, cell.image.right() - 1, cell.image.y);
+            assert_eq!(mark, Badge::Shorts.symbol(), "{:?}", cell.image);
+        }
+
+        app.channel.as_mut().expect("チャンネル").tab = ChannelTab::Videos;
+        for cell in &layout.cells {
+            let mark = drawn_symbol(&app, cell.image.right() - 1, cell.image.y);
+            assert_ne!(mark, Badge::Shorts.symbol(), "{:?}", cell.image);
+        }
     }
 
     #[test]

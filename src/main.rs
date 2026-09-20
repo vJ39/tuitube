@@ -246,6 +246,7 @@ fn present_thumbs(
     let mut bytes = Vec::new();
     video::encode_clear(&mut bytes);
     let mut incomplete = false;
+    let shorts = ui::viewing_shorts(app);
     if let Some(layout) = ui::grid_layout(app, cell) {
         for (i, rect) in layout.cells.iter().enumerate() {
             let Some(result) = app.view_results().get(layout.offset + i) else {
@@ -258,9 +259,13 @@ fn present_thumbs(
                 Some(at) => {
                     rgb::encode_image(image, at, &mut bytes);
                     // 印はサムネイルより後に送る (画像は後から貼った方が上に出る)。
-                    if app.settings.engagement.enabled {
-                        let badges = badge::badges_for(&app.engagement, result);
-                        badge::encode(&badges, at, cell, &mut bytes);
+                    let badges: Vec<badge::Badge> = badge::badges_for(&app.engagement, result)
+                        .into_iter()
+                        .filter(|b| app.settings.engagement.enabled || !b.engagement())
+                        .collect();
+                    badge::encode(&badges, at, cell, &mut bytes);
+                    if shorts {
+                        badge::encode_tab(&[badge::Badge::Shorts], at, cell, &mut bytes);
                     }
                 }
                 // セル寸法と噛み合わず描けなかった。次のフレームで取り直す
@@ -728,8 +733,8 @@ fn note_cookie_failure(app: &mut App, error: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{Playback, PlaylistView};
-    use crate::cookies::CookieSource;
+    use crate::app::{ChannelView, Playback, PlaylistView};
+    use crate::cookies::{ChannelTab, CookieSource};
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
     use crate::search::fixtures::{FakeYtDlp, done};
@@ -768,6 +773,7 @@ mod tests {
             duration: None,
             uploader: None,
             channel_id: None,
+            is_live: false,
         }
     }
 
@@ -1819,6 +1825,82 @@ mod tests {
         app.thumbs.mark_dirty();
 
         assert_eq!(count_images(&thumbs_bytes(&mut app)), 4, "印を出さない");
+    }
+
+    /// タブ単位の印の送出列。位置は badge 側の実装を通す。
+    fn tab_badge_bytes(badges: &[badge::Badge], at: video::Placement) -> Vec<u8> {
+        let mut out = Vec::new();
+        badge::encode_tab(badges, at, CELL, &mut out);
+        out
+    }
+
+    /// ショートのタブを見ている 80x24 の画面。サムネイルは検索結果と同じ id で持つ。
+    fn shorts_thumb_app(count: usize) -> App {
+        let mut app = thumb_app(count);
+        let mut view = ChannelView::new("UCabc".to_string(), "Some Channel".to_string());
+        // タブを切り替えるテストがあるので、どちらのタブでも同じ行が見えるようにする。
+        for tab in [ChannelTab::Videos, ChannelTab::Shorts] {
+            view.tab = tab;
+            view.state_mut().results = app.results.clone();
+            view.state_mut().loaded = true;
+        }
+        app.channel = Some(view);
+        app.mode = Mode::Channel;
+        app
+    }
+
+    #[test]
+    fn present_thumbs_marks_every_thumbnail_on_the_shorts_tab() {
+        let mut app = shorts_thumb_app(2);
+        make_ready(&mut app, &["id0", "id1"]);
+        app.thumbs.mark_dirty();
+        let at = thumb_placement(&app, 1);
+
+        let out = thumbs_bytes(&mut app);
+
+        assert_eq!(count_images(&out), 4, "サムネイル 2 枚 + 印 2 個");
+        let mark = tab_badge_bytes(&[badge::Badge::Shorts], at);
+        assert!(find(&out, &mark).is_some(), "ショートの印が無い");
+    }
+
+    #[test]
+    fn present_thumbs_leaves_the_thumbnails_bare_on_the_other_channel_tabs() {
+        let mut app = shorts_thumb_app(2);
+        app.channel.as_mut().expect("チャンネル").tab = ChannelTab::Videos;
+        make_ready(&mut app, &["id0", "id1"]);
+        app.thumbs.mark_dirty();
+
+        assert_eq!(count_images(&thumbs_bytes(&mut app)), 2, "印を出さない");
+    }
+
+    #[test]
+    fn present_thumbs_keeps_the_kind_badges_when_the_engagement_setting_is_off() {
+        // ライブ・ショートは検索結果だけで分かるので、OAuth の設定で消さない。
+        let mut app = shorts_thumb_app(2);
+        app.channel
+            .as_mut()
+            .expect("チャンネル")
+            .state_mut()
+            .results[1]
+            .is_live = true;
+        make_ready(&mut app, &["id0", "id1"]);
+        app.engagement
+            .remember_like("id1", true, std::time::UNIX_EPOCH);
+        app.settings.engagement.enabled = false;
+        app.thumbs.mark_dirty();
+        let at = thumb_placement(&app, 1);
+
+        let out = thumbs_bytes(&mut app);
+
+        assert_eq!(
+            count_images(&out),
+            5,
+            "サムネイル 2 枚 + ショート 2 個 + ライブ 1 個"
+        );
+        let live = badge_bytes(&[badge::Badge::Live], at);
+        assert!(find(&out, &live).is_some(), "ライブの印が無い");
+        let liked = badge_bytes(&[badge::Badge::Liked], at);
+        assert!(find(&out, &liked).is_none(), "いいねの印は出さない");
     }
 
     #[test]

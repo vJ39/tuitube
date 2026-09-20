@@ -1963,6 +1963,7 @@ mod tests {
             duration: None,
             uploader: None,
             channel_id: None,
+            is_live: false,
         }
     }
 
@@ -3544,6 +3545,7 @@ mod tests {
                 duration: None,
                 uploader: None,
                 channel_id: Some(channel_id.to_string()),
+                is_live: false,
             })
             .collect();
         App {

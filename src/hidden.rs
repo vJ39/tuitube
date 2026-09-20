@@ -232,6 +232,7 @@ mod tests {
             duration: None,
             uploader: None,
             channel_id: channel_id.map(str::to_string),
+            is_live: false,
         }
     }
 

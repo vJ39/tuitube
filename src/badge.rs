@@ -14,6 +14,8 @@ const BORDER: [u8; 3] = [16, 16, 16];
 /// セルの角に出す印。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Badge {
+    Live,
+    Shorts,
     Liked,
     Subscribed,
 }
@@ -22,6 +24,8 @@ impl Badge {
     /// 塗り色。再生画面のアクション行 (ui::ActionKind) の赤/緑と揃える。
     fn fill(self) -> [u8; 3] {
         match self {
+            Badge::Live => [255, 70, 30],
+            Badge::Shorts => [60, 120, 240],
             Badge::Liked => [220, 40, 40],
             Badge::Subscribed => [40, 190, 90],
         }
@@ -31,15 +35,26 @@ impl Badge {
     /// アクション行 (ui::ActionKind) と揃える。
     pub fn symbol(self) -> &'static str {
         match self {
+            Badge::Live => "●LIVE",
+            Badge::Shorts => "S",
             Badge::Liked => "♥",
             Badge::Subscribed => "＋",
         }
+    }
+
+    /// OAuth (engagement) の問い合わせ結果に由来する印か。ライブ・ショートは
+    /// 検索結果だけで分かるので、engagement を切っていても出す。
+    pub fn engagement(self) -> bool {
+        matches!(self, Badge::Liked | Badge::Subscribed)
     }
 }
 
 /// この行に出す印。左から並べる順。
 pub fn badges_for(cache: &EngagementCache, result: &SearchResult) -> Vec<Badge> {
     let mut badges = Vec::new();
+    if result.is_live {
+        badges.push(Badge::Live);
+    }
     if cache.is_liked(&result.id) {
         badges.push(Badge::Liked);
     }
@@ -77,14 +92,30 @@ pub fn image(badge: Badge, cell: CellSize) -> Option<RgbImage> {
 /// 印を置く場所。サムネイルの左上から右へ 1 セルずつ並べる。
 /// 収まらない分は隣のセルを汚すので出さない。
 pub fn placements(at: Placement, count: usize) -> Vec<Placement> {
+    corner_placements(at, count, false)
+}
+
+/// タブ単位の印を置く場所。行ごとの印 (左上) と重ならないよう、右上から左へ並べる。
+pub fn tab_placements(at: Placement, count: usize) -> Vec<Placement> {
+    corner_placements(at, count, true)
+}
+
+/// サムネイル上端の角から 1 セルずつ並べる。`from_right` で右上起点に切り替える。
+fn corner_placements(at: Placement, count: usize, from_right: bool) -> Vec<Placement> {
     if at.rows == 0 {
         return Vec::new();
     }
     (0..count.min(usize::from(at.cols)))
         .filter_map(|i| {
+            let offset = u16::try_from(i).ok()?;
+            let col = if from_right {
+                at.col.checked_add(at.cols - 1)?.checked_sub(offset)?
+            } else {
+                at.col.checked_add(offset)?
+            };
             Some(Placement {
                 row: at.row,
-                col: at.col.checked_add(u16::try_from(i).ok()?)?,
+                col,
                 cols: 1,
                 rows: 1,
             })
@@ -94,7 +125,16 @@ pub fn placements(at: Placement, count: usize) -> Vec<Placement> {
 
 /// 貼ったサムネイル (`at`) の上へ印を追加で送る。サムネイル本体の送出列には手を入れない。
 pub fn encode(badges: &[Badge], at: Placement, cell: CellSize, out: &mut Vec<u8>) {
-    for (badge, place) in badges.iter().zip(placements(at, badges.len())) {
+    encode_at(badges, placements(at, badges.len()), cell, out);
+}
+
+/// タブ単位の印を反対側の角へ追加で送る。
+pub fn encode_tab(badges: &[Badge], at: Placement, cell: CellSize, out: &mut Vec<u8>) {
+    encode_at(badges, tab_placements(at, badges.len()), cell, out);
+}
+
+fn encode_at(badges: &[Badge], places: Vec<Placement>, cell: CellSize, out: &mut Vec<u8>) {
+    for (badge, place) in badges.iter().zip(places) {
         if let Some(image) = image(*badge, cell) {
             rgb::encode_image(&image, place, out);
         }
@@ -122,6 +162,15 @@ mod tests {
             duration: None,
             uploader: None,
             channel_id: channel_id.map(str::to_string),
+            is_live: false,
+        }
+    }
+
+    /// 配信中の 1 行。
+    fn live(id: &str, channel_id: Option<&str>) -> SearchResult {
+        SearchResult {
+            is_live: true,
+            ..result(id, channel_id)
         }
     }
 
@@ -144,6 +193,60 @@ mod tests {
     #[test]
     fn symbols_differ_between_liked_and_subscribed() {
         assert_ne!(Badge::Liked.symbol(), Badge::Subscribed.symbol());
+    }
+
+    #[test]
+    fn every_badge_has_its_own_symbol() {
+        let mut symbols = [
+            Badge::Live.symbol(),
+            Badge::Shorts.symbol(),
+            Badge::Liked.symbol(),
+            Badge::Subscribed.symbol(),
+        ];
+        symbols.sort_unstable();
+        for pair in symbols.windows(2) {
+            assert_ne!(pair[0], pair[1], "{symbols:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_video_gets_the_live_badge() {
+        let cache = EngagementCache::default();
+
+        assert_eq!(badges_for(&cache, &live("v1", None)), vec![Badge::Live]);
+        assert!(badges_for(&cache, &result("v1", None)).is_empty());
+    }
+
+    #[test]
+    fn a_live_video_of_a_subscribed_channel_shows_the_live_badge_first() {
+        let mut cache = EngagementCache::default();
+        cache.remember_like("v1", true, now());
+        cache.remember_subscription("UC1", true, now());
+
+        assert_eq!(
+            badges_for(&cache, &live("v1", Some("UC1"))),
+            vec![Badge::Live, Badge::Liked, Badge::Subscribed],
+            "並びは ライブ → いいね → 登録"
+        );
+    }
+
+    #[test]
+    fn the_shorts_badge_never_comes_from_a_row() {
+        // ショートは行では判定できないので、タブを見ている描画側が足す。
+        let mut cache = EngagementCache::default();
+        cache.remember_like("v1", true, now());
+        cache.remember_subscription("UC1", true, now());
+
+        assert!(!badges_for(&cache, &live("v1", Some("UC1"))).contains(&Badge::Shorts));
+    }
+
+    #[test]
+    fn only_the_like_and_the_subscribe_badge_follow_the_engagement_setting() {
+        assert!(Badge::Liked.engagement());
+        assert!(Badge::Subscribed.engagement());
+        // ライブ・ショートは検索結果だけで分かるので、OAuth の設定とは無関係。
+        assert!(!Badge::Live.engagement());
+        assert!(!Badge::Shorts.engagement());
     }
 
     #[test]
@@ -235,6 +338,55 @@ mod tests {
     }
 
     #[test]
+    fn the_tab_badges_start_at_the_far_corner_of_the_thumbnail() {
+        // 行ごとの印 (左上) と重ならないよう、右上から左へ並べる。
+        assert_eq!(
+            tab_placements(placed(), 2),
+            vec![
+                Placement {
+                    row: 5,
+                    col: 11,
+                    cols: 1,
+                    rows: 1
+                },
+                Placement {
+                    row: 5,
+                    col: 10,
+                    cols: 1,
+                    rows: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tab_badge_with_no_room_is_dropped() {
+        let narrow = Placement {
+            cols: 1,
+            ..placed()
+        };
+
+        assert_eq!(
+            tab_placements(narrow, 2).len(),
+            1,
+            "隣のセルまではみ出さない"
+        );
+        assert!(tab_placements(placed(), 0).is_empty());
+        for empty in [
+            Placement {
+                cols: 0,
+                ..placed()
+            },
+            Placement {
+                rows: 0,
+                ..placed()
+            },
+        ] {
+            assert!(tab_placements(empty, 2).is_empty());
+        }
+    }
+
+    #[test]
     fn a_thumbnail_with_no_room_gets_no_badge() {
         for empty in [
             Placement {
@@ -310,6 +462,14 @@ mod tests {
     }
 
     #[test]
+    fn the_live_badge_does_not_look_like_the_like_badge() {
+        let live = image(Badge::Live, CELL).expect("作れる");
+        let liked = image(Badge::Liked, CELL).expect("作れる");
+
+        assert_ne!(pixel(&live, 4, 8), pixel(&liked, 4, 8));
+    }
+
+    #[test]
     fn the_like_and_the_subscribe_badge_use_different_colors() {
         let liked = image(Badge::Liked, CELL).expect("作れる");
         let subscribed = image(Badge::Subscribed, CELL).expect("作れる");
@@ -333,6 +493,25 @@ mod tests {
         assert!(text.contains("\x1b[5;9H"), "1 個目の位置が違う");
         assert!(text.contains("\x1b[5;10H"), "2 個目の位置が違う");
         assert_eq!(text.matches("c=1,r=1").count(), 2);
+    }
+
+    #[test]
+    fn encoding_a_tab_badge_writes_it_at_the_far_corner() {
+        let mut out = Vec::new();
+        encode_tab(&[Badge::Shorts], placed(), CELL, &mut out);
+
+        assert_eq!(image_count(&out), 1);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("\x1b[5;11H"), "右上に置いていない");
+        assert_eq!(text.matches("c=1,r=1").count(), 1);
+    }
+
+    #[test]
+    fn encoding_no_tab_badge_writes_nothing() {
+        let mut out = Vec::new();
+        encode_tab(&[], placed(), CELL, &mut out);
+
+        assert!(out.is_empty());
     }
 
     #[test]
