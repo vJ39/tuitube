@@ -1845,6 +1845,24 @@ fn save_display_mode(
     }
 }
 
+/// v での即時切替+自動保存。display.mode と違い mpv へ何も送らないので、
+/// w (cycle_display_mode) と違い非同期にする必要がなく同期のまま完結する。
+pub fn toggle_search_layout(app: &mut App, config: Option<&Path>, now: std::time::Instant) {
+    let Some(path) = config else {
+        app.set_temporary_error(NO_CONFIG_PATH.to_string(), now);
+        return;
+    };
+    let layout = app.settings.search.layout.next();
+    match settings::save_search_layout_to(path, layout) {
+        Ok(()) => {
+            app.settings.search.layout = layout;
+            // 保存した値が Esc の戻り先になる。他の項目は開いた時点の値のまま残す。
+            app.settings_backup.search.layout = layout;
+        }
+        Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
+    }
+}
+
 /// 保存できた旨。書き換えなかった項目があれば、その名前も出す。
 fn saved_notice(
     path: &Path,
@@ -1884,6 +1902,7 @@ mod tests {
     use crate::cookies::{ChannelTab, CookieSource, CookieState, Feed};
     use crate::display::Quality;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
+    use crate::grid::LayoutMode;
     use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
     use crate::rgb::RgbImage;
@@ -2809,6 +2828,109 @@ mod tests {
         assert_eq!(app.display, DisplayMode::Text);
         assert_eq!(app.error.as_deref(), Some(NO_CONFIG_PATH));
         assert_eq!(app.settings.display.mode, DisplayMode::Embedded);
+    }
+
+    #[test]
+    fn toggling_saves_the_new_layout_to_the_config_file() {
+        let path = settings_temp_dir("toggle-layout-autosave").join("config.toml");
+        std::fs::write(&path, "[search]\nlayout = \"grid\"\n").expect("書ける");
+        let mut app = App::default();
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+
+        assert_eq!(app.settings.search.layout, LayoutMode::List);
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert_eq!(written, "[search]\nlayout = \"list\"\n", "{written}");
+        assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn toggling_keeps_the_rest_of_the_config_file() {
+        // v は保存を意図した操作ではないので、layout 以外の行を書き換えない。
+        let path = settings_temp_dir("toggle-layout-keep").join("config.toml");
+        let before = "# 自分で書いたコメント\n[search]\nlayout = \"grid\"\nlimit = 5000\n\n[display]\nmode = \"embedded\"\n";
+        std::fs::write(&path, before).expect("書ける");
+        let mut app = App::default();
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert_eq!(written, before.replace("\"grid\"", "\"list\""), "{written}");
+    }
+
+    #[test]
+    fn toggling_creates_the_config_file_when_there_is_none() {
+        let path = settings_temp_dir("toggle-layout-new").join("config.toml");
+        let mut app = App::default();
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert_eq!(written, crate::settings::render(&app.settings), "{written}");
+    }
+
+    #[test]
+    fn toggling_says_nothing_when_the_save_goes_through() {
+        let path = settings_temp_dir("toggle-layout-quiet").join("config.toml");
+        let mut app = App::default();
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+
+        assert_eq!(app.notice, None);
+        assert_eq!(app.error, None);
+    }
+
+    #[test]
+    fn toggling_twice_returns_to_the_original_layout() {
+        let path = settings_temp_dir("toggle-layout-roundtrip").join("config.toml");
+        let mut app = App::default();
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+
+        assert_eq!(app.settings.search.layout, LayoutMode::Grid);
+    }
+
+    #[test]
+    fn a_toggled_layout_survives_a_later_escape() {
+        // 設定画面を開いて Esc で戻したときに、直前の自動保存まで巻き戻さない。
+        let path = settings_temp_dir("toggle-layout-escape").join("config.toml");
+        let mut app = App::default();
+        let mut session = Session::default();
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+        assert_eq!(
+            app.settings_backup.search.layout,
+            LayoutMode::List,
+            "保存した内容が Esc の戻り先になる"
+        );
+
+        open_settings(&mut app, &mut session);
+        close_settings(&mut app);
+        assert_eq!(app.settings.search.layout, LayoutMode::List);
+    }
+
+    #[test]
+    fn a_failed_toggle_keeps_the_previous_layout() {
+        let dir = settings_temp_dir("toggle-layout-blocked");
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "ファイルなので中に書けない").expect("書ける");
+
+        let mut app = App::default();
+        toggle_search_layout(
+            &mut app,
+            Some(&blocker.join("config.toml")),
+            std::time::Instant::now(),
+        );
+
+        let error = app.error.clone().expect("保存できない理由を出す");
+        assert!(error.contains("保存できません"), "{error}");
+        // 保存できていないので、settings も Esc の戻り先も切り替える前のまま。
+        assert_eq!(app.settings.search.layout, LayoutMode::Grid);
+        assert_eq!(app.settings_backup.search.layout, LayoutMode::Grid);
+    }
+
+    #[test]
+    fn toggling_without_a_place_to_save_says_so_and_keeps_the_layout() {
+        let mut app = App::default();
+        toggle_search_layout(&mut app, None, std::time::Instant::now());
+
+        assert_eq!(app.error.as_deref(), Some(NO_CONFIG_PATH));
+        assert_eq!(app.settings.search.layout, LayoutMode::Grid);
     }
 
     #[tokio::test]

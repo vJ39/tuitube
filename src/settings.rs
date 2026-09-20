@@ -1227,28 +1227,71 @@ pub fn save_display_mode_to(path: &Path, mode: DisplayMode) -> Result<(), String
     write_atomic(path, &updated)
 }
 
-/// `[display]` の mode 行だけを差し替えた全文。行が無ければ節の頭へ、
-/// 節ごと無ければ末尾へ足す。他の行には触らない。
+/// search.layout の行だけを差し替える。v での自動保存は保存を意図した操作ではないので、
+/// 全文の書き直し (= 利用者のコメントと未知のキーが消える) を起こさない。
+pub fn save_search_layout_to(path: &Path, layout: LayoutMode) -> Result<(), String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        // まだファイルが無ければ残すものも無いので、起動時と同じテンプレートを作る。
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let settings = Settings {
+                search: SearchSettings {
+                    layout,
+                    ..SearchSettings::default()
+                },
+                ..Settings::default()
+            };
+            return save_to(path, &settings);
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    let updated = with_search_layout(&text, layout);
+    // 読み直して値が入っているか確かめてから置き換える。手書きの書き方 (dotted key など)
+    // では行を見つけられず、足した行が重複キーになることがある。
+    if parse(&updated)
+        .ok()
+        .and_then(|raw| raw.search?.layout)
+        .as_deref()
+        != Some(layout.key())
+    {
+        return Err("search.layout の行を書き換えられません".to_string());
+    }
+    write_atomic(path, &updated)
+}
+
+/// `[display]` の mode 行だけを差し替えた全文。
 fn with_display_mode(text: &str, mode: DisplayMode) -> String {
-    let new_line = format!("mode = \"{}\"", mode.key());
+    with_toml_string_value(text, "display", "mode", mode.key())
+}
+
+/// `[search]` の layout 行だけを差し替えた全文。
+fn with_search_layout(text: &str, layout: LayoutMode) -> String {
+    with_toml_string_value(text, "search", "layout", layout.key())
+}
+
+/// `[section]` の `key` 行だけを差し替えた全文。行が無ければ節の頭へ、
+/// 節ごと無ければ末尾へ足す。他の行には触らない。
+fn with_toml_string_value(text: &str, section: &str, key: &str, value: &str) -> String {
+    let header_line = format!("[{section}]");
+    let new_line = format!("{key} = \"{value}\"");
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
-    let mut in_display = false;
+    let mut in_section = false;
     let (mut header, mut target) = (None, None);
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_display = trimmed == "[display]";
-            if in_display {
+            in_section = trimmed == header_line;
+            if in_section {
                 header = Some(i);
             }
-        } else if in_display && target.is_none() && is_key_line(trimmed, "mode") {
+        } else if in_section && target.is_none() && is_key_line(trimmed, key) {
             target = Some(i);
         }
     }
     match (target, header) {
         (Some(i), _) => lines[i] = new_line,
         (None, Some(i)) => lines.insert(i + 1, new_line),
-        (None, None) => lines.extend([String::new(), "[display]".to_string(), new_line]),
+        (None, None) => lines.extend([String::new(), header_line, new_line]),
     }
     let mut out = lines.join("\n");
     out.push('\n');
@@ -2199,6 +2242,90 @@ mod tests {
         let error = save_display_mode_to(&path, DisplayMode::Text).expect_err("書き換えられない");
 
         assert!(error.contains("display.mode"), "{error}");
+        assert_eq!(fs::read_to_string(&path).expect("読める"), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_search_layout_to_rewrites_only_the_layout_line() {
+        let dir = temp_dir("save-layout-line");
+        let path = dir.join("config.toml");
+        // 手で書いたコメント・tuitube が持たないキーを混ぜておく。
+        let before = "# 自分のメモ\n[search]\n# 表示形式\nlayout = \"grid\"\nlimit = 5000\nmy_key = \"残る\"\n\n[display]\nmode = \"embedded\"\n";
+        fs::write(&path, before).expect("書ける");
+
+        save_search_layout_to(&path, LayoutMode::List).expect("保存できる");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("読める"),
+            before.replace("\"grid\"", "\"list\"")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_search_layout_to_adds_the_line_when_it_is_missing() {
+        let dir = temp_dir("save-layout-add");
+        let path = dir.join("config.toml");
+        for (before, after) in [
+            (
+                "[search]\nlimit = 5\n",
+                "[search]\nlayout = \"list\"\nlimit = 5\n",
+            ),
+            // layout を持つ別の節があっても [search] の側へ書く。
+            (
+                "[display]\nmode = \"text\"\n",
+                "[display]\nmode = \"text\"\n\n[search]\nlayout = \"list\"\n",
+            ),
+            (
+                "[search]\n# layout = \"list\"\n",
+                "[search]\nlayout = \"list\"\n# layout = \"list\"\n",
+            ),
+        ] {
+            fs::write(&path, before).expect("書ける");
+            save_search_layout_to(&path, LayoutMode::List).expect("保存できる");
+            assert_eq!(
+                fs::read_to_string(&path).expect("読める"),
+                after,
+                "{before}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_search_layout_to_creates_the_template_when_there_is_no_file() {
+        let dir = temp_dir("save-layout-new");
+        let path = dir.join("nested/config.toml");
+
+        save_search_layout_to(&path, LayoutMode::List).expect("保存できる");
+
+        let expected = Settings {
+            search: SearchSettings {
+                layout: LayoutMode::List,
+                ..SearchSettings::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(
+            fs::read_to_string(&path).expect("読める"),
+            render(&expected),
+            "親ディレクトリごと作る"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_search_layout_to_keeps_the_file_when_the_line_cannot_be_placed() {
+        let dir = temp_dir("save-layout-dotted");
+        let path = dir.join("config.toml");
+        // dotted key の search は節として現れないので、足すと重複キーになる。
+        let before = "search.layout = \"grid\"\n";
+        fs::write(&path, before).expect("書ける");
+
+        let error = save_search_layout_to(&path, LayoutMode::List).expect_err("書き換えられない");
+
+        assert!(error.contains("search.layout"), "{error}");
         assert_eq!(fs::read_to_string(&path).expect("読める"), before);
         let _ = fs::remove_dir_all(&dir);
     }

@@ -10,7 +10,7 @@ use crate::actions::{
     reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative, select_channel_tab,
     select_tab, send_to_player, start_download, start_playback, start_search, stop_playback,
     subscribe_channel, subscribe_playing_channel, switch_channel_tab, switch_tab, toggle_comments,
-    toggle_subtitles,
+    toggle_search_layout, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -121,6 +121,19 @@ async fn handle_key_results(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
+    let config = config_path_from_env();
+    handle_key_results_with(app, key, tx, session, config.as_deref()).await;
+}
+
+/// 設定ファイルの置き場を差し替えられる形。テストはここに一時ファイルを渡して
+/// 利用者の設定を書き換えない。
+async fn handle_key_results_with(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    config: Option<&Path>,
+) {
     match key.code {
         // 末尾で押したときは、もっと見られる (m キーと同じ判定) 状態なら一覧を送らず
         // 読み込みを始める。list 表示は select_next が末尾で先頭へ巻き戻るため、この
@@ -148,6 +161,8 @@ async fn handle_key_results(
         KeyCode::Char('p') => open_playlists(app, tx, session),
         // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
         KeyCode::Char('m') => load_more(app, tx, session),
+        // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
+        KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
         KeyCode::Char('b') => leave_background(app, session).await,
         KeyCode::Char('/') | KeyCode::Esc => {
@@ -166,15 +181,19 @@ async fn handle_key_channel(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
-    handle_key_channel_with(app, key, tx, session, Oauth::real()).await;
+    let config = config_path_from_env();
+    handle_key_channel_with(app, key, tx, session, Oauth::real(), config.as_deref()).await;
 }
 
+/// oauth の実装先と設定ファイルの置き場を差し替えられる形。テストはここに偽物と
+/// 一時ファイルを渡して、実際の通信も利用者の設定の書き換えも起こさない。
 async fn handle_key_channel_with<B: oauth::Backend + 'static>(
     app: &mut App,
     key: KeyEvent,
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
     deps: Oauth<B>,
+    config: Option<&Path>,
 ) {
     match key.code {
         KeyCode::Down => move_selection(app, Dir::Down),
@@ -192,6 +211,8 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         KeyCode::Char('s') => subscribe_channel(app, tx, session, deps),
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
+        // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
+        KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
         KeyCode::Char('b') => leave_background(app, session).await,
         KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
@@ -237,6 +258,19 @@ async fn handle_key_playlist(
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
 ) {
+    let config = config_path_from_env();
+    handle_key_playlist_with(app, key, tx, session, config.as_deref()).await;
+}
+
+/// 設定ファイルの置き場を差し替えられる形。テストはここに一時ファイルを渡して
+/// 利用者の設定を書き換えない。
+async fn handle_key_playlist_with(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    config: Option<&Path>,
+) {
     match key.code {
         KeyCode::Down => move_selection(app, Dir::Down),
         KeyCode::Up => move_selection(app, Dir::Up),
@@ -251,6 +285,8 @@ async fn handle_key_playlist(
         KeyCode::Char('d') => open_download(app, session),
         // プレイリストごと隠す手はないので、チャンネルと違い動画 1 件だけを隠す。
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
+        // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
+        KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
         KeyCode::Char('b') => leave_background(app, session).await,
         KeyCode::Char('/') | KeyCode::Esc => leave_playlist(app, session),
@@ -745,6 +781,7 @@ mod tests {
     use crate::category::{Category, Tabs};
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::display::DisplayMode;
+    use crate::grid::LayoutMode;
     use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
     use crate::search::{PlaylistEntry, SearchResult};
@@ -1331,6 +1368,79 @@ mod tests {
         assert_eq!(app.query.text(), "w", "入力モードでは文字として入る");
     }
 
+    #[tokio::test]
+    async fn v_toggles_the_layout_in_the_results_screen() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(2);
+        let path = temp_config("toggle-layout-results");
+
+        handle_key_results_with(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &tx,
+            &mut session,
+            Some(&path),
+        )
+        .await;
+
+        assert_eq!(app.settings.search.layout, LayoutMode::List);
+        let written = std::fs::read_to_string(&path).expect("読める");
+        assert!(written.contains("layout = \"list\""), "{written}");
+    }
+
+    #[tokio::test]
+    async fn v_toggles_the_layout_in_a_channel() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = subscribable_app();
+        let path = temp_config("toggle-layout-channel");
+
+        handle_key_channel_with(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &tx,
+            &mut session,
+            fake_oauth(),
+            Some(&path),
+        )
+        .await;
+
+        assert_eq!(app.settings.search.layout, LayoutMode::List);
+        assert!(session.oauth_task.is_none(), "v で登録が走らない");
+    }
+
+    #[tokio::test]
+    async fn v_toggles_the_layout_in_a_playlist() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlist_app(2);
+        let path = temp_config("toggle-layout-playlist");
+
+        handle_key_playlist_with(
+            &mut app,
+            key(KeyCode::Char('v')),
+            &tx,
+            &mut session,
+            Some(&path),
+        )
+        .await;
+
+        assert_eq!(app.settings.search.layout, LayoutMode::List);
+    }
+
+    #[tokio::test]
+    async fn v_does_nothing_in_the_playlists_list() {
+        // 対象外 (v1): サムネイルを持たないタイトルのみの一覧なので、grid/list 切替の対象にしない。
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlists_app(2);
+
+        handle_key(&mut app, key(KeyCode::Char('v')), &tx, &mut session).await;
+
+        assert_eq!(app.settings.search.layout, LayoutMode::Grid);
+    }
+
     const URL: &str = "https://www.youtube.com/watch?v=abc";
 
     fn playing_url_app() -> App {
@@ -1494,6 +1604,7 @@ mod tests {
             &tx,
             &mut session,
             fake_oauth(),
+            None,
         )
         .await;
 
@@ -1514,6 +1625,7 @@ mod tests {
             &tx,
             &mut session,
             fake_oauth(),
+            None,
         )
         .await;
 
@@ -1529,7 +1641,7 @@ mod tests {
         let mut pressed = key(KeyCode::Char('s'));
         pressed.modifiers = KeyModifiers::CONTROL;
 
-        handle_key_channel_with(&mut app, pressed, &tx, &mut session, fake_oauth()).await;
+        handle_key_channel_with(&mut app, pressed, &tx, &mut session, fake_oauth(), None).await;
 
         assert_eq!(app.mode, Mode::Settings);
         assert!(session.oauth_task.is_none(), "登録は始めない");
@@ -1547,7 +1659,8 @@ mod tests {
         ] {
             let mut session = Session::default();
             let mut app = subscribable_app();
-            handle_key_channel_with(&mut app, key(code), &tx, &mut session, fake_oauth()).await;
+            handle_key_channel_with(&mut app, key(code), &tx, &mut session, fake_oauth(), None)
+                .await;
             assert!(session.oauth_task.is_none(), "{code:?} で登録が走った");
         }
     }
@@ -3802,6 +3915,7 @@ mod tests {
             &tx,
             &mut session,
             fake_oauth(),
+            None,
         )
         .await;
 

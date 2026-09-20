@@ -1104,6 +1104,7 @@ fn input_hints(background: bool) -> Vec<String> {
 /// h は押さないと気づけないので、矢印と Esc の言葉を削ってでも入れる。
 /// もっと見られる間だけ末尾に m を足す (狭い端末では他より先に落ちる)。
 /// バックグラウンド中だけ末尾に b (前面へ戻る) を足す。
+/// v (grid/list 切替) は 80 桁に入らないので、m/b と同じく幅のある端末でだけ出る。
 fn results_hints(can_load_more: bool, background: bool) -> Vec<String> {
     let mut hints = vec![
         "↑↓←→".to_string(),
@@ -1123,12 +1124,14 @@ fn results_hints(can_load_more: bool, background: bool) -> Vec<String> {
     if background {
         hints.push("b:全画面へ".to_string());
     }
+    hints.push("v:表示切替".to_string());
     hints
 }
 
 /// チャンネル一覧の案内。全部で 79 桁で 80 桁端末に収まる。
 /// タブの案内が長いので、矢印は結果一覧の案内に任せて落としてある。
 /// h はこのチャンネルごと隠す。バックグラウンド中だけ末尾に b (前面へ戻る) を足す。
+/// v (grid/list 切替) は 80 桁に入らないので、幅のある端末でだけ出る。
 fn channel_hints(background: bool) -> Vec<String> {
     let mut hints = vec![
         "Enter:再生".to_string(),
@@ -1143,6 +1146,7 @@ fn channel_hints(background: bool) -> Vec<String> {
     if background {
         hints.push("b:全画面へ".to_string());
     }
+    hints.push("v:表示切替".to_string());
     hints
 }
 
@@ -1162,7 +1166,7 @@ fn playlists_hints(background: bool) -> Vec<String> {
 }
 
 /// プレイリストの動画一覧の案内。タブが無いのでカテゴリの案内は出さない。
-/// Esc はプレイリスト一覧へ戻る。
+/// Esc はプレイリスト一覧へ戻る。v (grid/list 切替) は幅のある端末でだけ出る。
 fn playlist_hints(background: bool) -> Vec<String> {
     let mut hints = vec![
         "↑↓←→".to_string(),
@@ -1177,6 +1181,7 @@ fn playlist_hints(background: bool) -> Vec<String> {
     if background {
         hints.push("b:全画面へ".to_string());
     }
+    hints.push("v:表示切替".to_string());
     hints
 }
 
@@ -2340,6 +2345,58 @@ mod tests {
             80,
         );
         assert!(!narrow.contains("m:もっと見る"), "{narrow}");
+    }
+
+    #[test]
+    fn the_layout_toggle_hint_shows_up_once_there_is_room() {
+        let wide = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(wide.contains("v:表示切替"), "{wide}");
+
+        // 既存の案内だけでちょうど 80 桁が埋まるので、80 桁端末ではまだ出ない。
+        let narrow = help_80(Mode::Results, DisplayMode::Embedded);
+        assert!(!narrow.contains("v:表示切替"), "{narrow}");
+
+        let channel_wide = help_text(
+            Mode::Channel,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(channel_wide.contains("v:表示切替"), "{channel_wide}");
+
+        let playlist_wide = help_text(
+            Mode::Playlist,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(playlist_wide.contains("v:表示切替"), "{playlist_wide}");
+
+        // 対象外 (v1): サムネイルを持たないタイトルのみの一覧なので出さない。
+        let playlists_wide = help_text(
+            Mode::Playlists,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(!playlists_wide.contains("v:表示切替"), "{playlists_wide}");
     }
 
     #[test]
