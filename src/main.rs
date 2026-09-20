@@ -1,11 +1,13 @@
 mod actions;
 mod app;
+mod badge;
 mod category;
 mod clipboard;
 mod comments;
 mod cookies;
 mod display;
 mod download;
+mod engagement;
 mod fetch;
 mod geometry;
 mod grid;
@@ -89,10 +91,16 @@ fn install_mouse_panic_hook() {
 }
 
 /// 読んだ設定から画面側の初期状態を組む。環境変数の上書きもここで持ち回す。
-fn app_from(loaded: settings::Loaded, hidden: hidden::Hidden, resume: resume::Resume) -> App {
+fn app_from(
+    loaded: settings::Loaded,
+    hidden: hidden::Hidden,
+    resume: resume::Resume,
+    engagement: engagement::EngagementCache,
+) -> App {
     App {
         hidden,
         resume,
+        engagement,
         display: loaded.settings.display.mode,
         // 実際に効くかは最初の検索で分かる。ここでは指定の有無だけを持つ。
         cookies: CookieState::from_source(loaded.settings.cookies.clone()),
@@ -112,7 +120,12 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     spawn_input_reader(tx.clone());
 
     // 設定は起動時に一度だけ読む。読み替えたときは notice がステータス行に出る。
-    let mut app = app_from(settings::load(), hidden::load(), resume::load());
+    let mut app = app_from(
+        settings::load(),
+        hidden::load(),
+        resume::load(),
+        engagement::load(),
+    );
     if let Some(dir) = app.settings.thumbnails.dir() {
         thumbs::prune_cache(&dir, app.settings.thumbnails.max_cached);
     }
@@ -155,12 +168,15 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         session.comments_task.take(),
         session.channel_lookup_task.take(),
         session.oauth_task.take(),
+        session.engagement_task.take(),
     ]
     .into_iter()
     .flatten()
     {
         task.abort();
     }
+    // 書けなくても終了は止めない。次の起動で取り直すだけ。
+    let _ = engagement::save(&app.engagement);
     stop_playback(&mut session).await;
     // alt screen を抜ければ仕様上は消えるが、端末差を当てにしない。
     let mut out = Vec::new();
@@ -239,7 +255,14 @@ fn present_thumbs(
                 continue;
             };
             match video::placement(rect.image, cell, (image.width, image.height)) {
-                Some(at) => rgb::encode_image(image, at, &mut bytes),
+                Some(at) => {
+                    rgb::encode_image(image, at, &mut bytes);
+                    // 印はサムネイルより後に送る (画像は後から貼った方が上に出る)。
+                    if app.settings.engagement.enabled {
+                        let badges = badge::badges_for(&app.engagement, result);
+                        badge::encode(&badges, at, cell, &mut bytes);
+                    }
+                }
                 // セル寸法と噛み合わず描けなかった。次のフレームで取り直す
                 // (take_dirty は成否を見ずに消費済みなので、ここで戻さないと直らない)。
                 None => incomplete = true,
@@ -385,6 +408,7 @@ async fn handle_event(
             app.searching = false;
             apply_search_done(app, session, &target, report, requested_limit);
             actions::start_thumbnails(app, tx, session);
+            actions::start_engagement(app, tx, session);
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
@@ -448,9 +472,51 @@ async fn handle_event(
             result,
         } => apply_channel_lookup_with(app, tx, session, nonce, video_id, result, RealYtDlp),
         AppEvent::OauthDone { nonce, result } => apply_oauth_done(app, session, nonce, result),
+        AppEvent::EngagementReady {
+            nonce,
+            liked_videos,
+            asked_channels,
+            subscribed_channels,
+        } => apply_engagement_ready(
+            app,
+            session,
+            nonce,
+            liked_videos,
+            asked_channels,
+            subscribed_channels,
+        ),
         AppEvent::DownloadDone { nonce, notice } => {
             apply_download_done(app, session, nonce, notice)
         }
+    }
+}
+
+/// 問い合わせで分かったいいね済み/登録済みを控えへ写す。取れなかった側は触らない。
+fn apply_engagement_ready(
+    app: &mut App,
+    session: &mut Session,
+    nonce: u64,
+    liked_videos: Option<Vec<String>>,
+    asked_channels: Vec<String>,
+    subscribed_channels: Vec<String>,
+) {
+    if nonce != session.search_nonce {
+        return;
+    }
+    session.engagement_task = None;
+    let now = std::time::SystemTime::now();
+    let mut changed = false;
+    if let Some(liked) = liked_videos {
+        app.engagement.replace_liked(liked, now);
+        changed = true;
+    }
+    if !asked_channels.is_empty() {
+        app.engagement
+            .remember_channels(&asked_channels, &subscribed_channels, now);
+        changed = true;
+    }
+    if changed {
+        app.thumbs.mark_dirty();
     }
 }
 
@@ -492,6 +558,7 @@ fn apply_oauth_done(
         return;
     }
     session.oauth_task = None;
+    let action = session.oauth_action.take();
     // 失敗のときはエラーを出すだけでは「…中」が残るので、ここで畳む。
     if app
         .notice
@@ -501,8 +568,25 @@ fn apply_oauth_done(
         app.set_notice(None);
     }
     match result {
-        Ok(notice) => app.set_temporary_notice(notice, std::time::Instant::now()),
+        Ok(notice) => {
+            // 本家で確定したので、次の問い合わせを待たずに印を出す。
+            if let Some(action) = action {
+                remember_engagement(app, &action, std::time::SystemTime::now());
+                app.thumbs.mark_dirty();
+            }
+            app.set_temporary_notice(notice, std::time::Instant::now());
+        }
         Err(e) => app.set_error(Some(e)),
+    }
+}
+
+/// 送った操作の内容を控えへ写す。
+fn remember_engagement(app: &mut App, action: &oauth::Action, now: std::time::SystemTime) {
+    match action {
+        oauth::Action::Like(video_id) => app.engagement.remember_like(video_id, true, now),
+        oauth::Action::Subscribe(channel_id) => {
+            app.engagement.remember_subscription(channel_id, true, now)
+        }
     }
 }
 
@@ -1236,7 +1320,12 @@ mod tests {
                 ..settings::EnvOverrides::default()
             },
         );
-        let mut app = app_from(loaded, hidden::Hidden::default(), resume::Resume::default());
+        let mut app = app_from(
+            loaded,
+            hidden::Hidden::default(),
+            resume::Resume::default(),
+            engagement::EngagementCache::default(),
+        );
         assert_eq!(app.settings.cookies, None, "実行中は連携を切る");
 
         actions::save_settings_to(&mut app, Some(&path), std::time::Instant::now());
@@ -1263,6 +1352,7 @@ mod tests {
             loaded,
             hidden::load_from(Some(&path)),
             resume::Resume::default(),
+            engagement::EngagementCache::default(),
         );
 
         assert!(app.hidden.videos.contains("v1"), "起動時に読み込む");
@@ -1286,6 +1376,7 @@ mod tests {
             loaded,
             hidden::Hidden::default(),
             resume::load_from(Some(&path)),
+            engagement::EngagementCache::default(),
         );
 
         assert_eq!(app.resume.lookup("v1"), Some(42.0), "起動時に読み込む");
@@ -1659,6 +1750,92 @@ mod tests {
         assert_eq!(out, clear_bytes(), "リスト表示では貼らず、残骸だけ消す");
     }
 
+    /// `index` 番目のセルに貼られるサムネイルの配置。
+    fn thumb_placement(app: &App, index: usize) -> video::Placement {
+        let layout = ui::grid_layout(app, CELL).expect("格子を組める");
+        video::placement(layout.cells[index].image, CELL, (16, 16)).expect("置ける")
+    }
+
+    fn find(out: &[u8], needle: &[u8]) -> Option<usize> {
+        out.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// 印の送出列。判定は badge 側の実装を通す。
+    fn badge_bytes(badges: &[badge::Badge], at: video::Placement) -> Vec<u8> {
+        let mut out = Vec::new();
+        badge::encode(badges, at, CELL, &mut out);
+        out
+    }
+
+    #[test]
+    fn present_thumbs_overlays_a_badge_on_a_liked_thumbnail() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0", "id1", "id2", "id3"]);
+        app.engagement
+            .remember_like("id1", true, std::time::UNIX_EPOCH);
+        app.thumbs.mark_dirty();
+        let at = thumb_placement(&app, 1);
+
+        let out = thumbs_bytes(&mut app);
+
+        assert_eq!(count_images(&out), 5, "サムネイル 4 枚 + 印 1 個");
+        let badge = badge_bytes(&[badge::Badge::Liked], at);
+        let badge_at = find(&out, &badge).expect("いいね済みの印が無い");
+        let mut thumbnail = Vec::new();
+        rgb::encode_image(&thumb(), at, &mut thumbnail);
+        let thumbnail_at = find(&out, &thumbnail).expect("サムネイルが無い");
+        assert!(thumbnail_at < badge_at, "印が先だとサムネイルの下に隠れる");
+    }
+
+    #[test]
+    fn present_thumbs_overlays_both_badges_on_a_liked_video_of_a_subscribed_channel() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0", "id1", "id2", "id3"]);
+        app.results[1].channel_id = Some("UC1".to_string());
+        app.engagement
+            .remember_like("id1", true, std::time::UNIX_EPOCH);
+        app.engagement
+            .remember_subscription("UC1", true, std::time::UNIX_EPOCH);
+        app.thumbs.mark_dirty();
+        let at = thumb_placement(&app, 1);
+
+        let out = thumbs_bytes(&mut app);
+
+        assert_eq!(count_images(&out), 6, "サムネイル 4 枚 + 印 2 個");
+        let badges = badge_bytes(&[badge::Badge::Liked, badge::Badge::Subscribed], at);
+        assert!(find(&out, &badges).is_some(), "印が 2 個並んでいない");
+    }
+
+    #[test]
+    fn present_thumbs_writes_no_badge_when_the_engagement_setting_is_off() {
+        let mut app = thumb_app(4);
+        make_ready(&mut app, &["id0", "id1", "id2", "id3"]);
+        app.engagement
+            .remember_like("id1", true, std::time::UNIX_EPOCH);
+        app.settings.engagement.enabled = false;
+        app.thumbs.mark_dirty();
+
+        assert_eq!(count_images(&thumbs_bytes(&mut app)), 4, "印を出さない");
+    }
+
+    #[test]
+    fn present_thumbs_adds_the_badge_after_the_thumbnail_without_changing_it() {
+        let mut app = thumb_app(1);
+        make_ready(&mut app, &["id0"]);
+        let plain = thumbs_bytes(&mut app);
+
+        app.engagement
+            .remember_like("id0", true, std::time::UNIX_EPOCH);
+        app.thumbs.mark_dirty();
+        let out = thumbs_bytes(&mut app);
+
+        assert!(
+            out.starts_with(&plain),
+            "サムネイル側の送出列は変えず、後ろへ足すだけ"
+        );
+        assert_eq!(count_images(&out), 2);
+    }
+
     #[test]
     fn starting_playback_erases_the_thumbnails_from_the_screen() {
         let mut app = thumb_app(4);
@@ -1673,6 +1850,7 @@ mod tests {
             "song".to_string(),
             "https://www.youtube.com/watch?v=id0".to_string(),
             "id0".to_string(),
+            None,
             sink(),
         );
         let out = present(&mut session, &app);
@@ -2105,6 +2283,119 @@ mod tests {
             "走っている方の知らせを畳まない"
         );
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn a_like_shows_up_on_the_thumbnails_right_away() {
+        let mut app = App::default();
+        app.thumbs.take_dirty();
+        let mut session = Session {
+            oauth_action: Some(oauth::Action::Like("v1".to_string())),
+            ..Session::default()
+        };
+
+        apply_oauth_done(
+            &mut app,
+            &mut session,
+            0,
+            Ok(oauth::LIKED_NOTICE.to_string()),
+        );
+
+        assert!(app.engagement.is_liked("v1"));
+        assert!(app.thumbs.take_dirty(), "印を出すために貼り直す");
+        assert!(session.oauth_action.is_none(), "反映した操作は持ち越さない");
+    }
+
+    #[test]
+    fn a_subscription_shows_up_right_away() {
+        let mut app = App::default();
+        let mut session = Session {
+            oauth_action: Some(oauth::Action::Subscribe("UC1".to_string())),
+            ..Session::default()
+        };
+
+        apply_oauth_done(
+            &mut app,
+            &mut session,
+            0,
+            Ok(oauth::SUBSCRIBED_NOTICE.to_string()),
+        );
+
+        assert_eq!(app.engagement.is_subscribed("UC1"), Some(true));
+    }
+
+    #[test]
+    fn a_failed_operation_does_not_touch_the_engagement_cache() {
+        let mut app = App::default();
+        let mut session = Session {
+            oauth_action: Some(oauth::Action::Like("v1".to_string())),
+            ..Session::default()
+        };
+
+        apply_oauth_done(&mut app, &mut session, 0, Err("拒否されました".to_string()));
+
+        assert!(!app.engagement.is_liked("v1"));
+    }
+
+    #[test]
+    fn the_state_check_result_lands_in_the_cache() {
+        let mut app = App::default();
+        app.thumbs.take_dirty();
+        let mut session = Session::default();
+
+        apply_engagement_ready(
+            &mut app,
+            &mut session,
+            0,
+            Some(vec!["v1".to_string()]),
+            vec!["UC1".to_string(), "UC2".to_string()],
+            vec!["UC2".to_string()],
+        );
+
+        assert!(app.engagement.is_liked("v1"));
+        assert_eq!(app.engagement.is_subscribed("UC1"), Some(false));
+        assert_eq!(app.engagement.is_subscribed("UC2"), Some(true));
+        assert!(app.thumbs.take_dirty());
+    }
+
+    #[test]
+    fn a_state_check_result_from_the_previous_search_is_dropped() {
+        let mut app = App::default();
+        let mut session = Session {
+            search_nonce: 2,
+            ..Session::default()
+        };
+
+        apply_engagement_ready(
+            &mut app,
+            &mut session,
+            1,
+            Some(vec!["v1".to_string()]),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(!app.engagement.is_liked("v1"));
+    }
+
+    #[test]
+    fn the_engagement_cache_is_read_at_startup() {
+        let dir =
+            std::env::temp_dir().join(format!("tuitube-main-engagement-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("engagement.json");
+        std::fs::write(&path, r#"{"liked_videos":["v1"]}"#).expect("書ける");
+
+        let loaded = settings::load_from(None, settings::EnvOverrides::default());
+        let app = app_from(
+            loaded,
+            hidden::Hidden::default(),
+            resume::Resume::default(),
+            engagement::load_from(Some(&path)),
+        );
+
+        assert!(app.engagement.is_liked("v1"), "起動時に読み込む");
     }
 
     #[tokio::test]

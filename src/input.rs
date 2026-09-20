@@ -8,8 +8,8 @@ use crate::actions::{
     open_channel, open_download, open_settings, reload_channel_tab, reload_tab,
     remember_playback_position, reset_speed, save_settings, scroll_comments, seek_absolute,
     seek_relative, select_channel_tab, select_tab, send_to_player, start_download, start_playback,
-    start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
-    toggle_comments, toggle_subtitles,
+    start_search, stop_playback, subscribe_channel, subscribe_playing_channel, switch_channel_tab,
+    switch_tab, toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -440,8 +440,11 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     if key.code == KeyCode::Char('o') {
         toggle_comments(app, session);
     }
-    if key.code == KeyCode::Char('l') {
-        like_video(app, tx, session, deps);
+    // deps は一度しか渡せないので、OAuth を使う操作は 1 つの match にまとめる。
+    match key.code {
+        KeyCode::Char('l') => like_video(app, tx, session, deps),
+        KeyCode::Char('u') => subscribe_playing_channel(app, tx, session, deps),
+        _ => {}
     }
     if key.code == KeyCode::Char('d') {
         open_download(app, session);
@@ -464,7 +467,7 @@ pub async fn handle_mouse(
         return;
     }
     match app.mode {
-        Mode::Playing => handle_mouse_playing(app, mouse, session).await,
+        Mode::Playing => handle_mouse_playing(app, mouse, tx, session).await,
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
         Mode::Channel => handle_mouse_channel(app, mouse, tx, session).await,
         Mode::Input => handle_mouse_input(app, mouse, tx, session),
@@ -560,7 +563,30 @@ async fn handle_mouse_channel(
     }
 }
 
-async fn handle_mouse_playing(app: &mut App, mouse: MouseEvent, session: &mut Session) {
+async fn handle_mouse_playing(
+    app: &mut App,
+    mouse: MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    handle_mouse_playing_with(app, mouse, tx, session, Oauth::real()).await;
+}
+
+async fn handle_mouse_playing_with<B: oauth::Backend + 'static>(
+    app: &mut App,
+    mouse: MouseEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+) {
+    // アイコンの上での押し込みはシークにしない。外れたら下のシーク処理へ渡す。
+    if let Some(kind) = playing_action_click(app, mouse) {
+        match kind {
+            ui::ActionKind::Like => like_video(app, tx, session, deps),
+            ui::ActionKind::Subscribe => subscribe_playing_channel(app, tx, session, deps),
+        }
+        return;
+    }
     let Some(input) = mouse_input(mouse.kind) else {
         return;
     };
@@ -578,6 +604,15 @@ async fn handle_mouse_playing(app: &mut App, mouse: MouseEvent, session: &mut Se
     };
     let target = layout.seconds_at(column, duration);
     seek_absolute(app, session, target, std::time::Instant::now()).await;
+}
+
+/// アクション行を押し込んだときの操作。押し込み以外は None
+/// (移動はシークバーの hover に渡す必要がある)。
+fn playing_action_click(app: &App, mouse: MouseEvent) -> Option<ui::ActionKind> {
+    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        return None;
+    }
+    ui::action_at_point(app, mouse.column, mouse.row)
 }
 
 /// 左ボタンと移動だけ。それ以外は None。
@@ -661,7 +696,7 @@ mod tests {
         }
     }
 
-    /// 80x24 の端末で再生中。バー行は y=21、トラック 65 セルで 1 セル 10 秒。
+    /// 80x24 の端末で再生中。バー行は y=20、トラック 65 セルで 1 セル 10 秒。
     fn playing_app() -> App {
         App {
             mode: Mode::Playing,
@@ -765,7 +800,7 @@ mod tests {
         assert!(!app.comments.visible());
     }
 
-    /// 上限まで取れた再生画面。1 件 2 行なので 80x24 の枠 (内側 19 行) には収まらない。
+    /// 上限まで取れた再生画面。1 件 2 行なので 80x24 の枠 (内側 18 行) には収まらない。
     fn commented_app() -> App {
         let mut app = playing_app();
         app.comments.begin("abc".to_string());
@@ -785,9 +820,9 @@ mod tests {
         let (tx, _rx) = channel();
         let mut session = Session::default();
         let mut app = commented_app();
-        // 50 件 = 100 行を 19 行の枠で見る。
+        // 50 件 = 100 行を 18 行の枠で見る。
         let lines = 2 * crate::comments::COMMENT_LIMIT;
-        let height = 19;
+        let height = 18;
 
         // 閉じている間の ↑↓ は音量のままで、一覧は動かない。
         handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
@@ -1517,6 +1552,137 @@ mod tests {
         }
     }
 
+    /// チャンネル ID を引き継いだ再生。アクション行に登録ラベルが出る状態。
+    fn playing_channel_app() -> App {
+        let mut app = playing_url_app();
+        app.playback.channel_id = Some("UC1".to_string());
+        app
+    }
+
+    async fn press_while_playing(app: &mut App, code: KeyCode, session: &mut Session) {
+        let (tx, _rx) = channel();
+        handle_key_playing_with(
+            app,
+            key(code),
+            &tx,
+            session,
+            FakeClipboard::new(CopyResult::Ok),
+            fake_oauth(),
+            Some(&temp_config("scratch")),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn u_while_playing_subscribes_to_the_channel_of_the_video() {
+        let mut session = Session::default();
+        let mut app = playing_channel_app();
+
+        press_while_playing(&mut app, KeyCode::Char('u'), &mut session).await;
+
+        assert_eq!(app.notice.as_deref(), Some(crate::oauth::SUBSCRIBE_NOTICE));
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Subscribe("UC1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn u_does_nothing_without_a_channel_id() {
+        let mut session = Session::default();
+        // playing_url_app はチャンネル ID を持たない。
+        let mut app = playing_url_app();
+
+        press_while_playing(&mut app, KeyCode::Char('u'), &mut session).await;
+
+        assert!(session.oauth_task.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn l_and_u_ask_for_different_actions() {
+        let mut session = Session::default();
+        let mut app = playing_channel_app();
+
+        press_while_playing(&mut app, KeyCode::Char('l'), &mut session).await;
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Like("abc".to_string()))
+        );
+
+        press_while_playing(&mut app, KeyCode::Char('u'), &mut session).await;
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Subscribe("UC1".to_string()))
+        );
+    }
+
+    /// アクション行 (80x24 の端末では y=21) の押し込み。
+    fn action_click(column: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, 21)
+    }
+
+    async fn click_while_playing(app: &mut App, event: MouseEvent, session: &mut Session) {
+        let (tx, _rx) = channel();
+        handle_mouse_playing_with(app, event, &tx, session, fake_oauth()).await;
+    }
+
+    #[tokio::test]
+    async fn clicking_the_like_icon_likes_instead_of_seeking() {
+        let mut session = Session::default();
+        let mut app = playing_channel_app();
+
+        click_while_playing(&mut app, action_click(0), &mut session).await;
+
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Like("abc".to_string()))
+        );
+        assert_eq!(app.playback.time_pos, Some(0.0), "シークは走らない");
+        assert_eq!(app.seek_bar.drag, None);
+    }
+
+    #[tokio::test]
+    async fn clicking_the_subscribe_icon_subscribes() {
+        let mut session = Session::default();
+        let mut app = playing_channel_app();
+        // いいねラベルと区切りの右。
+        let column = crate::grid::display_width(ui::ActionKind::Like.label()) as u16 + 2;
+
+        click_while_playing(&mut app, action_click(column), &mut session).await;
+
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Subscribe("UC1".to_string()))
+        );
+        assert_eq!(app.playback.time_pos, Some(0.0), "シークは走らない");
+    }
+
+    #[tokio::test]
+    async fn a_click_next_to_the_icons_does_nothing() {
+        let mut session = Session::default();
+        let mut app = playing_channel_app();
+
+        click_while_playing(&mut app, action_click(70), &mut session).await;
+
+        assert!(session.oauth_action.is_none());
+        assert_eq!(app.playback.time_pos, Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn the_seek_bar_still_answers_clicks_with_the_action_row_in_place() {
+        let mut session = Session::default();
+        let mut app = playing_channel_app();
+
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
+        click_while_playing(&mut app, down, &mut session).await;
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
+        click_while_playing(&mut app, up, &mut session).await;
+
+        assert_eq!(app.playback.time_pos, Some(130.0));
+        assert!(session.oauth_action.is_none(), "いいねは走らない");
+    }
+
     #[tokio::test]
     async fn l_is_a_plain_character_outside_of_playback() {
         let (tx, _rx) = channel();
@@ -1626,9 +1792,9 @@ mod tests {
         let mut session = Session::default();
         let mut app = playing_app();
 
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
         handle_mouse(&mut app, down, &tx, &mut session).await;
-        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 21);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
         handle_mouse(&mut app, up, &tx, &mut session).await;
 
         assert_eq!(app.playback.time_pos, Some(130.0));
@@ -1644,15 +1810,15 @@ mod tests {
         let mut session = Session::default();
         let mut app = playing_app();
 
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
         handle_mouse(&mut app, down, &tx, &mut session).await;
         // ドラッグ中の右クリックでシークが飛ばない。左ドラッグはそのまま続く。
-        let other = mouse(MouseEventKind::Up(MouseButton::Right), 40, 21);
+        let other = mouse(MouseEventKind::Up(MouseButton::Right), 40, 20);
         handle_mouse(&mut app, other, &tx, &mut session).await;
         assert_eq!(app.playback.time_pos, Some(0.0));
         assert_eq!(app.seek_bar.drag, Some(0));
 
-        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 21);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
         handle_mouse(&mut app, up, &tx, &mut session).await;
         assert_eq!(app.playback.time_pos, Some(130.0));
         assert_eq!(app.seek_bar.drag, None);
@@ -1668,9 +1834,9 @@ mod tests {
         };
 
         // シークバーの行を押しても再生位置は動かない。
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
         handle_mouse(&mut app, down, &tx, &mut session).await;
-        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 21);
+        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
         handle_mouse(&mut app, up, &tx, &mut session).await;
 
         assert_eq!(app.seek_bar, SeekBarState::default());
@@ -3192,7 +3358,7 @@ mod tests {
             mode: Mode::Settings,
             ..playing_app()
         };
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 21);
+        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
         handle_mouse(&mut app, down, &tx, &mut session).await;
         // 設定画面ではタブ行の桁も設定一覧の一部なので、クリックでタブを移さない。
         handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;

@@ -317,11 +317,12 @@ pub fn seek_absolute(seconds: f64) -> MpvCommand;
 `src/ui.rs`
 
 ```rust
-fn playing_areas(area: Rect) -> [Rect; 4];
+fn playing_areas(area: Rect) -> [Rect; 5];
 pub fn video_area(area: Rect) -> Rect;      // [0]
 pub fn seek_bar_area(area: Rect) -> Rect;   // [1]
-pub fn status_area(area: Rect) -> Rect;     // [2]
-pub fn help_area(area: Rect) -> Rect;       // [3]
+pub fn action_area(area: Rect) -> Rect;     // [2] (#65 で追加)
+pub fn status_area(area: Rect) -> Rect;     // [3]
+pub fn help_area(area: Rect) -> Rect;       // [4]
 /// 描画とヒットテストが共有する割り付け。
 pub fn seek_bar_layout(app: &App) -> SeekBarLayout;
 ```

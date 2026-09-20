@@ -1,4 +1,5 @@
 use crate::app::{App, ChannelView, DownloadField, Mode, format_time};
+use crate::badge;
 use crate::comments;
 use crate::display::DisplayMode;
 use crate::geometry::cell_size;
@@ -17,10 +18,11 @@ fn window_placeholder(display: DisplayMode) -> String {
     format!("別ウィンドウで再生中  w: {}へ", display.next().label())
 }
 
-/// 再生中は [映像, シークバー, ステータス, ヘルプ] の4段。映像に残り全体を渡す。
-fn playing_areas(area: Rect) -> [Rect; 4] {
+/// 再生中は [映像, シークバー, アクション, ステータス, ヘルプ] の5段。映像に残り全体を渡す。
+fn playing_areas(area: Rect) -> [Rect; 5] {
     Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -71,14 +73,19 @@ pub fn seek_bar_area(area: Rect) -> Rect {
     playing_areas(area)[1]
 }
 
+/// いいね・チャンネル登録の行。クリック位置から操作を求めるときもこの矩形を使う。
+pub fn action_area(area: Rect) -> Rect {
+    playing_areas(area)[2]
+}
+
 /// 再生状態を出す行。
 pub fn status_area(area: Rect) -> Rect {
-    playing_areas(area)[2]
+    playing_areas(area)[3]
 }
 
 /// 操作説明の行。
 pub fn help_area(area: Rect) -> Rect {
-    playing_areas(area)[3]
+    playing_areas(area)[4]
 }
 
 /// コメント一覧の枠の内側。描画と送り幅が同じ寸法を数える。
@@ -692,8 +699,19 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|r| {
             let uploader = r.uploader.as_deref().unwrap_or("-");
+            // サムネイルを描かない list 表示では present_thumbs のバッジ (#66) が
+            // 乗らないので、行の文字に印を足す。
+            let marks: String = badge::badges_for(&app.engagement, r)
+                .iter()
+                .map(|b| b.symbol())
+                .collect();
+            let prefix = if marks.is_empty() {
+                String::new()
+            } else {
+                format!("{marks} ")
+            };
             ListItem::new(format!(
-                "{}  {}  [{}]",
+                "{prefix}{}  {}  [{}]",
                 format_time(r.duration),
                 r.title,
                 uploader
@@ -730,6 +748,7 @@ fn draw_playing(frame: &mut Frame, app: &App) {
         }
     }
     draw_seek_bar(frame, app, area);
+    draw_actions(frame, app, action_area(area));
     draw_footer(frame, app, status_area(area), help_area(area));
 }
 
@@ -800,6 +819,113 @@ fn draw_seek_bar(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(bar, seek_bar_area(area));
 }
 
+/// アクション行に出す操作。キーでもクリックでも同じものを指す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    Like,
+    Subscribe,
+}
+
+/// ラベルの区切り。
+const ACTION_GAP: &str = "  ";
+
+impl ActionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ActionKind::Like => "♥いいね",
+            ActionKind::Subscribe => "＋登録",
+        }
+    }
+
+    /// 済みのときの色。未は一律 Color::Gray。
+    fn done_color(self) -> Color {
+        match self {
+            ActionKind::Like => Color::Red,
+            ActionKind::Subscribe => Color::Green,
+        }
+    }
+}
+
+/// アクション行に左から並ぶもの。描画とクリックの当たり判定が同じ並びを通るように、
+/// 幅の食い方はここだけで決める。
+enum ActionPiece {
+    Gap,
+    Label { kind: ActionKind, done: bool },
+}
+
+impl ActionPiece {
+    fn text(&self) -> &'static str {
+        match self {
+            ActionPiece::Gap => ACTION_GAP,
+            ActionPiece::Label { kind, .. } => kind.label(),
+        }
+    }
+}
+
+fn action_pieces(app: &App) -> Vec<ActionPiece> {
+    let mut pieces = vec![ActionPiece::Label {
+        kind: ActionKind::Like,
+        done: app.engagement.is_liked(&app.playback.id),
+    }];
+    // チャンネル ID の無い行から始めた再生では押せないので、登録は並べない。
+    if let Some(channel_id) = app.playback.channel_id.as_deref() {
+        pieces.push(ActionPiece::Gap);
+        pieces.push(ActionPiece::Label {
+            kind: ActionKind::Subscribe,
+            // 未確認 (None) は未登録と同じ見た目にする。
+            done: app.engagement.is_subscribed(channel_id).unwrap_or(false),
+        });
+    }
+    pieces
+}
+
+fn action_spans(app: &App) -> Vec<Span<'static>> {
+    action_pieces(app)
+        .into_iter()
+        .map(|piece| match piece {
+            ActionPiece::Gap => Span::raw(ACTION_GAP),
+            ActionPiece::Label { kind, done } => {
+                let style = if done {
+                    Style::default()
+                        .fg(kind.done_color())
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                Span::styled(kind.label(), style)
+            }
+        })
+        .collect()
+}
+
+fn draw_actions(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Paragraph::new(Line::from(action_spans(app))), area);
+}
+
+/// アクション行の `column` 桁にある操作。区切りの上では None。
+fn action_at_column(app: &App, column: usize) -> Option<ActionKind> {
+    let mut x = 0;
+    for piece in action_pieces(app) {
+        let cells = grid::display_width(piece.text());
+        if let ActionPiece::Label { kind, .. } = piece
+            && (x..x + cells).contains(&column)
+        {
+            return Some(kind);
+        }
+        x += cells;
+    }
+    None
+}
+
+/// 画面のこの位置にある操作。アクション行の外や区切りの上では None。
+pub fn action_at_point(app: &App, column: u16, row: u16) -> Option<ActionKind> {
+    let area = action_area(app.screen);
+    if !area.contains(Position::new(column, row)) {
+        return None;
+    }
+    action_at_column(app, (column - area.x) as usize)
+}
+
 /// 終了確認 (y/N) の案内。エラーと同じ赤で目立たせる。
 const CONFIRM_QUIT_STATUS: &str = "終了しますか？ (y/N)";
 
@@ -848,6 +974,7 @@ fn help_line(app: &App, width: u16) -> String {
         app.comments.visible(),
         app.can_load_more(),
         app.background,
+        app.playback.channel_id.is_some(),
         width,
     )
 }
@@ -874,13 +1001,14 @@ fn help_text(
     comments_open: bool,
     can_load_more: bool,
     background: bool,
+    can_subscribe: bool,
     width: u16,
 ) -> String {
     let hints = match mode {
         Mode::Input => input_hints(background),
         Mode::Results => results_hints(can_load_more, background),
         Mode::Channel => channel_hints(background),
-        Mode::Playing => playing_hints(display, comments_open),
+        Mode::Playing => playing_hints(display, comments_open, can_subscribe),
         Mode::Settings => settings_hints(),
         Mode::Download => download_hints(),
     };
@@ -990,8 +1118,8 @@ fn settings_typing_hints() -> Vec<String> {
 /// 再生中の案内。全部で 130 桁ほどあり 80 桁端末には入らないので、
 /// 落ちて困らないものを後ろに置く。先頭 7 つは最も幅を食う w:別ウィンドウとコメント表示中でも
 /// 77 桁に収まる。
-fn playing_hints(display: DisplayMode, comments_open: bool) -> Vec<String> {
-    vec![
+fn playing_hints(display: DisplayMode, comments_open: bool, can_subscribe: bool) -> Vec<String> {
+    let mut hints = vec![
         "space:一時停止".to_string(),
         "←→:シーク".to_string(),
         // コメント表示中の ↑↓ は一覧送りに使う。
@@ -1004,13 +1132,21 @@ fn playing_hints(display: DisplayMode, comments_open: bool) -> Vec<String> {
         format!("w:{}", display.next().label()),
         "Esc:停止".to_string(),
         "q:終了".to_string(),
+        "♥l:いいね".to_string(),
+    ];
+    // チャンネル ID の無い再生では押しても何も起きないので、案内も出さない。
+    if can_subscribe {
+        hints.push("＋u:登録".to_string());
+    }
+    hints.extend([
         "s:字幕".to_string(),
         "o:コメント".to_string(),
         "[ ]:速度±0.1".to_string(),
         "BS:等速".to_string(),
         "クリック:シーク".to_string(),
         "b:検索へ".to_string(),
-    ]
+    ]);
+    hints
 }
 
 /// 幅に入るところまでを空白 1 つでつなぐ。help は折り返さないので、
@@ -1035,6 +1171,7 @@ fn fit_hints(hints: &[String], width: usize) -> String {
 mod tests {
     use super::*;
     use crate::app::{ChannelView, Playback};
+    use crate::badge::Badge;
     use crate::category::Tabs;
     use crate::search::SearchResult;
     use crate::seekbar::SeekBarState;
@@ -1286,13 +1423,21 @@ mod tests {
 
     /// 80 桁端末のヘルプ。案内が落ちるかどうかはここで決まる。
     fn help_80(mode: Mode, display: DisplayMode) -> String {
-        help_text(mode, display, false, false, false, 80)
+        help_text(mode, display, false, false, false, false, 80)
     }
 
     #[test]
     fn input_help_mentions_the_editing_keys() {
         // 既存の案内で 80 桁が埋まっているので、編集キーは幅のある端末でだけ出る。
-        let help = help_text(Mode::Input, DisplayMode::Embedded, false, false, false, 140);
+        let help = help_text(
+            Mode::Input,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            140,
+        );
         for key in [
             "Ctrl+A:全選択",
             "Shift+←→:選択",
@@ -1327,8 +1472,8 @@ mod tests {
     fn video_area_layout_is_unchanged_by_the_text_mode() {
         // 文字ブロックは映像と同じ矩形に描くので、割り付けはモードで変わらない。
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
-        assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 20));
+        assert_eq!(seek_bar_area(area), Rect::new(0, 20, 80, 1));
     }
 
     #[test]
@@ -1337,6 +1482,7 @@ mod tests {
         let help = help_text(
             Mode::Playing,
             DisplayMode::Embedded,
+            false,
             false,
             false,
             false,
@@ -1351,8 +1497,8 @@ mod tests {
     fn video_area_layout_is_unchanged_by_the_display_mode() {
         // プレースホルダは映像と同じ矩形に描くので、割り付けはモードで変わらない。
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
-        assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 20));
+        assert_eq!(seek_bar_area(area), Rect::new(0, 20, 80, 1));
     }
 
     #[test]
@@ -1413,7 +1559,7 @@ mod tests {
             display,
             screen: Rect::new(0, 0, 80, 24),
             video: Some(VideoSink::new(Geometry::new(
-                Rect::new(0, 0, 80, 21),
+                Rect::new(0, 0, 80, 20),
                 crate::video::FALLBACK_CELL,
                 crate::video::MAX_FRAME_PIXELS,
             ))),
@@ -1943,6 +2089,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             80,
         );
         for key in ["Enter:再生", "Tab:", "Esc", "q:終了"] {
@@ -1993,6 +2140,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             200,
         );
         assert!(!help.contains("m:もっと見る"), "{help}");
@@ -2006,12 +2154,21 @@ mod tests {
             false,
             true,
             false,
+            false,
             200,
         );
         assert!(wide.contains("m:もっと見る"), "{wide}");
 
         // 既存の案内だけでちょうど 80 桁が埋まるので、80 桁端末ではまだ出ない。
-        let narrow = help_text(Mode::Results, DisplayMode::Embedded, false, true, false, 80);
+        let narrow = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            true,
+            false,
+            false,
+            80,
+        );
         assert!(!narrow.contains("m:もっと見る"), "{narrow}");
     }
 
@@ -2023,6 +2180,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             200,
         );
         assert!(!hidden.contains("b:全画面へ"), "{hidden}");
@@ -2033,6 +2191,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             200,
         );
         assert!(shown.contains("b:全画面へ"), "{shown}");
@@ -2040,6 +2199,7 @@ mod tests {
         let hidden = help_text(
             Mode::Channel,
             DisplayMode::Embedded,
+            false,
             false,
             false,
             false,
@@ -2053,14 +2213,31 @@ mod tests {
             false,
             false,
             true,
+            false,
             200,
         );
         assert!(shown.contains("b:全画面へ"), "{shown}");
 
-        let hidden = help_text(Mode::Input, DisplayMode::Embedded, false, false, false, 200);
+        let hidden = help_text(
+            Mode::Input,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
         assert!(!hidden.contains("Ctrl+B"), "{hidden}");
 
-        let shown = help_text(Mode::Input, DisplayMode::Embedded, false, false, true, 200);
+        let shown = help_text(
+            Mode::Input,
+            DisplayMode::Embedded,
+            false,
+            false,
+            true,
+            false,
+            200,
+        );
         assert!(shown.contains("Ctrl+B:全画面へ"), "{shown}");
     }
 
@@ -2069,6 +2246,7 @@ mod tests {
         let help = help_text(
             Mode::Playing,
             DisplayMode::Embedded,
+            false,
             false,
             false,
             false,
@@ -2159,6 +2337,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_list_view_marks_liked_and_subscribed_rows() {
+        // list 表示はサムネイルを描かないので、present_thumbs のバッジ (#66) が
+        // 乗らない。行のテキストに印を足して、ここでも分かるようにする。
+        let mut app = grid_app(2);
+        app.settings.search.layout = LayoutMode::List;
+        app.results[0].channel_id = Some("UC1".to_string());
+        app.engagement
+            .remember_like("id0", true, std::time::SystemTime::now());
+        app.engagement
+            .remember_subscription("UC1", true, std::time::SystemTime::now());
+
+        let text = rendered(&app, 80, 24);
+        let line0 = text
+            .lines()
+            .find(|line| line.contains("title 0"))
+            .expect("1 行目がある");
+        assert!(line0.contains(Badge::Liked.symbol()), "{line0}");
+        assert!(line0.contains(Badge::Subscribed.symbol()), "{line0}");
+        // 印の無い行 (id1) には記号を出さない。
+        let line1 = text
+            .lines()
+            .find(|line| line.contains("title 1"))
+            .expect("2 行目がある");
+        assert!(!line1.contains(Badge::Liked.symbol()), "{line1}");
     }
 
     #[test]
@@ -2302,10 +2507,143 @@ mod tests {
     #[test]
     fn playing_rows_do_not_overlap_the_video() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 21));
-        assert_eq!(seek_bar_area(area), Rect::new(0, 21, 80, 1));
+        assert_eq!(video_area(area), Rect::new(0, 0, 80, 20));
+        assert_eq!(seek_bar_area(area), Rect::new(0, 20, 80, 1));
+        assert_eq!(action_area(area), Rect::new(0, 21, 80, 1));
         assert_eq!(status_area(area), Rect::new(0, 22, 80, 1));
         assert_eq!(help_area(area), Rect::new(0, 23, 80, 1));
+    }
+
+    /// 再生中のアクション行を見るための 80x24 の App。
+    fn action_app(channel_id: Option<&str>) -> App {
+        App {
+            mode: Mode::Playing,
+            screen: Rect::new(0, 0, 80, 24),
+            playback: Playback {
+                id: "v1".to_string(),
+                channel_id: channel_id.map(str::to_string),
+                ..Playback::default()
+            },
+            ..App::default()
+        }
+    }
+
+    /// アクション行で `text` を含むラベルの style。
+    fn action_style(app: &App, text: &str) -> Style {
+        action_spans(app)
+            .into_iter()
+            .find(|span| span.content.contains(text))
+            .expect("ラベルがある")
+            .style
+    }
+
+    #[test]
+    fn the_action_row_shows_the_like_and_the_subscribe_label() {
+        let app = action_app(Some("UC1"));
+        let row = drawn_row(&app, action_area(app.screen).y);
+        assert!(row.contains("いいね"), "{row}");
+        assert!(row.contains("登録"), "{row}");
+    }
+
+    #[test]
+    fn the_action_row_hides_the_subscribe_label_without_a_channel_id() {
+        // チャンネル ID の無い行から始めた再生では押せないので、印も出さない。
+        let app = action_app(None);
+        let row = drawn_row(&app, action_area(app.screen).y);
+        assert!(row.contains("いいね"), "{row}");
+        assert!(!row.contains("登録"), "{row}");
+    }
+
+    #[test]
+    fn a_done_action_is_colored_and_an_undone_one_is_gray() {
+        let gray = Style::default().fg(Color::Gray);
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        let mut app = action_app(Some("UC1"));
+        assert_eq!(action_style(&app, "いいね"), gray);
+        assert_eq!(
+            action_style(&app, "登録"),
+            gray,
+            "未確認は未登録と同じ見た目"
+        );
+
+        app.engagement.remember_subscription("UC1", false, now);
+        assert_eq!(action_style(&app, "登録"), gray);
+
+        app.engagement.remember_like("v1", true, now);
+        app.engagement.remember_subscription("UC1", true, now);
+        assert_ne!(action_style(&app, "いいね"), gray);
+        assert_ne!(action_style(&app, "登録"), gray);
+    }
+
+    #[test]
+    fn the_action_hit_test_agrees_with_the_drawn_row() {
+        for channel_id in [None, Some("UC1")] {
+            let app = action_app(channel_id);
+            // 描いた行を左から辿り、各桁がどの操作の上かを並べる。
+            let mut columns: Vec<Option<ActionKind>> = Vec::new();
+            for piece in action_pieces(&app) {
+                let cells = grid::display_width(piece.text());
+                let kind = match piece {
+                    ActionPiece::Label { kind, .. } => Some(kind),
+                    ActionPiece::Gap => None,
+                };
+                columns.extend(std::iter::repeat_n(kind, cells));
+            }
+            for column in 0..columns.len() + 2 {
+                assert_eq!(
+                    action_at_column(&app, column),
+                    columns.get(column).copied().flatten(),
+                    "{channel_id:?} / {column} 桁目"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_action_row_answers_the_action_hit_test() {
+        let app = action_app(Some("UC1"));
+        let row = action_area(app.screen).y;
+        assert_eq!(action_at_point(&app, 0, row), Some(ActionKind::Like));
+        let subscribe_x = grid::display_width(ActionKind::Like.label()) as u16 + 2;
+        assert_eq!(
+            action_at_point(&app, subscribe_x, row),
+            Some(ActionKind::Subscribe)
+        );
+        for other in [0u16, 1, row - 1, row + 1, 23] {
+            assert_eq!(
+                action_at_point(&app, 0, other),
+                None,
+                "{other} 行目はアクション行でない"
+            );
+        }
+    }
+
+    #[test]
+    fn playing_help_mentions_the_like_and_the_subscribe_key() {
+        // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
+        let wide = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            true,
+            200,
+        );
+        assert!(wide.contains("l:いいね"), "{wide}");
+        assert!(wide.contains("u:登録"), "{wide}");
+
+        let no_channel = help_text(
+            Mode::Playing,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(no_channel.contains("l:いいね"), "{no_channel}");
+        assert!(!no_channel.contains("u:登録"), "{no_channel}");
     }
 
     #[test]
@@ -2339,6 +2677,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             200,
         );
         assert!(wide.contains("クリック:シーク"), "{wide}");
@@ -2349,11 +2688,20 @@ mod tests {
             false,
             false,
             false,
+            false,
             30,
         );
         assert_eq!(narrow, "space:一時停止 ←→:シーク");
         assert_eq!(
-            help_text(Mode::Playing, DisplayMode::Embedded, false, false, false, 0),
+            help_text(
+                Mode::Playing,
+                DisplayMode::Embedded,
+                false,
+                false,
+                false,
+                false,
+                0
+            ),
             ""
         );
     }
@@ -2364,6 +2712,7 @@ mod tests {
         let wide = help_text(
             Mode::Playing,
             DisplayMode::Embedded,
+            false,
             false,
             false,
             false,
@@ -2449,6 +2798,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 0
             ),
             ""
@@ -2461,6 +2811,7 @@ mod tests {
         let narrow = help_text(
             Mode::Settings,
             DisplayMode::Embedded,
+            false,
             false,
             false,
             false,
@@ -2671,6 +3022,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             200,
         );
         assert!(wide.contains("o:コメント"), "{wide}");
@@ -2684,6 +3036,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             200,
         );
         assert!(open.contains("↑↓:行送り"), "{open}");
@@ -2695,12 +3048,13 @@ mod tests {
             false,
             false,
             false,
+            false,
             200,
         );
         assert!(closed.contains("↑↓:音量"), "{closed}");
     }
 
-    /// 1 件 2 行なので、80x24 の枠 (内側 19 行) には 9 件と少ししか入らない。
+    /// 1 件 2 行なので、80x24 の枠 (内側 18 行) には 9 件と少ししか入らない。
     fn many_comments(count: usize) -> App {
         commented_app(
             (0..count)
@@ -2738,7 +3092,7 @@ mod tests {
     fn the_comment_viewport_is_the_inside_of_the_frame() {
         let screen = Rect::new(0, 0, 80, 24);
         let view = comments_viewport(screen);
-        assert_eq!(view, Rect::new(1, 1, 78, 19));
+        assert_eq!(view, Rect::new(1, 1, 78, 18));
     }
 
     #[test]
@@ -2748,6 +3102,7 @@ mod tests {
             help_text(
                 Mode::Playing,
                 DisplayMode::Embedded,
+                false,
                 false,
                 false,
                 false,

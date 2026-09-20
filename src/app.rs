@@ -2,6 +2,7 @@ use crate::category::{TabState, Tabs};
 use crate::comments::{Comment, Comments};
 use crate::cookies::{ChannelTab, CookieState, Target};
 use crate::display::{DisplayMode, FpsCap};
+use crate::engagement::EngagementCache;
 use crate::hidden::Hidden;
 use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
@@ -95,6 +96,14 @@ pub enum AppEvent {
     OauthDone {
         nonce: u64,
         result: Result<String, String>,
+    },
+    /// いいね済み/登録済みの問い合わせが返った。取れなかった側は
+    /// liked_videos = None / asked_channels 空で、その分の控えを触らない。
+    EngagementReady {
+        nonce: u64,
+        liked_videos: Option<Vec<String>>,
+        asked_channels: Vec<String>,
+        subscribed_channels: Vec<String>,
     },
     /// ダウンロードが終わった。Ok は set_temporary_notice、Err は set_error へ渡す文言。
     DownloadDone {
@@ -507,6 +516,8 @@ pub struct Playback {
     pub url: String,
     /// 再生中の動画 ID。再開位置を記憶するときの検索キー。
     pub id: String,
+    /// 投稿チャンネルの ID。チャンネルタブ経由の行には無いので None もある。
+    pub channel_id: Option<String>,
     pub paused: Option<bool>,
     pub time_pos: Option<f64>,
     pub duration: Option<f64>,
@@ -612,6 +623,8 @@ pub struct App {
     pub hidden: Hidden,
     /// 動画ごとの再生位置の記憶。次に選んだときの再開位置をここから引く。
     pub resume: Resume,
+    /// いいね済み/チャンネル登録済みの控え。印の判定と再確認の要否をここから引く。
+    pub engagement: EngagementCache,
     /// ダウンロード画面を開いた元のモード。閉じたらここへ戻る。
     pub download_return: Mode,
     /// 保存先の入力欄。開いた時点で `[download] dir` かその既定値を入れておく。
@@ -665,6 +678,7 @@ impl Default for App {
             env_overridden: EnvOverridden::default(),
             hidden: Hidden::default(),
             resume: Resume::default(),
+            engagement: EngagementCache::default(),
             download_return: Mode::Input,
             download_dir: QueryEditor::default(),
             download_filename: QueryEditor::default(),
@@ -808,6 +822,19 @@ impl App {
 
     pub fn view_result_ids(&self) -> Vec<String> {
         self.view_results().iter().map(|r| r.id.clone()).collect()
+    }
+
+    /// 今の一覧に出ているチャンネル ID。登録済みかを確認する対象に使う。
+    /// チャンネルを開いている間は行が channel_id を持たないので、開いた 1 つを返す。
+    pub fn view_channel_ids(&self) -> Vec<String> {
+        match &self.channel {
+            Some(channel) => vec![channel.channel_id.clone()],
+            None => self
+                .results
+                .iter()
+                .filter_map(|r| r.channel_id.clone())
+                .collect(),
+        }
     }
 
     /// 選択中の行が一覧の最後の行か。0件のときは false。
@@ -1660,6 +1687,31 @@ mod tests {
         assert_eq!(app.view_selected(), 1);
         assert_eq!(app.view_scroll(), 4);
         assert_eq!(app.view_selected_result().map(|r| r.id.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn the_channel_ids_of_the_open_list_come_out_for_checking() {
+        let mut app = App::default();
+        app.set_results(
+            vec![
+                SearchResult {
+                    channel_id: Some("UC1".to_string()),
+                    ..result("v0")
+                },
+                SearchResult {
+                    channel_id: Some("UC2".to_string()),
+                    ..result("v1")
+                },
+                result("v2"),
+            ],
+            &search_target(),
+        );
+
+        assert_eq!(app.view_channel_ids(), ["UC1", "UC2"], "持たない行は飛ばす");
+
+        // チャンネルを開いている間は、行に channel_id が入らないので開いた 1 つを見る。
+        let app = channel_app();
+        assert_eq!(app.view_channel_ids(), ["UCabc"]);
     }
 
     #[test]

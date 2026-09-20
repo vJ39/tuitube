@@ -39,6 +39,14 @@ pub const DEFAULT_MAX_CACHED: usize = 500;
 /// サムネイル 1 枚あたりのダウンロード上限秒数。
 pub const DEFAULT_THUMB_TIMEOUT_SECS: u64 = 10;
 pub const MAX_THUMB_TIMEOUT_SECS: u64 = 120;
+/// いいね済み/登録済みの控えを取り直すまでの間隔。既定は 1 週間。
+pub const DEFAULT_ENGAGEMENT_TTL_SECS: u64 = 604_800;
+pub const MIN_ENGAGEMENT_TTL_SECS: u64 = 60;
+pub const MAX_ENGAGEMENT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// 状態確認をいくつまで同時に投げるか。YouTube 側の割り当てを使い切らないよう控えめに。
+pub const DEFAULT_ENGAGEMENT_CONCURRENCY: usize = 3;
+pub const MIN_ENGAGEMENT_CONCURRENCY: usize = 1;
+pub const MAX_ENGAGEMENT_CONCURRENCY: usize = 10;
 
 const CONFIG_FILE: &str = "config.toml";
 const APP_DIR: &str = "tuitube";
@@ -54,6 +62,7 @@ pub struct RawConfig {
     pub cookies: Option<RawCookies>,
     pub search: Option<RawSearch>,
     pub thumbnails: Option<RawThumbnails>,
+    pub engagement: Option<RawEngagement>,
     pub download: Option<RawDownload>,
     pub categories: Option<Vec<RawCategory>>,
 }
@@ -73,6 +82,13 @@ pub struct RawThumbnails {
     pub cache_dir: Option<String>,
     pub max_cached: Option<i64>,
     pub timeout_secs: Option<i64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+pub struct RawEngagement {
+    pub enabled: Option<bool>,
+    pub ttl_secs: Option<i64>,
+    pub max_concurrent_requests: Option<i64>,
 }
 
 /// ダウンロード画面 (`Mode::Download`) の保存先。dir は自由文字列のため設定画面 (v1) には出さない。
@@ -254,6 +270,25 @@ impl ThumbnailSettings {
     }
 }
 
+/// いいね済み/登録済みの印の出し方。控えの中身は engagement.rs が持つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngagementSettings {
+    pub enabled: bool,
+    /// 控えを取り直すまでの間隔。
+    pub ttl: Duration,
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for EngagementSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl: Duration::from_secs(DEFAULT_ENGAGEMENT_TTL_SECS),
+            max_concurrent_requests: DEFAULT_ENGAGEMENT_CONCURRENCY,
+        }
+    }
+}
+
 /// ダウンロード画面 (`Mode::Download`) の保存先。未指定なら download::default_dir が決める。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DownloadSettings {
@@ -275,6 +310,7 @@ pub struct Settings {
     pub cookies: Option<CookieSource>,
     pub search: SearchSettings,
     pub thumbnails: ThumbnailSettings,
+    pub engagement: EngagementSettings,
     pub download: DownloadSettings,
     /// 「すべて」を除いたカテゴリタブ。
     pub categories: Vec<Category>,
@@ -291,6 +327,7 @@ impl Default for Settings {
             cookies: None,
             search: SearchSettings::default(),
             thumbnails: ThumbnailSettings::default(),
+            engagement: EngagementSettings::default(),
             download: DownloadSettings::default(),
             categories: default_categories(),
         }
@@ -392,6 +429,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> Validated {
 
     let search = validate_search(raw.search.unwrap_or_default(), &mut notices);
     let thumbnails = validate_thumbnails(raw.thumbnails.unwrap_or_default(), &mut notices);
+    let engagement = validate_engagement(raw.engagement.unwrap_or_default(), &mut notices);
     let download = validate_download(raw.download.unwrap_or_default(), &mut notices);
     let categories = validate_categories(raw.categories, &mut notices);
 
@@ -405,6 +443,7 @@ pub fn validate(raw: RawConfig, env: EnvOverrides) -> Validated {
             cookies,
             search,
             thumbnails,
+            engagement,
             download,
             categories,
         },
@@ -529,6 +568,48 @@ fn validate_thumbnails(raw: RawThumbnails, notices: &mut Vec<String>) -> Thumbna
         cache_dir,
         max_cached,
         timeout,
+    }
+}
+
+/// 印の出し方だけ。控えの読み書きは engagement.rs 側。
+fn validate_engagement(raw: RawEngagement, notices: &mut Vec<String>) -> EngagementSettings {
+    // 網羅分解。キーを足すとここで止まる。
+    let RawEngagement {
+        enabled,
+        ttl_secs,
+        max_concurrent_requests,
+    } = raw;
+    let defaults = EngagementSettings::default();
+    let min_ttl = MIN_ENGAGEMENT_TTL_SECS as i64;
+    let max_ttl = MAX_ENGAGEMENT_TTL_SECS as i64;
+    let ttl = match ttl_secs {
+        None => defaults.ttl,
+        Some(secs) if (min_ttl..=max_ttl).contains(&secs) => Duration::from_secs(secs as u64),
+        Some(secs) => {
+            let clamped = secs.clamp(min_ttl, max_ttl);
+            notices.push(format!(
+                "[engagement] ttl_secs={secs} は {clamped} に丸めました"
+            ));
+            Duration::from_secs(clamped as u64)
+        }
+    };
+    let min_concurrency = MIN_ENGAGEMENT_CONCURRENCY as i64;
+    let max_concurrency = MAX_ENGAGEMENT_CONCURRENCY as i64;
+    let max_concurrent_requests = match max_concurrent_requests {
+        None => defaults.max_concurrent_requests,
+        Some(count) if (min_concurrency..=max_concurrency).contains(&count) => count as usize,
+        Some(count) => {
+            let clamped = count.clamp(min_concurrency, max_concurrency);
+            notices.push(format!(
+                "[engagement] max_concurrent_requests={count} は {clamped} に丸めました"
+            ));
+            clamped as usize
+        }
+    };
+    EngagementSettings {
+        enabled: enabled.unwrap_or(defaults.enabled),
+        ttl,
+        max_concurrent_requests,
     }
 }
 
@@ -964,6 +1045,24 @@ pub fn render(settings: &Settings) -> String {
     out.push_str(&format!(
         "timeout_secs = {}\n",
         thumbnails.timeout.as_secs()
+    ));
+
+    let engagement = &settings.engagement;
+    out.push_str("\n[engagement]\n");
+    out.push_str(
+        "# いいね済み/登録済みの印。false にすると印を出さず、状態の問い合わせもしない。\n",
+    );
+    out.push_str(&format!("enabled = {}\n", engagement.enabled));
+    out.push_str(&format!(
+        "# 印を取り直すまでの秒数。{MIN_ENGAGEMENT_TTL_SECS}..={MAX_ENGAGEMENT_TTL_SECS} (既定は 1 週間)。\n"
+    ));
+    out.push_str(&format!("ttl_secs = {}\n", engagement.ttl.as_secs()));
+    out.push_str(&format!(
+        "# 状態確認を同時に投げる本数。{MIN_ENGAGEMENT_CONCURRENCY}..={MAX_ENGAGEMENT_CONCURRENCY}。\n"
+    ));
+    out.push_str(&format!(
+        "max_concurrent_requests = {}\n",
+        engagement.max_concurrent_requests
     ));
 
     let download = &settings.download;
@@ -2396,6 +2495,67 @@ mod tests {
             settings_of(text).thumbnails.cache_dir,
             Some(PathBuf::from(format!("{home}/.cache/tuitube/thumbs")))
         );
+    }
+
+    #[test]
+    fn engagement_settings_are_read() {
+        let text = "[engagement]\nenabled = false\nttl_secs = 3600\nmax_concurrent_requests = 5\n";
+        let engagement = settings_of(text).engagement;
+        assert!(!engagement.enabled);
+        assert_eq!(engagement.ttl, Duration::from_secs(3_600));
+        assert_eq!(engagement.max_concurrent_requests, 5);
+        assert!(notices_of(text).is_empty());
+
+        // 未指定なら既定 (1 週間・同時 3 本)。
+        let defaults = settings_of("").engagement;
+        assert_eq!(defaults, EngagementSettings::default());
+        assert!(defaults.enabled);
+        assert_eq!(
+            defaults.ttl,
+            Duration::from_secs(DEFAULT_ENGAGEMENT_TTL_SECS)
+        );
+        assert_eq!(
+            defaults.max_concurrent_requests,
+            DEFAULT_ENGAGEMENT_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn unreadable_engagement_values_are_rounded_with_a_notice() {
+        let text = "[engagement]\nttl_secs = 0\nmax_concurrent_requests = 0\n";
+        let engagement = settings_of(text).engagement;
+        assert_eq!(engagement.ttl, Duration::from_secs(MIN_ENGAGEMENT_TTL_SECS));
+        assert_eq!(
+            engagement.max_concurrent_requests,
+            MIN_ENGAGEMENT_CONCURRENCY
+        );
+        assert_eq!(notices_of(text).len(), 2, "{:?}", notices_of(text));
+
+        let over = "[engagement]\nttl_secs = 99999999\nmax_concurrent_requests = 100\n";
+        let engagement = settings_of(over).engagement;
+        assert_eq!(engagement.ttl, Duration::from_secs(MAX_ENGAGEMENT_TTL_SECS));
+        assert_eq!(
+            engagement.max_concurrent_requests,
+            MAX_ENGAGEMENT_CONCURRENCY
+        );
+        assert_eq!(notices_of(over).len(), 2, "{:?}", notices_of(over));
+    }
+
+    #[test]
+    fn render_round_trips_the_engagement_section() {
+        let custom = Settings {
+            engagement: EngagementSettings {
+                enabled: false,
+                ttl: Duration::from_secs(3_600),
+                max_concurrent_requests: 5,
+            },
+            ..Settings::default()
+        };
+        assert_eq!(settings_of(&render(&custom)), custom);
+
+        let text = render(&Settings::default());
+        assert!(text.contains("[engagement]"), "{text}");
+        assert!(notices_of(&text).is_empty(), "{:?}", notices_of(&text));
     }
 
     #[test]

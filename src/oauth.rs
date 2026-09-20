@@ -13,6 +13,7 @@ pub const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 pub const SUBSCRIPTIONS_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/subscriptions";
 pub const RATE_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/videos/rate";
+pub const VIDEOS_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/videos";
 
 const APP_DIR: &str = "tuitube";
 const CLIENT_FILE: &str = "oauth_client.toml";
@@ -25,6 +26,13 @@ const HTTP_TIMEOUT_SECS: u32 = 30;
 const AUTH_WAIT_SECS: u64 = 300;
 /// リダイレクトのリクエスト行として読む上限。
 const REQUEST_LINE_MAX: u64 = 8192;
+/// いいね一覧 1 ページの件数。API の上限。
+const LIKED_PAGE_SIZE: u32 = 50;
+/// 辿るページ数の上限。myRating の一覧は 1000 件までしか返らないので、
+/// 次ページが返り続けてもここで打ち切る。
+const LIKED_PAGE_MAX: usize = 20;
+/// 登録確認 1 回で渡すチャンネル ID の数。forChannelId の上限が公表されていないので安全側。
+pub const CHANNEL_CHUNK: usize = 50;
 
 pub const SUBSCRIBE_NOTICE: &str = "チャンネル登録中…";
 pub const LIKE_NOTICE: &str = "いいねを送信中…";
@@ -364,6 +372,36 @@ pub fn rate_request(access_token: &str, video_id: &str) -> Request {
     }
 }
 
+/// 自分がいいねした動画一覧の 1 ページ。myRating は id と同時に指定できないので、
+/// 動画 ID を渡して 1 件だけ確認する経路が無く、一覧を辿ることになる。
+pub fn list_liked_videos_request(access_token: &str, page_token: Option<&str>) -> Request {
+    let mut url = format!("{VIDEOS_ENDPOINT}?part=id&myRating=like&maxResults={LIKED_PAGE_SIZE}");
+    if let Some(token) = page_token {
+        url.push_str(&format!("&pageToken={}", percent_encode(token)));
+    }
+    let mut args = base_args();
+    args.push(url);
+    Request {
+        args,
+        secrets: vec![bearer(access_token)],
+    }
+}
+
+/// 渡したチャンネルのうち自分が登録しているものを返させる。
+pub fn list_subscriptions_request(access_token: &str, channel_ids: &[String]) -> Request {
+    // 区切りのカンマを残すため ID ごとに符号化する。
+    let ids: Vec<String> = channel_ids.iter().map(|id| percent_encode(id)).collect();
+    let mut args = base_args();
+    args.push(format!(
+        "{SUBSCRIPTIONS_ENDPOINT}?part=snippet&mine=true&forChannelId={}",
+        ids.join(",")
+    ));
+    Request {
+        args,
+        secrets: vec![bearer(access_token)],
+    }
+}
+
 /// -w で足した末尾のステータス行を本文から切り離す。
 pub fn split_status(stdout: &[u8]) -> Result<Response, String> {
     let text = String::from_utf8_lossy(stdout);
@@ -432,6 +470,53 @@ pub fn is_duplicate(body: &str) -> bool {
             .and_then(|v| v.as_str())
             .is_some_and(|r| r.to_ascii_lowercase().contains("duplicate"))
     })
+}
+
+/// いいね一覧 1 ページの動画 ID と、続きがあればそのトークン。
+fn liked_page_of(response: &Response) -> Result<(Vec<String>, Option<String>), String> {
+    let value = api_json(response, "いいね一覧")?;
+    let ids = value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let next = value
+        .get("nextPageToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((ids, next))
+}
+
+/// 登録済みとして返ってきたチャンネル ID。
+fn subscribed_channels_of(response: &Response) -> Result<Vec<String>, String> {
+    let value = api_json(response, "チャンネル登録")?;
+    Ok(value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.pointer("/snippet/resourceId/channelId")
+                        .and_then(|v| v.as_str())
+                })
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn api_json(response: &Response, what: &str) -> Result<serde_json::Value, String> {
+    if response.status >= 400 {
+        return Err(api_error(response));
+    }
+    serde_json::from_str(&response.body).map_err(|e| format!("{what}を読めません: {e}"))
 }
 
 pub fn api_error(response: &Response) -> String {
@@ -652,6 +737,68 @@ async fn call_api<B: Backend>(
         return Ok(action.done_notice().to_string());
     }
     Err(api_error(&response))
+}
+
+// ---- 状態確認 ----
+
+/// 背景での状態確認に使うアクセストークン。保存済みの refresh_token だけを使う。
+/// 認証がまだなら None を返す (印を出すためにブラウザを開かない)。
+pub async fn access_token_for_refresh<B: Backend>(
+    backend: &B,
+    paths: &Paths,
+) -> Result<Option<String>, String> {
+    let Some(refresh) = load_refresh_token(&paths.token) else {
+        return Ok(None);
+    };
+    let client = read_client(&paths.client)?;
+    Ok(Some(refresh_access(backend, &client, &refresh).await?))
+}
+
+/// いいね済み動画 ID を全ページ集める。前のページのトークンが無いと次を呼べないので直列。
+pub async fn refresh_liked_videos<B: Backend>(
+    backend: &B,
+    access_token: &str,
+) -> Result<Vec<String>, String> {
+    let mut liked = Vec::new();
+    let mut page: Option<String> = None;
+    for _ in 0..LIKED_PAGE_MAX {
+        let request = list_liked_videos_request(access_token, page.as_deref());
+        let (mut found, next) = liked_page_of(&backend.curl(request).await?)?;
+        liked.append(&mut found);
+        match next {
+            Some(token) => page = Some(token),
+            None => break,
+        }
+    }
+    Ok(liked)
+}
+
+/// 渡したチャンネルのうち登録済みのものを返す。チャンクに分け、同時に走らせる数を
+/// max_concurrent で抑える。1 つでも失敗したら全体を失敗にする。途中までを反映すると、
+/// 返らなかった ID を未登録として確定させてしまうため。
+pub async fn refresh_subscriptions<B: Backend + 'static>(
+    backend: std::sync::Arc<B>,
+    access_token: &str,
+    channel_ids: &[String],
+    max_concurrent: usize,
+) -> Result<Vec<String>, String> {
+    let chunks: Vec<&[String]> = channel_ids.chunks(CHANNEL_CHUNK).collect();
+    let mut subscribed = Vec::new();
+    for wave in chunks.chunks(max_concurrent.max(1)) {
+        let mut running = Vec::with_capacity(wave.len());
+        for chunk in wave {
+            let backend = std::sync::Arc::clone(&backend);
+            let request = list_subscriptions_request(access_token, chunk);
+            running.push(tokio::spawn(async move {
+                subscribed_channels_of(&backend.curl(request).await?)
+            }));
+        }
+        for task in running {
+            let mut found = task.await.map_err(|e| format!("確認できません: {e}"))??;
+            subscribed.append(&mut found);
+        }
+    }
+    Ok(subscribed)
 }
 
 // ---- 本番の Backend ----
@@ -971,6 +1118,10 @@ mod tests {
         secret_of(&calls[at], "--data")
     }
 
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
     fn url_of(calls: &[Request], at: usize) -> String {
         calls[at].url().to_string()
     }
@@ -1137,6 +1288,8 @@ mod tests {
             token_request("grant_type=refresh_token"),
             subscribe_request("at", "UC1"),
             rate_request("at", "vid"),
+            list_liked_videos_request("at", None),
+            list_subscriptions_request("at", &ids(&["UC1"])),
         ] {
             let args = &request.args;
             let at = args.iter().position(|a| a == "-w").expect("書式");
@@ -1159,6 +1312,8 @@ mod tests {
         for request in [
             subscribe_request("at-1", "UC123"),
             rate_request("at-1", "vid1"),
+            list_liked_videos_request("at-1", Some("page-1")),
+            list_subscriptions_request("at-1", &ids(&["UC123"])),
         ] {
             assert_argv_is_clean(&request, &["at-1", "Authorization"]);
             assert_eq!(
@@ -1252,6 +1407,53 @@ mod tests {
         assert_eq!(
             secret_of(&request, "--header"),
             "Authorization: Bearer at-1"
+        );
+    }
+
+    #[test]
+    fn list_liked_videos_request_asks_for_a_page_of_the_liked_list() {
+        let request = list_liked_videos_request("at-1", None);
+        assert_eq!(
+            request.url(),
+            format!("{VIDEOS_ENDPOINT}?part=id&myRating=like&maxResults=50")
+        );
+        assert_eq!(
+            secret_of(&request, "--header"),
+            "Authorization: Bearer at-1"
+        );
+    }
+
+    #[test]
+    fn list_liked_videos_request_carries_the_page_token() {
+        let request = list_liked_videos_request("at-1", Some("CAUQAA/=="));
+        assert_eq!(
+            request.url(),
+            format!(
+                "{VIDEOS_ENDPOINT}?part=id&myRating=like&maxResults=50&pageToken=CAUQAA%2F%3D%3D"
+            )
+        );
+    }
+
+    #[test]
+    fn list_subscriptions_request_asks_about_the_given_channels() {
+        let request = list_subscriptions_request("at-1", &ids(&["UC1", "UC2"]));
+        assert_eq!(
+            request.url(),
+            format!("{SUBSCRIPTIONS_ENDPOINT}?part=snippet&mine=true&forChannelId=UC1,UC2")
+        );
+        assert_eq!(
+            secret_of(&request, "--header"),
+            "Authorization: Bearer at-1"
+        );
+    }
+
+    #[test]
+    fn list_subscriptions_request_keeps_the_comma_that_separates_the_ids() {
+        // ID ごとに符号化する。丸ごと符号化すると区切りのカンマまで %2C になる。
+        let request = list_subscriptions_request("at-1", &ids(&["UC a", "UC/b"]));
+        assert_eq!(
+            request.url(),
+            format!("{SUBSCRIPTIONS_ENDPOINT}?part=snippet&mine=true&forChannelId=UC%20a,UC%2Fb")
         );
     }
 
@@ -1839,6 +2041,188 @@ mod tests {
             "理由を添える: {notice}"
         );
         assert_eq!(backend.calls().len(), 2);
+    }
+
+    // ---- 状態確認 ----
+
+    /// いいね一覧の 1 ページぶんの応答。
+    fn liked_page(video_ids: &[&str], next: Option<&str>) -> Result<Response, String> {
+        let items: Vec<serde_json::Value> = video_ids
+            .iter()
+            .map(|id| serde_json::json!({"kind": "youtube#video", "id": id}))
+            .collect();
+        let mut body = serde_json::json!({"items": items});
+        if let Some(next) = next {
+            body["nextPageToken"] = serde_json::json!(next);
+        }
+        ok(&body.to_string())
+    }
+
+    /// 登録済みとして返すチャンネルの応答。
+    fn subscription_page(channel_ids: &[&str]) -> Result<Response, String> {
+        let items: Vec<serde_json::Value> = channel_ids
+            .iter()
+            .map(|id| {
+                serde_json::json!({"snippet": {"resourceId": {"kind": "youtube#channel", "channelId": id}}})
+            })
+            .collect();
+        ok(&serde_json::json!({"items": items}).to_string())
+    }
+
+    /// URL の forChannelId に並んでいる ID。
+    fn asked_channels(request: &Request) -> Vec<String> {
+        let query = request
+            .url()
+            .split_once("forChannelId=")
+            .expect("問い合わせ")
+            .1;
+        query.split(',').map(percent_decode).collect()
+    }
+
+    #[tokio::test]
+    async fn the_liked_list_is_walked_page_by_page() {
+        let backend = FakeBackend::new().with_responses(vec![
+            liked_page(&["v1", "v2"], Some("page-2")),
+            liked_page(&["v3"], None),
+        ]);
+
+        let liked = refresh_liked_videos(&backend, "at-1")
+            .await
+            .expect("取れる");
+
+        assert_eq!(liked, ids(&["v1", "v2", "v3"]));
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(!url_of(&calls, 0).contains("pageToken"), "初回は付けない");
+        assert!(
+            url_of(&calls, 1).ends_with("&pageToken=page-2"),
+            "{}",
+            url_of(&calls, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_liked_list_stops_at_the_page_limit() {
+        // 本家が次ページを返し続けても止まること (一覧は 1000 件までしか取れない)。
+        let pages = (0..LIKED_PAGE_MAX + 5)
+            .map(|at| liked_page(&["v"], Some(&format!("page-{at}"))))
+            .collect();
+        let backend = FakeBackend::new().with_responses(pages);
+
+        let liked = refresh_liked_videos(&backend, "at-1")
+            .await
+            .expect("取れる");
+
+        assert_eq!(backend.calls().len(), LIKED_PAGE_MAX);
+        assert_eq!(liked.len(), LIKED_PAGE_MAX);
+    }
+
+    #[tokio::test]
+    async fn a_refused_liked_page_is_reported() {
+        let backend = FakeBackend::new().with_responses(vec![
+            liked_page(&["v1"], Some("page-2")),
+            failed(403, r#"{"error":{"code":403,"message":"quotaExceeded"}}"#),
+        ]);
+
+        let error = refresh_liked_videos(&backend, "at-1")
+            .await
+            .expect_err("失敗する");
+
+        assert!(error.contains("quotaExceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_channels_are_asked_in_batches() {
+        let wanted: Vec<String> = (0..CHANNEL_CHUNK + 2).map(|at| format!("UC{at}")).collect();
+        let backend = std::sync::Arc::new(FakeBackend::new().with_responses(vec![
+            subscription_page(&["UC0"]),
+            subscription_page(&["UC50"]),
+        ]));
+
+        let subscribed = refresh_subscriptions(std::sync::Arc::clone(&backend), "at-1", &wanted, 3)
+            .await
+            .expect("取れる");
+
+        assert_eq!(subscribed, ids(&["UC0", "UC50"]));
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2, "50 件ずつに分ける");
+        assert_eq!(asked_channels(&calls[0]).len(), CHANNEL_CHUNK);
+        assert_eq!(asked_channels(&calls[1]), ids(&["UC50", "UC51"]));
+    }
+
+    #[tokio::test]
+    async fn asking_about_no_channel_does_not_call_the_api() {
+        let backend = std::sync::Arc::new(FakeBackend::new());
+
+        let subscribed = refresh_subscriptions(std::sync::Arc::clone(&backend), "at-1", &[], 3)
+            .await
+            .expect("何もしない");
+
+        assert!(subscribed.is_empty());
+        assert!(backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_refused_batch_fails_the_whole_channel_refresh() {
+        // 半分だけ反映すると、返らなかった ID を未登録として確定させてしまう。
+        let wanted: Vec<String> = (0..CHANNEL_CHUNK + 1).map(|at| format!("UC{at}")).collect();
+        let backend = std::sync::Arc::new(
+            FakeBackend::new().with_responses(vec![subscription_page(&["UC0"]), failed(500, "{}")]),
+        );
+
+        let error = refresh_subscriptions(std::sync::Arc::clone(&backend), "at-1", &wanted, 3)
+            .await
+            .expect_err("失敗する");
+
+        assert!(error.contains("500"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_batches_run_no_more_than_the_allowed_number_at_a_time() {
+        let wanted: Vec<String> = (0..CHANNEL_CHUNK * 3).map(|at| format!("UC{at}")).collect();
+        let backend = std::sync::Arc::new(FakeBackend::new().with_responses(vec![
+            subscription_page(&[]),
+            subscription_page(&[]),
+            subscription_page(&[]),
+        ]));
+
+        refresh_subscriptions(std::sync::Arc::clone(&backend), "at-1", &wanted, 1)
+            .await
+            .expect("取れる");
+
+        assert_eq!(backend.calls().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_background_check_without_a_stored_token_does_not_open_a_browser() {
+        let paths = paths("no-token-for-check");
+        let backend = FakeBackend::new();
+
+        let token = access_token_for_refresh(&backend, &paths)
+            .await
+            .expect("認証していないだけなので失敗ではない");
+
+        assert_eq!(token, None);
+        assert!(backend.opened().is_empty(), "確認のために認可を求めない");
+        assert!(!backend.bound());
+        assert!(backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_background_check_uses_the_stored_refresh_token() {
+        let paths = paths("token-for-check");
+        save_refresh_token(&paths.token, "rt-1").expect("書ける");
+        let backend = FakeBackend::new().with_responses(vec![ok(REFRESHED_JSON)]);
+
+        let token = access_token_for_refresh(&backend, &paths)
+            .await
+            .expect("取れる");
+
+        assert_eq!(token.as_deref(), Some("at-2"));
+        assert!(backend.opened().is_empty());
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 1);
+        assert_argv_is_clean(&calls[0], &["dummy-secret", "rt-1"]);
     }
 
     #[test]

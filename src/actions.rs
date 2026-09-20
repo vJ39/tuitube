@@ -98,6 +98,10 @@ pub struct Session {
     pub oauth_task: Option<JoinHandle<()>>,
     /// 打ち切りごとに進む世代。前の操作ぶんが遅れて届いても混ざらない。
     pub oauth_nonce: u64,
+    /// 送信中の操作。成功したら控えへ写すので、送った内容をここへ置いておく。
+    pub oauth_action: Option<oauth::Action>,
+    /// いいね済み/登録済みの問い合わせ。nonce は search_nonce を共用する。
+    pub engagement_task: Option<JoinHandle<()>>,
     /// 動画/音声ファイルのダウンロード。同時に走らせるのは1件まで。
     pub download_task: Option<JoinHandle<()>>,
     /// 打ち切りごとに進む世代。前のダウンロードぶんが遅れて届いても混ざらない。
@@ -540,6 +544,19 @@ impl Oauth<oauth::RealBackend> {
     }
 }
 
+/// 渡したチャンネルを登録する。
+pub fn subscribe_to<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    channel_id: String,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    start_oauth(app, tx, session, oauth::Action::Subscribe(channel_id), deps);
+}
+
 /// 表示中のチャンネルを登録する。チャンネルを見ていなければ何もしない。
 pub fn subscribe_channel<B>(
     app: &mut App,
@@ -549,11 +566,25 @@ pub fn subscribe_channel<B>(
 ) where
     B: oauth::Backend + 'static,
 {
-    let Some(channel) = app.channel.as_ref() else {
+    let Some(channel_id) = app.channel.as_ref().map(|c| c.channel_id.clone()) else {
         return;
     };
-    let action = oauth::Action::Subscribe(channel.channel_id.clone());
-    start_oauth(app, tx, session, action, deps);
+    subscribe_to(app, tx, session, channel_id, deps);
+}
+
+/// 再生中の動画のチャンネルを登録する。チャンネル ID を持たない行から始めた再生では何もしない。
+pub fn subscribe_playing_channel<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    let Some(channel_id) = app.playback.channel_id.clone() else {
+        return;
+    };
+    subscribe_to(app, tx, session, channel_id, deps);
 }
 
 /// 再生中の動画にいいねする。動画 ID を取れなければ何もしない。
@@ -589,6 +620,7 @@ pub fn start_oauth<B>(
     cancel_oauth(session);
     let nonce = session.oauth_nonce;
     app.set_notice(Some(action.notice().to_string()));
+    session.oauth_action = Some(action.clone());
     let backend = deps.backend;
     let tx = tx.clone();
     session.oauth_task = Some(tokio::spawn(async move {
@@ -602,7 +634,92 @@ fn cancel_oauth(session: &mut Session) {
     if let Some(task) = session.oauth_task.take() {
         task.abort();
     }
+    session.oauth_action = None;
     session.oauth_nonce += 1;
+}
+
+pub fn start_engagement(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    start_engagement_with(
+        app,
+        tx,
+        session,
+        Oauth::real(),
+        std::time::SystemTime::now(),
+    );
+}
+
+/// いいね済み一覧と、一覧に出ているチャンネルの登録有無を背景で確かめる。
+/// 印は飾りなので、置き場が無い・認証がまだ・失敗したときは何も出さずに黙って終える。
+pub fn start_engagement_with<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+    now: std::time::SystemTime,
+) where
+    B: oauth::Backend + 'static,
+{
+    if let Some(task) = session.engagement_task.take() {
+        task.abort();
+    }
+    if !app.settings.engagement.enabled {
+        return;
+    }
+    let Some(paths) = deps.paths else {
+        return;
+    };
+    let ttl = app.settings.engagement.ttl;
+    let liked_wanted = app.engagement.liked_needs_refresh(now, ttl);
+    let channels = app
+        .engagement
+        .channels_needing_refresh(&app.view_channel_ids(), now, ttl);
+    if !liked_wanted && channels.is_empty() {
+        return;
+    }
+    let nonce = session.search_nonce;
+    let max_concurrent = app.settings.engagement.max_concurrent_requests;
+    let backend = std::sync::Arc::new(deps.backend);
+    let tx = tx.clone();
+    session.engagement_task = Some(tokio::spawn(async move {
+        let Ok(Some(token)) = oauth::access_token_for_refresh(backend.as_ref(), &paths).await
+        else {
+            return;
+        };
+        let liked_videos = if liked_wanted {
+            oauth::refresh_liked_videos(backend.as_ref(), &token)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        // 一部だけ反映すると、返らなかった ID を未登録として確定させてしまう。
+        // 失敗したチャンクがあれば、チャンネル側は丸ごと諦める。
+        let subscribed = if channels.is_empty() {
+            Some(Vec::new())
+        } else {
+            oauth::refresh_subscriptions(
+                std::sync::Arc::clone(&backend),
+                &token,
+                &channels,
+                max_concurrent,
+            )
+            .await
+            .ok()
+        };
+        let (asked_channels, subscribed_channels) = match subscribed {
+            Some(found) => (channels, found),
+            None => (Vec::new(), Vec::new()),
+        };
+        if liked_videos.is_none() && asked_channels.is_empty() {
+            return;
+        }
+        let _ = tx.send(AppEvent::EngagementReady {
+            nonce,
+            liked_videos,
+            asked_channels,
+            subscribed_channels,
+        });
+    }));
 }
 
 /// チャンネル一覧を抜けて検索結果へ戻る。
@@ -1074,6 +1191,7 @@ pub fn enter_playback(
     title: String,
     url: String,
     id: String,
+    channel_id: Option<String>,
     video: VideoSink,
 ) {
     // バックグラウンド再生中に別の動画へ差し替える経路もここを通るので、
@@ -1083,6 +1201,7 @@ pub fn enter_playback(
         title,
         url,
         id,
+        channel_id,
         ..Playback::default()
     };
     app.seek_bar = SeekBarState::default();
@@ -1114,6 +1233,7 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
                 result.title.clone(),
                 url.clone(),
                 result.id.clone(),
+                result.channel_id.clone(),
                 video,
             );
             session.player = Some(Player {
@@ -1805,6 +1925,7 @@ mod tests {
             "title".to_string(),
             "https://example.com/watch".to_string(),
             "id0".to_string(),
+            None,
             sink(),
         );
         assert_eq!(app.mode, Mode::Playing);
@@ -1835,6 +1956,7 @@ mod tests {
             "title".to_string(),
             "https://example.com/watch".to_string(),
             "v2".to_string(),
+            None,
             sink(),
         );
 
@@ -1844,6 +1966,25 @@ mod tests {
             "前の動画の位置を覚える"
         );
         assert_eq!(app.playback.id, "v2");
+    }
+
+    #[test]
+    fn enter_playback_remembers_the_channel_of_the_video() {
+        // 再生中のチャンネル登録 (u) はここで覚えた channel_id だけを見る。
+        let mut app = App::default();
+        let mut session = Session::default();
+
+        enter_playback(
+            &mut app,
+            &mut session,
+            "title".to_string(),
+            "https://example.com/watch".to_string(),
+            "v1".to_string(),
+            Some("UC1".to_string()),
+            sink(),
+        );
+
+        assert_eq!(app.playback.channel_id.as_deref(), Some("UC1"));
     }
 
     #[test]
@@ -3007,6 +3148,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribing_to_an_id_does_not_need_the_channel_view() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        // 再生中は app.channel に無関係な値しか入らないので、ID を直接渡す経路を使う。
+        let mut app = playing_app();
+
+        subscribe_to(
+            &mut app,
+            &tx,
+            &mut session,
+            "UC9".to_string(),
+            hanging_oauth("subscribe-to"),
+        );
+
+        assert_eq!(app.notice.as_deref(), Some(crate::oauth::SUBSCRIBE_NOTICE));
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Subscribe("UC9".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_while_playing_uses_the_channel_of_the_video() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            playback: Playback {
+                channel_id: Some("UC2".to_string()),
+                ..Playback::default()
+            },
+            ..playing_app()
+        };
+
+        subscribe_playing_channel(
+            &mut app,
+            &tx,
+            &mut session,
+            hanging_oauth("playing-channel"),
+        );
+
+        assert_eq!(
+            session.oauth_action,
+            Some(crate::oauth::Action::Subscribe("UC2".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribing_while_playing_without_a_channel_id_does_nothing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing_app();
+
+        subscribe_playing_channel(&mut app, &tx, &mut session, hanging_oauth("playing-no-id"));
+
+        assert!(session.oauth_task.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
     async fn liking_sends_the_playing_video_id() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
@@ -3140,6 +3340,280 @@ mod tests {
         assert_eq!(app.error.as_deref(), Some(crate::oauth::NO_CONFIG_PATH));
         assert!(session.oauth_task.is_none());
         assert!(app.notice.is_none());
+    }
+
+    // ---- いいね済み/登録済みの状態確認 ----
+
+    const LIKED_PAGE_JSON: &str = r#"{"items":[{"id":"v1"}]}"#;
+    const SUBSCRIBED_JSON: &str = r#"{"items":[{"snippet":{"resourceId":{"channelId":"UC1"}}}]}"#;
+    const NO_ITEMS_JSON: &str = r#"{"items":[]}"#;
+
+    fn response(status: u16, body: &str) -> Result<crate::oauth::Response, String> {
+        Ok(crate::oauth::Response {
+            status,
+            body: body.to_string(),
+        })
+    }
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    fn unix(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// 保存済みトークンを消した置き場。まだ認証していない状態。
+    fn paths_without_token(name: &str) -> crate::oauth::Paths {
+        let paths = oauth_paths(name);
+        std::fs::remove_file(&paths.token).expect("消せる");
+        paths
+    }
+
+    /// 渡した channel_id を持つ行が並んだ一覧。
+    fn engagement_app(channel_ids: &[&str]) -> App {
+        let results = channel_ids
+            .iter()
+            .enumerate()
+            .map(|(i, channel_id)| SearchResult {
+                id: format!("v{i}"),
+                title: format!("title {i}"),
+                duration: None,
+                uploader: None,
+                channel_id: Some(channel_id.to_string()),
+            })
+            .collect();
+        App {
+            results,
+            ..App::default()
+        }
+    }
+
+    /// EngagementReady を 1 件受け取る。届かなければ None。
+    async fn next_engagement(
+        rx: &mut mpsc::UnboundedReceiver<AppEvent>,
+        session: &mut Session,
+    ) -> Option<AppEvent> {
+        let task = session.engagement_task.take()?;
+        task.await.expect("タスクは panic しない");
+        rx.try_recv().ok()
+    }
+
+    #[tokio::test]
+    async fn the_state_check_asks_for_the_liked_list_and_the_visible_channels() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1", "UC2"]);
+        let deps = oauth_deps(
+            "engagement",
+            vec![
+                response(200, OAUTH_ACCESS_JSON),
+                response(200, LIKED_PAGE_JSON),
+                response(200, SUBSCRIBED_JSON),
+            ],
+        );
+        let backend = deps.backend.clone();
+
+        start_engagement_with(&mut app, &tx, &mut session, deps, unix(1_000));
+
+        let event = next_engagement(&mut rx, &mut session).await.expect("届く");
+        let AppEvent::EngagementReady {
+            nonce,
+            liked_videos,
+            asked_channels,
+            subscribed_channels,
+        } = event
+        else {
+            panic!("EngagementReady でない");
+        };
+        assert_eq!(nonce, session.search_nonce);
+        assert_eq!(liked_videos, Some(ids(&["v1"])));
+        assert_eq!(asked_channels, ids(&["UC1", "UC2"]));
+        assert_eq!(subscribed_channels, ids(&["UC1"]));
+        assert!(
+            backend.opened().is_empty(),
+            "背景の確認でブラウザを開かない"
+        );
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 3, "トークン・いいね一覧・登録確認");
+        assert!(
+            calls[1].url().contains("myRating=like"),
+            "{}",
+            calls[1].url()
+        );
+        assert!(
+            calls[2].url().ends_with("forChannelId=UC1,UC2"),
+            "{}",
+            calls[2].url()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_state_check_does_not_run_when_the_marks_are_off() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1"]);
+        app.settings.engagement.enabled = false;
+
+        start_engagement_with(
+            &mut app,
+            &tx,
+            &mut session,
+            hanging_oauth("engagement-off"),
+            unix(1_000),
+        );
+
+        assert!(session.engagement_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_asked_while_the_cache_is_still_fresh() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1"]);
+        app.engagement.replace_liked(ids(&["v1"]), unix(1_000));
+        app.engagement
+            .remember_channels(&ids(&["UC1"]), &ids(&["UC1"]), unix(1_000));
+
+        start_engagement_with(
+            &mut app,
+            &tx,
+            &mut session,
+            hanging_oauth("engagement-fresh"),
+            unix(1_000),
+        );
+
+        assert!(session.engagement_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_what_needs_confirming_is_asked_again() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1", "UC2"]);
+        // いいね一覧と UC1 は確認済み。残りは UC2 だけ。
+        app.engagement.replace_liked(ids(&["v1"]), unix(1_000));
+        app.engagement
+            .remember_channels(&ids(&["UC1"]), &ids(&["UC1"]), unix(1_000));
+        let deps = oauth_deps(
+            "engagement-partial",
+            vec![
+                response(200, OAUTH_ACCESS_JSON),
+                response(200, NO_ITEMS_JSON),
+            ],
+        );
+        let backend = deps.backend.clone();
+
+        start_engagement_with(&mut app, &tx, &mut session, deps, unix(1_000));
+
+        let event = next_engagement(&mut rx, &mut session).await.expect("届く");
+        let AppEvent::EngagementReady {
+            liked_videos,
+            asked_channels,
+            subscribed_channels,
+            ..
+        } = event
+        else {
+            panic!("EngagementReady でない");
+        };
+        assert_eq!(liked_videos, None, "いいね一覧は取り直さない");
+        assert_eq!(asked_channels, ids(&["UC2"]));
+        assert!(subscribed_channels.is_empty());
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 2, "トークンと登録確認だけ");
+        assert!(
+            calls[1].url().ends_with("forChannelId=UC2"),
+            "{}",
+            calls[1].url()
+        );
+    }
+
+    #[tokio::test]
+    async fn while_browsing_a_channel_only_that_channel_is_checked() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+        let deps = oauth_deps(
+            "engagement-channel",
+            vec![
+                response(200, OAUTH_ACCESS_JSON),
+                response(200, LIKED_PAGE_JSON),
+                response(200, SUBSCRIBED_JSON),
+            ],
+        );
+
+        start_engagement_with(&mut app, &tx, &mut session, deps, unix(1_000));
+
+        let event = next_engagement(&mut rx, &mut session).await.expect("届く");
+        let AppEvent::EngagementReady { asked_channels, .. } = event else {
+            panic!("EngagementReady でない");
+        };
+        assert_eq!(asked_channels, ids(&["UC1"]));
+    }
+
+    #[tokio::test]
+    async fn a_failed_state_check_stays_quiet() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&[]);
+        let deps = oauth_deps(
+            "engagement-failure",
+            vec![
+                response(200, OAUTH_ACCESS_JSON),
+                response(
+                    403,
+                    r#"{"error":{"message":"quota","errors":[{"reason":"quotaExceeded"}]}}"#,
+                ),
+            ],
+        );
+
+        start_engagement_with(&mut app, &tx, &mut session, deps, unix(1_000));
+
+        assert!(
+            next_engagement(&mut rx, &mut session).await.is_none(),
+            "印は飾りなので、失敗は画面に出さない"
+        );
+        assert!(app.error.is_none());
+        assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn without_a_saved_token_the_state_check_does_not_open_a_browser() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1"]);
+        let deps = Oauth {
+            backend: FakeBackend::new(),
+            paths: Some(paths_without_token("engagement-no-token")),
+        };
+        let backend = deps.backend.clone();
+
+        start_engagement_with(&mut app, &tx, &mut session, deps, unix(1_000));
+
+        assert!(next_engagement(&mut rx, &mut session).await.is_none());
+        assert!(backend.opened().is_empty(), "印のために認可を求めない");
+        assert!(backend.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_location_skips_the_state_check_silently() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1"]);
+
+        start_engagement_with(
+            &mut app,
+            &tx,
+            &mut session,
+            Oauth {
+                backend: FakeBackend::new(),
+                paths: None,
+            },
+            unix(1_000),
+        );
+
+        assert!(session.engagement_task.is_none());
+        assert!(app.error.is_none(), "操作していないので理由を出さない");
     }
 
     /// フィード系の 1 本ぶんの非 flat 出力。
@@ -3922,6 +4396,7 @@ mod tests {
             "song".to_string(),
             URL.to_string(),
             "id0".to_string(),
+            None,
             sink(),
         );
         assert_eq!(app.playback.url, URL);
@@ -3938,6 +4413,7 @@ mod tests {
             "song".to_string(),
             URL.to_string(),
             "id0".to_string(),
+            None,
             sink(),
         );
 
@@ -4114,6 +4590,7 @@ mod tests {
             "song".to_string(),
             URL.to_string(),
             "id0".to_string(),
+            None,
             sink(),
         );
 
@@ -4139,6 +4616,7 @@ mod tests {
             "song".to_string(),
             URL.to_string(),
             "id0".to_string(),
+            None,
             sink(),
         );
         assert!(!playback_plan(&app).1.args().iter().any(|a| a == "--sid=no"));
@@ -5338,7 +5816,7 @@ mod tests {
     fn scrolling_moves_by_a_line_and_by_a_screen() {
         let mut app = commented_app();
         let lines = 2 * comments::COMMENT_LIMIT;
-        let height = 19;
+        let height = 18;
 
         scroll_comments(&mut app, CommentScroll::Line(1));
         assert_eq!(app.comments.scroll(lines, height), 1);
@@ -5354,7 +5832,7 @@ mod tests {
     fn scrolling_stops_at_the_last_screen_of_the_list() {
         let mut app = commented_app();
         let lines = 2 * comments::COMMENT_LIMIT;
-        let height = 19;
+        let height = 18;
 
         for _ in 0..20 {
             scroll_comments(&mut app, CommentScroll::Page(1));
