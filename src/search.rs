@@ -37,12 +37,51 @@ pub fn parse_lines(output: &str) -> Vec<SearchResult> {
     output.lines().filter_map(parse_line).collect()
 }
 
+/// Target ごとのパース。検索結果ページはチャンネルの行も混ぜて返すので動画だけ残し、
+/// どの種別でも公開日の新しい順に並べ替える。
+pub fn parse_target_lines(target: &Target, output: &str) -> Vec<SearchResult> {
+    let mut lines: Vec<ParsedLine> = output
+        .lines()
+        .filter_map(parse_entry)
+        .filter(|line| !matches!(target, Target::Search(_)) || line.is_video)
+        .collect();
+    // 日付が無い行同士は元の順序を保つ (安定ソート)。日付が取れない種別は並びが変わらない。
+    lines.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    lines.into_iter().map(|line| line.result).collect()
+}
+
+/// 1 行ぶんの読み取り結果。timestamp と ie_key は並べ替えと選り分けにしか使わないので、
+/// SearchResult には載せずここでだけ持つ。
+struct ParsedLine {
+    result: SearchResult,
+    /// approximate_date で入る公開日時。履歴等では入らない。
+    timestamp: Option<i64>,
+    /// ie_key が "Youtube" か。チャンネルの行は "YoutubeTab" で返る。
+    is_video: bool,
+}
+
+fn parse_entry(line: &str) -> Option<ParsedLine> {
+    let value = parse_value(line)?;
+    Some(ParsedLine {
+        result: result_from(&value)?,
+        timestamp: value.get("timestamp").and_then(Value::as_i64),
+        is_video: value.get("ie_key").and_then(Value::as_str) == Some("Youtube"),
+    })
+}
+
 fn parse_line(line: &str) -> Option<SearchResult> {
+    result_from(&parse_value(line)?)
+}
+
+fn parse_value(line: &str) -> Option<Value> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
-    let value: Value = serde_json::from_str(line).ok()?;
+    serde_json::from_str(line).ok()
+}
+
+fn result_from(value: &Value) -> Option<SearchResult> {
     let id = value.get("id")?.as_str()?.to_string();
     let title = value
         .get("title")
@@ -120,25 +159,20 @@ impl YtDlp for RealYtDlp {
 
 pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>, limit: usize) -> Vec<String> {
     let mut args = vec![
-        target.yt_dlp_url(limit),
+        target.yt_dlp_url(),
         "--flat-playlist".to_string(),
         "--dump-json".to_string(),
+        // 行に公開日を入れさせる。付けないと timestamp が常に null で並べ替えられない。
+        "--extractor-args".to_string(),
+        "youtubetab:approximate_date".to_string(),
+        "--playlist-end".to_string(),
     ];
-    match target {
-        Target::Feed(_) => {
-            args.push("--playlist-end".to_string());
-            args.push(FEED_LIMIT.to_string());
-        }
-        Target::Channel { .. } => {
-            args.push("--playlist-end".to_string());
-            args.push(CHANNEL_LIMIT.to_string());
-        }
-        Target::Playlist(_) => {
-            args.push("--playlist-end".to_string());
-            args.push(PLAYLIST_LIMIT.to_string());
-        }
-        Target::Search(_) => {}
-    }
+    args.push(match target {
+        Target::Search(_) => limit.to_string(),
+        Target::Feed(_) => FEED_LIMIT.to_string(),
+        Target::Channel { .. } => CHANNEL_LIMIT.to_string(),
+        Target::Playlist(_) => PLAYLIST_LIMIT.to_string(),
+    });
     if let Some(cookies) = cookies {
         args.extend(cookies.yt_dlp_args());
     }
@@ -301,7 +335,7 @@ async fn attempt(
     } else {
         CookieOutcome::NotUsed
     };
-    let results = parse_lines(&String::from_utf8_lossy(&output.stdout));
+    let results = parse_target_lines(target, &String::from_utf8_lossy(&output.stdout));
     let results = if results.is_empty() && !output.status.success() {
         Err(format!("yt-dlp が失敗しました: {}", stderr_detail(&stderr)))
     } else {
@@ -417,8 +451,7 @@ mod tests {
     use crate::cookies::{CHANNEL_LIMIT, ChannelTab, Feed};
     use crate::search::fixtures::{FakeYtDlp, Step, done, missing};
 
-    const LINE_FULL: &str =
-        r#"{"id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
+    const LINE_FULL: &str = r#"{"ie_key":"Youtube","id":"abc123","title":"Rust TUI tutorial","duration":612.0,"uploader":"someone"}"#;
 
     fn source(spec: &str) -> CookieSource {
         CookieSource::from_spec(Some(spec)).expect("spec")
@@ -426,6 +459,12 @@ mod tests {
 
     fn has_cookie_flag(args: &[String]) -> bool {
         args.iter().any(|a| a == "--cookies-from-browser")
+    }
+
+    /// --playlist-end に渡した件数。
+    fn playlist_end(args: &[String]) -> Option<String> {
+        let at = args.iter().position(|a| a == "--playlist-end")?;
+        args.get(at + 1).cloned()
     }
 
     #[test]
@@ -507,6 +546,127 @@ mod tests {
         ] {
             assert!(!parse_lines(not_live)[0].is_live, "{not_live}");
         }
+    }
+
+    /// 検索結果ページの動画の行。approximate_date を付けると timestamp が入る。
+    fn video_line(id: &str, timestamp: Option<i64>) -> String {
+        match timestamp {
+            Some(timestamp) => format!(
+                r#"{{"ie_key":"Youtube","id":"{id}","title":"{id}","timestamp":{timestamp}}}"#
+            ),
+            None => format!(r#"{{"ie_key":"Youtube","id":"{id}","title":"{id}"}}"#),
+        }
+    }
+
+    /// 検索結果ページは動画の間にチャンネルの行を混ぜて返す。
+    const CHANNEL_ROW: &str = r#"{"_type":"url","ie_key":"YoutubeTab","id":"UCabc","title":"Some Channel","url":"https://www.youtube.com/channel/UCabc"}"#;
+
+    fn ids(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    fn all_targets() -> [Target; 4] {
+        [
+            Target::Search("q".to_string()),
+            Target::Feed(Feed::Recommended),
+            Target::Channel {
+                id: "UCabc".to_string(),
+                tab: ChannelTab::Videos,
+            },
+            Target::Playlist("PLabc123".to_string()),
+        ]
+    }
+
+    #[test]
+    fn a_search_drops_the_channel_rows_of_the_results_page() {
+        let out = format!(
+            "{}\n{CHANNEL_ROW}\n{}\n",
+            video_line("v1", Some(3)),
+            video_line("v2", Some(2))
+        );
+        let results = parse_target_lines(&Target::Search("q".to_string()), &out);
+        assert_eq!(ids(&results), ["v1", "v2"]);
+    }
+
+    #[test]
+    fn the_other_targets_keep_every_row_they_are_given() {
+        // チャンネル・プレイリスト・フィードの行は ie_key を欠くことがあるので選り分けない。
+        let out = format!(
+            "{}\n{}\n",
+            r#"{"id":"v1","title":"t","timestamp":2}"#, r#"{"id":"v2","title":"t"}"#
+        );
+        for target in all_targets().into_iter().skip(1) {
+            assert_eq!(
+                ids(&parse_target_lines(&target, &out)),
+                ["v1", "v2"],
+                "{target:?}"
+            );
+        }
+        // 検索では ie_key の無い行は動画と見なさない。
+        assert!(parse_target_lines(&Target::Search("q".to_string()), &out).is_empty());
+    }
+
+    #[test]
+    fn results_come_back_newest_first() {
+        let out = format!(
+            "{}\n{}\n{}\n",
+            video_line("old", Some(1_600_000_000)),
+            video_line("new", Some(1_750_000_000)),
+            video_line("mid", Some(1_700_000_000))
+        );
+        for target in all_targets() {
+            assert_eq!(
+                ids(&parse_target_lines(&target, &out)),
+                ["new", "mid", "old"],
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_without_a_date_keep_their_order_after_the_dated_ones() {
+        // 履歴・登録チャンネルの行には日付が乗らないので、並べ替えで混ぜ返さない。
+        let out = format!(
+            "{}\n{}\n{}\n",
+            video_line("a", None),
+            video_line("dated", Some(1_700_000_000)),
+            video_line("b", None)
+        );
+        let results = parse_target_lines(&Target::Feed(Feed::History), &out);
+        assert_eq!(ids(&results), ["dated", "a", "b"]);
+        // 全部日付が無ければ元の順のまま。
+        let out = format!("{}\n{}\n", video_line("a", None), video_line("b", None));
+        let results = parse_target_lines(&Target::Feed(Feed::History), &out);
+        assert_eq!(ids(&results), ["a", "b"]);
+    }
+
+    #[test]
+    fn parse_target_lines_reads_the_same_fields_as_the_line_parser() {
+        // 日付順に並べ替えても、行から読む中身は変わらない。
+        assert_eq!(
+            parse_target_lines(&Target::Search("q".to_string()), LINE_FULL),
+            parse_lines(LINE_FULL)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_search_hands_back_the_newest_first() {
+        let out = format!(
+            "{}\n{}\n",
+            video_line("old", Some(1_600_000_000)),
+            video_line("new", Some(1_750_000_000))
+        );
+        let runner = FakeYtDlp::new([done(0, &out, "")]);
+        let report = run_search(
+            &runner,
+            &Target::Search("q".to_string()),
+            None,
+            10,
+            YT_DLP_TIMEOUT,
+        )
+        .await;
+        let results = report.results.expect("結果は返る");
+        assert_eq!(ids(&results), ["new", "old"]);
     }
 
     const ONE_VIDEO: &str = r#"{"id":"id1","title":"t","channel_id":"UCfeed","uploader":"Up"}"#;
@@ -615,6 +775,8 @@ mod tests {
                 "https://www.youtube.com/channel/UCabc/shorts",
                 "--flat-playlist",
                 "--dump-json",
+                "--extractor-args",
+                "youtubetab:approximate_date",
                 "--playlist-end",
                 &CHANNEL_LIMIT.to_string(),
             ]
@@ -657,7 +819,15 @@ mod tests {
     fn yt_dlp_args_without_cookies_match_the_current_command() {
         assert_eq!(
             yt_dlp_args(&Target::Search("q".to_string()), None, 10),
-            ["ytsearch10:q", "--flat-playlist", "--dump-json"]
+            [
+                "https://www.youtube.com/results?search_query=q",
+                "--flat-playlist",
+                "--dump-json",
+                "--extractor-args",
+                "youtubetab:approximate_date",
+                "--playlist-end",
+                "10",
+            ]
         );
     }
 
@@ -669,13 +839,10 @@ mod tests {
             10,
         );
         assert_eq!(
-            args,
+            args[args.len() - 2..],
             [
-                "ytsearch10:q",
-                "--flat-playlist",
-                "--dump-json",
-                "--cookies-from-browser",
-                "chrome:P 1",
+                "--cookies-from-browser".to_string(),
+                "chrome:P 1".to_string()
             ]
         );
     }
@@ -684,22 +851,32 @@ mod tests {
     fn yt_dlp_args_pass_a_cookie_file_with_the_cookies_flag() {
         let file =
             CookieSource::from_file(Some(std::path::Path::new("/tmp/cookies.txt"))).expect("path");
+        let args = yt_dlp_args(&Target::Search("q".to_string()), Some(&file), 10);
         assert_eq!(
-            yt_dlp_args(&Target::Search("q".to_string()), Some(&file), 10),
-            [
-                "ytsearch10:q",
-                "--flat-playlist",
-                "--dump-json",
-                "--cookies",
-                "/tmp/cookies.txt",
-            ]
+            args[args.len() - 2..],
+            ["--cookies".to_string(), "/tmp/cookies.txt".to_string()]
         );
     }
 
     #[test]
     fn yt_dlp_args_take_the_result_count_from_the_setting() {
+        // 検索も件数は URL でなく --playlist-end で渡す。
         let args = yt_dlp_args(&Target::Search("q".to_string()), None, 25);
-        assert_eq!(args[0], "ytsearch25:q");
+        assert_eq!(args[0], "https://www.youtube.com/results?search_query=q");
+        assert_eq!(playlist_end(&args), Some("25".to_string()));
+    }
+
+    #[test]
+    fn yt_dlp_args_always_ask_for_approximate_dates() {
+        // 公開日が行に乗らないと日付順に並べ替えられないので、どの種別にも付ける。
+        for target in all_targets() {
+            let args = yt_dlp_args(&target, None, 10);
+            let at = args
+                .iter()
+                .position(|a| a == "--extractor-args")
+                .unwrap_or_else(|| panic!("{target:?} に --extractor-args がある"));
+            assert_eq!(args[at + 1], "youtubetab:approximate_date", "{target:?}");
+        }
     }
 
     /// プレイリスト一覧の行。uploader は固定文字列で、duration/channel_id は null で返る。
@@ -779,6 +956,8 @@ mod tests {
                 "https://www.youtube.com/playlist?list=PLabc123",
                 "--flat-playlist",
                 "--dump-json",
+                "--extractor-args",
+                "youtubetab:approximate_date",
                 "--playlist-end",
                 &PLAYLIST_LIMIT.to_string(),
             ]
@@ -888,17 +1067,17 @@ mod tests {
                 ":ytrec",
                 "--flat-playlist",
                 "--dump-json",
+                "--extractor-args",
+                "youtubetab:approximate_date",
                 "--playlist-end",
                 "30",
                 "--cookies-from-browser",
                 "chrome",
             ]
         );
-        assert!(
-            !yt_dlp_args(&Target::Search("q".to_string()), None, 10)
-                .iter()
-                .any(|a| a == "--playlist-end")
-        );
+        // フィードの上限は設定の件数では変わらない。
+        let args = yt_dlp_args(&Target::Feed(Feed::Recommended), None, 25);
+        assert_eq!(playlist_end(&args), Some(FEED_LIMIT.to_string()));
     }
 
     #[tokio::test]

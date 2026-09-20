@@ -3176,6 +3176,12 @@ mod tests {
             .expect("完走");
     }
 
+    /// yt-dlp へ渡った件数 (--playlist-end の次の引数)。
+    fn playlist_end(args: &[String]) -> Option<String> {
+        let at = args.iter().position(|a| a == "--playlist-end")?;
+        args.get(at + 1).cloned()
+    }
+
     #[tokio::test]
     async fn open_channel_searches_the_video_tab_of_the_selected_result() {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -5289,7 +5295,12 @@ mod tests {
 
         let args = runner.calls();
         assert_eq!(
-            args[0][0], "ytsearch20:ラーメン",
+            args[0][0],
+            Target::Search("ラーメン".to_string()).yt_dlp_url()
+        );
+        assert_eq!(
+            playlist_end(&args[0]).as_deref(),
+            Some("20"),
             "取り直し(r)でも伸ばした件数のまま取りに行く"
         );
         let Some(AppEvent::SearchDone {
@@ -5374,7 +5385,12 @@ mod tests {
         finish_search(&mut session).await;
         let args = runner.calls();
         assert_eq!(
-            args[0][0], "ytsearch20:ラーメン",
+            args[0][0],
+            Target::Search("ラーメン".to_string()).yt_dlp_url()
+        );
+        assert_eq!(
+            playlist_end(&args[0]).as_deref(),
+            Some("20"),
             "表示中 10 件 + limit(10) で 20 件要求"
         );
 
@@ -5401,7 +5417,10 @@ mod tests {
 
         finish_search(&mut session).await;
         let args = runner.calls();
-        assert_eq!(args[0][0], format!("ytsearch{MAX_SEARCH_LIMIT}:ラーメン"));
+        assert_eq!(
+            playlist_end(&args[0]).as_deref(),
+            Some(MAX_SEARCH_LIMIT.to_string().as_str())
+        );
     }
 
     #[tokio::test]

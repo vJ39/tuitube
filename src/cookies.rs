@@ -1,10 +1,14 @@
 //! YouTube ログイン cookie を yt-dlp 経由で使うための判定と文言。
 //! 外部プロセスには触れない。実行は search.rs / mpv.rs が行う。
 
+use crate::oauth::percent_encode;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const ENV_VAR: &str = "TUITUBE_COOKIES_FROM_BROWSER";
+/// 検索結果ページ。`ytsearchN:` で引くと行に公開日が乗らないので、
+/// 日付順に並べ替えられるこちらを使う。
+pub const SEARCH_URL: &str = "https://www.youtube.com/results?search_query=";
 /// フィードは制限しないと 167 件返ることがある (`:ytrec` 実測)。
 pub const FEED_LIMIT: usize = 30;
 /// チャンネルのタブは投稿を全部返すので、同じく上限を付ける。
@@ -438,10 +442,10 @@ impl Target {
         }
     }
 
-    /// limit は [search] limit。フィードは件数を --playlist-end で渡すのでここでは使わない。
-    pub fn yt_dlp_url(&self, limit: usize) -> String {
+    /// 件数はどの種別も --playlist-end で渡すので、URL には入れない。
+    pub fn yt_dlp_url(&self) -> String {
         match self {
-            Target::Search(query) => format!("ytsearch{limit}:{query}"),
+            Target::Search(query) => format!("{SEARCH_URL}{}", percent_encode(query)),
             Target::Feed(feed) => feed.keyword().to_string(),
             Target::Channel { id, tab } => {
                 format!("https://www.youtube.com/channel/{id}/{}", tab.path())
@@ -1049,14 +1053,30 @@ mod tests {
     fn target_for_query_wraps_searches_and_passes_feeds() {
         let target = Target::for_query("rust tui");
         assert_eq!(target, Target::Search("rust tui".to_string()));
-        assert_eq!(target.yt_dlp_url(10), "ytsearch10:rust tui");
-        // 件数は設定から渡る。
-        assert_eq!(target.yt_dlp_url(25), "ytsearch25:rust tui");
+        assert_eq!(
+            target.yt_dlp_url(),
+            "https://www.youtube.com/results?search_query=rust%20tui"
+        );
 
         let target = Target::for_query(" :ytsubs ");
         assert_eq!(target, Target::Feed(Feed::Subscriptions));
-        assert_eq!(target.yt_dlp_url(10), ":ytsubs");
-        assert_eq!(target.yt_dlp_url(25), ":ytsubs");
+        assert_eq!(target.yt_dlp_url(), ":ytsubs");
+    }
+
+    #[test]
+    fn a_search_becomes_the_results_page_url() {
+        // ytsearchN: では行に公開日が乗らないので、検索結果ページを引く。
+        let target = Target::Search("ラーメン 二郎".to_string());
+        assert_eq!(
+            target.yt_dlp_url(),
+            format!("{SEARCH_URL}%E3%83%A9%E3%83%BC%E3%83%A1%E3%83%B3%20%E4%BA%8C%E9%83%8E")
+        );
+        // クエリの記号が URL の区切りに化けない。
+        let target = Target::Search("a&b=c?d#e".to_string());
+        assert_eq!(
+            target.yt_dlp_url(),
+            format!("{SEARCH_URL}a%26b%3Dc%3Fd%23e")
+        );
     }
 
     #[test]
@@ -1101,11 +1121,9 @@ mod tests {
                 tab,
             };
             assert_eq!(
-                target.yt_dlp_url(10),
+                target.yt_dlp_url(),
                 format!("https://www.youtube.com/channel/UCabc/{path}")
             );
-            // 件数は --playlist-end で渡すので limit では変わらない。
-            assert_eq!(target.yt_dlp_url(25), target.yt_dlp_url(10));
         }
     }
 
@@ -1142,11 +1160,9 @@ mod tests {
     fn a_playlist_becomes_its_youtube_url() {
         let target = Target::Playlist("PLabc123".to_string());
         assert_eq!(
-            target.yt_dlp_url(10),
+            target.yt_dlp_url(),
             "https://www.youtube.com/playlist?list=PLabc123"
         );
-        // 件数は --playlist-end で渡すので limit では変わらない。
-        assert_eq!(target.yt_dlp_url(25), target.yt_dlp_url(10));
         // 一覧側は id を取らないので Target ではなく URL 1 本。
         assert_eq!(PLAYLISTS_URL, "https://www.youtube.com/feed/playlists");
     }

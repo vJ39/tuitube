@@ -22,7 +22,7 @@ pub const DEFAULT_FPS_CAP: u32 = 15;
 pub const MAX_FPS_CAP: u32 = 120;
 pub const MIN_FRAME_PIXELS: u32 = 64 * 36;
 pub const MAX_FRAME_PIXELS_LIMIT: u32 = 3840 * 2160;
-/// 1 回の検索で取る件数 (ytsearchN の N)。
+/// 1 回の検索で取る件数 (yt-dlp の --playlist-end に渡す値)。
 pub const DEFAULT_SEARCH_LIMIT: usize = 10;
 pub const MIN_SEARCH_LIMIT: usize = 1;
 pub const MAX_SEARCH_LIMIT: usize = 1000;
