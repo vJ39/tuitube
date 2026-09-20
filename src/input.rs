@@ -117,6 +117,12 @@ async fn handle_key_results(
     session: &mut Session,
 ) {
     match key.code {
+        // 末尾で押したときは、もっと見られる (m キーと同じ判定) 状態なら一覧を送らず
+        // 読み込みを始める。list 表示は select_next が末尾で先頭へ巻き戻るため、この
+        // 判定は move_selection を呼ぶ前に行う (巻き戻った後では末尾にいたと分からない)。
+        KeyCode::Down if app.view_is_at_last_result() && app.can_load_more() && !app.searching => {
+            load_more(app, tx, session)
+        }
         KeyCode::Down => move_selection(app, Dir::Down),
         KeyCode::Up => move_selection(app, Dir::Up),
         KeyCode::Right => move_selection(app, Dir::Right),
@@ -2677,6 +2683,72 @@ mod tests {
         handle_key_results(&mut app, key(KeyCode::Char('m')), &tx, &mut session).await;
 
         assert!(take_search(&mut session), "もっと見るを取りに行く");
+    }
+
+    #[tokio::test]
+    async fn down_at_the_last_row_loads_more_instead_of_moving() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(8); // 4 列 x 2 行。
+        app.query.set("ラーメン");
+        app.tabs.state_mut().requested_limit = 8;
+        app.selected = 7; // 末尾。
+
+        handle_key_results(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+
+        assert!(take_search(&mut session), "末尾の Down は読み込みを始める");
+        assert_eq!(app.selected, 7, "選択はまだ動かさない");
+    }
+
+    #[tokio::test]
+    async fn down_at_the_last_row_still_moves_when_more_cannot_be_loaded() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(8);
+        app.query.set("ラーメン");
+        // requested_limit を立てていないので can_load_more は false。
+        app.selected = 7;
+
+        handle_key_results(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+
+        assert!(
+            !take_search(&mut session),
+            "もっと見られないので通常の移動のまま"
+        );
+        assert_eq!(app.selected, 7, "grid は末尾で留まる (今までどおり)");
+    }
+
+    #[tokio::test]
+    async fn down_before_the_last_row_moves_even_when_more_can_be_loaded() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(8);
+        app.query.set("ラーメン");
+        app.tabs.state_mut().requested_limit = 8;
+        app.selected = 0;
+
+        handle_key_results(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+
+        assert!(!take_search(&mut session), "末尾に着くまでは通常の移動");
+        assert_eq!(
+            app.selected, 4,
+            "grid 4 列ぶん進み、2 行目の先頭 (末尾ではない) へ"
+        );
+    }
+
+    #[tokio::test]
+    async fn down_at_the_last_row_does_not_load_more_twice_while_already_searching() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(8);
+        app.query.set("ラーメン");
+        app.tabs.state_mut().requested_limit = 8;
+        app.selected = 7;
+        app.searching = true; // 直前の Down で既に読み込み中。
+
+        handle_key_results(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+
+        assert!(!take_search(&mut session), "取得中の多重発行を防ぐ");
     }
 
     /// Ctrl を押しながらのキー。

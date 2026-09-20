@@ -810,6 +810,12 @@ impl App {
         self.view_results().iter().map(|r| r.id.clone()).collect()
     }
 
+    /// 選択中の行が一覧の最後の行か。0件のときは false。
+    pub fn view_is_at_last_result(&self) -> bool {
+        let len = self.view_results().len();
+        len > 0 && self.view_selected() + 1 == len
+    }
+
     pub fn select_next(&mut self) {
         let len = self.view_results().len();
         if len == 0 {
@@ -1499,6 +1505,34 @@ mod tests {
         app.tabs.state_mut().requested_limit = max;
         // 要求件数どおり満額で返っていても、上限まで要求済みならこれ以上は無い。
         assert!(!app.can_load_more(), "上限まで要求済み");
+    }
+
+    #[test]
+    fn view_is_at_last_result_is_false_when_nothing_is_selected_yet() {
+        let app = App::default();
+        assert!(!app.view_is_at_last_result(), "0件のときは false");
+    }
+
+    #[test]
+    fn view_is_at_last_result_is_false_in_the_middle_of_the_list() {
+        let mut app = App::default();
+        app.set_results(
+            vec![result("a"), result("b"), result("c")],
+            &search_target(),
+        );
+        app.selected = 1;
+        assert!(!app.view_is_at_last_result());
+    }
+
+    #[test]
+    fn view_is_at_last_result_is_true_on_the_last_row() {
+        let mut app = App::default();
+        app.set_results(
+            vec![result("a"), result("b"), result("c")],
+            &search_target(),
+        );
+        app.selected = 2;
+        assert!(app.view_is_at_last_result());
     }
 
     #[test]
