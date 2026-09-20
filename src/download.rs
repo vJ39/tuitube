@@ -131,6 +131,21 @@ fn with_log_hint(message: String, debug_log_path: Option<&Path>) -> String {
     }
 }
 
+/// 失敗時の文言に使う1行。yt-dlp は半年以上更新していないと必ず先頭に
+/// バージョン警告を出すため、stderr をそのまま使うとステータス行(高さ1行)には
+/// 警告だけが出て、後ろにある本当の理由 (ERROR: ...) が画面から消える。
+/// "ERROR" を含む最初の行を優先し、無ければ最後の空でない行を使う。
+fn failure_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    lines
+        .iter()
+        .find(|line| line.contains("ERROR"))
+        .or_else(|| lines.iter().rev().find(|line| !line.is_empty()))
+        .copied()
+        .unwrap_or("")
+        .to_string()
+}
+
 /// `--print after_move:filepath` が出す最後の行を保存済みパスとして読む。
 /// 空行が続いても、最後に出た値のある行を採る。
 pub fn extract_saved_path(stdout: &str) -> Option<String> {
@@ -186,7 +201,7 @@ pub async fn run<D: Downloader>(
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(with_log_hint(
-            format!("ダウンロードに失敗しました: {}", stderr.trim()),
+            format!("ダウンロードに失敗しました: {}", failure_reason(&stderr)),
             debug_log_path,
         ))
     }
@@ -397,6 +412,47 @@ mod tests {
         .await
         .expect_err("失敗");
         assert_eq!(error, "ダウンロードに失敗しました: ERROR: ffmpeg not found");
+    }
+
+    #[tokio::test]
+    async fn run_surfaces_the_error_line_even_behind_an_update_warning() {
+        // yt-dlp は半年以上更新していないと必ず先頭にこの警告を出す。ステータス行は
+        // 1行しか出せないので、先頭行のままだと本当の理由 (ERROR:) が画面から消える。
+        let stderr = "WARNING: Your yt-dlp version (2026.03.17) is older than 90 days!\n\
+                       It is strongly recommended to always use the latest version.\n\
+                       ERROR: unable to download video data: HTTP Error 403: Forbidden\n";
+        let downloader = FakeDownloader::new([done(1, "", stderr)]);
+        let error = run(
+            &downloader,
+            "/tmp/out",
+            "title",
+            false,
+            "https://x/v=1",
+            None,
+        )
+        .await
+        .expect_err("失敗");
+        assert_eq!(
+            error,
+            "ダウンロードに失敗しました: ERROR: unable to download video data: HTTP Error 403: Forbidden"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_falls_back_to_the_last_line_without_an_error_marker() {
+        let stderr = "WARNING: 何かの警告\n続きの説明行\n";
+        let downloader = FakeDownloader::new([done(1, "", stderr)]);
+        let error = run(
+            &downloader,
+            "/tmp/out",
+            "title",
+            false,
+            "https://x/v=1",
+            None,
+        )
+        .await
+        .expect_err("失敗");
+        assert_eq!(error, "ダウンロードに失敗しました: 続きの説明行");
     }
 
     #[tokio::test]
