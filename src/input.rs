@@ -4,12 +4,13 @@ use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
     close_download, close_settings, config_path_from_env, copy_url_with, cycle_display_mode,
     enter_background, hide_current_channel, hide_selected, leave_background, leave_channel,
-    like_video, load_more, move_download_focus, move_selection, move_settings_selection,
-    open_channel, open_download, open_settings, reload_channel_tab, reload_tab,
-    remember_playback_position, reset_speed, save_settings, scroll_comments, seek_absolute,
-    seek_relative, select_channel_tab, select_tab, send_to_player, start_download, start_playback,
-    start_search, stop_playback, subscribe_channel, subscribe_playing_channel, switch_channel_tab,
-    switch_tab, toggle_comments, toggle_subtitles,
+    leave_playlist, leave_playlists, like_video, load_more, move_download_focus, move_selection,
+    move_settings_selection, open_channel, open_download, open_playlist, open_playlists,
+    open_settings, reload_channel_tab, reload_playlist, reload_tab, remember_playback_position,
+    reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative, select_channel_tab,
+    select_tab, send_to_player, start_download, start_playback, start_search, stop_playback,
+    subscribe_channel, subscribe_playing_channel, switch_channel_tab, switch_tab, toggle_comments,
+    toggle_subtitles,
 };
 use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -67,6 +68,8 @@ pub async fn handle_key(
         Mode::Playing => handle_key_playing(app, key, tx, session).await,
         Mode::Settings => handle_key_settings(app, key),
         Mode::Download => handle_key_download(app, key, tx, session).await,
+        Mode::Playlists => handle_key_playlists(app, key, tx, session).await,
+        Mode::Playlist => handle_key_playlist(app, key, tx, session).await,
     }
 }
 
@@ -93,6 +96,8 @@ async fn handle_key_input(
         KeyCode::Char(c) if is_leave_background_key(c, key.modifiers) => {
             leave_background(app, session).await;
         }
+        // p も検索語なので、プレイリスト一覧は Ctrl+P で開く。
+        KeyCode::Char(c) if is_playlists_key(c, key.modifiers) => open_playlists(app, tx, session),
         // 他の Ctrl 付きは検索語に入れない。制御文字が混ざると検索が通らない。
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char(c) => {
@@ -140,6 +145,7 @@ async fn handle_key_results(
         KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
+        KeyCode::Char('p') => open_playlists(app, tx, session),
         // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
         KeyCode::Char('m') => load_more(app, tx, session),
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
@@ -194,6 +200,65 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
     }
 }
 
+/// プレイリスト一覧。サムネイルを持たない 1 列のリストなので、上下と開く・戻るだけ。
+async fn handle_key_playlists(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    match key.code {
+        KeyCode::Down => {
+            if let Some(view) = app.playlists.as_mut() {
+                view.select_next();
+            }
+        }
+        KeyCode::Up => {
+            if let Some(view) = app.playlists.as_mut() {
+                view.select_prev();
+            }
+        }
+        KeyCode::Enter => open_playlist(app, tx, session),
+        KeyCode::Char('S') => open_settings(app, session),
+        KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        // バックグラウンド中でなければ何もしない (leave_background が判定する)。
+        KeyCode::Char('b') => leave_background(app, session).await,
+        KeyCode::Char('/') | KeyCode::Esc => leave_playlists(app, session),
+        KeyCode::Char('q') => app.confirm_quit = true,
+        _ => {}
+    }
+}
+
+/// プレイリストの中の動画一覧。チャンネルと同型だが、タブ送りと登録は持たない。
+async fn handle_key_playlist(
+    app: &mut App,
+    key: KeyEvent,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+) {
+    match key.code {
+        KeyCode::Down => move_selection(app, Dir::Down),
+        KeyCode::Up => move_selection(app, Dir::Up),
+        KeyCode::Right => move_selection(app, Dir::Right),
+        KeyCode::Left => move_selection(app, Dir::Left),
+        KeyCode::Enter => start_playback(app, tx, session).await,
+        KeyCode::Char('S') => open_settings(app, session),
+        KeyCode::Char(c) if is_settings_key(c, key.modifiers) => open_settings(app, session),
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char('r') => reload_playlist(app, tx, session),
+        KeyCode::Char('c') => open_channel(app, tx, session),
+        KeyCode::Char('d') => open_download(app, session),
+        // プレイリストごと隠す手はないので、チャンネルと違い動画 1 件だけを隠す。
+        KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
+        // バックグラウンド中でなければ何もしない (leave_background が判定する)。
+        KeyCode::Char('b') => leave_background(app, session).await,
+        KeyCode::Char('/') | KeyCode::Esc => leave_playlist(app, session),
+        KeyCode::Char('q') => app.confirm_quit = true,
+        _ => {}
+    }
+}
+
 /// 設定画面を開くキー。Ctrl+S はどちらの検索画面でも使える。
 fn is_settings_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'s')
@@ -202,6 +267,11 @@ fn is_settings_key(c: char, modifiers: KeyModifiers) -> bool {
 /// バックグラウンド中に前面へ戻すキー。入力欄では b も検索語なので Ctrl 付きだけを見る。
 fn is_leave_background_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'b')
+}
+
+/// プレイリスト一覧を開くキー。入力欄では p も検索語なので Ctrl 付きだけを見る。
+fn is_playlists_key(c: char, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'p')
 }
 
 /// 検索語を全選択するキー。
@@ -471,7 +541,7 @@ pub async fn handle_mouse(
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
         Mode::Channel => handle_mouse_channel(app, mouse, tx, session).await,
         Mode::Input => handle_mouse_input(app, mouse, tx, session),
-        Mode::Settings | Mode::Download => {}
+        Mode::Settings | Mode::Download | Mode::Playlists | Mode::Playlist => {}
     }
 }
 
@@ -671,13 +741,13 @@ fn playing_command(code: KeyCode) -> Option<MpvCommand> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{ChannelView, Playback};
+    use crate::app::{ChannelView, Playback, PlaylistView, PlaylistsView};
     use crate::category::{Category, Tabs};
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::display::DisplayMode;
     use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
-    use crate::search::SearchResult;
+    use crate::search::{PlaylistEntry, SearchResult};
     use crate::seekbar::SeekBarState;
     use crossterm::event::MouseButton;
     use ratatui::layout::Rect;
@@ -2418,6 +2488,292 @@ mod tests {
             handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
 
             assert_eq!(app.mode, Mode::Settings, "{back:?}");
+        }
+    }
+
+    /// プレイリスト一覧を開いた画面。検索結果は控えたまま `count` 件の一覧を出す。
+    fn playlists_app(count: usize) -> App {
+        let mut app = channel_source_app();
+        open_playlists_on(&mut app, count);
+        app
+    }
+
+    fn open_playlists_on(app: &mut App, count: usize) {
+        app.store_to_tab();
+        app.playlists = Some(PlaylistsView {
+            entries: (0..count)
+                .map(|i| PlaylistEntry {
+                    id: format!("PL{i}"),
+                    title: format!("list {i}"),
+                })
+                .collect(),
+            selected: 0,
+            loaded: true,
+        });
+        app.mode = Mode::Playlists;
+    }
+
+    /// 一覧の 1 件目を開いて `count` 件の動画を持たせた画面。
+    fn playlist_app(count: usize) -> App {
+        let mut app = playlists_app(2);
+        app.playlist = Some(PlaylistView::new("PL0".to_string(), "list 0".to_string()));
+        app.mode = Mode::Playlist;
+        let videos: Vec<SearchResult> = (0..count)
+            .map(|i| SearchResult {
+                uploader: Some(format!("Channel {i}")),
+                channel_id: Some(format!("UC{i}")),
+                ..result(&format!("v{i}"))
+            })
+            .collect();
+        app.set_results(videos, &crate::cookies::Target::Playlist("PL0".to_string()));
+        app.mark_drawn();
+        app
+    }
+
+    #[tokio::test]
+    async fn p_opens_the_playlists_from_the_results() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = grid_app(4);
+        app.selected = 2;
+
+        handle_key(&mut app, key(KeyCode::Char('p')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Playlists);
+        assert!(app.playlists.is_some(), "一覧の入れ物を開く");
+        assert!(take_search(&mut session), "一覧を取りに行く");
+        assert_eq!(app.result_ids(), ["id0", "id1", "id2", "id3"], "結果は残す");
+    }
+
+    #[tokio::test]
+    async fn ctrl_p_opens_the_playlists_from_the_search_box() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        // 入力欄では素の p は検索語なので、Ctrl+P で開く。
+        handle_key(&mut app, key(KeyCode::Char('p')), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Input);
+        assert_eq!(app.query.text(), "p");
+
+        handle_key(&mut app, ctrl(KeyCode::Char('p')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Playlists);
+        assert_eq!(app.query.text(), "p", "検索語には足さない");
+        assert!(take_search(&mut session), "一覧を取りに行く");
+    }
+
+    #[tokio::test]
+    async fn the_arrow_keys_move_the_selection_in_the_playlists_list() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlists_app(3);
+
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.playlists.as_ref().expect("playlists").selected, 1);
+        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        assert_eq!(app.playlists.as_ref().expect("playlists").selected, 0);
+        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        assert_eq!(
+            app.playlists.as_ref().expect("playlists").selected,
+            2,
+            "先頭から上は末尾へ"
+        );
+        assert_eq!(app.selected, 0, "検索結果側の選択は動かさない");
+        assert!(
+            !take_search(&mut session),
+            "行を動かすだけでは取りに行かない"
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_opens_the_selected_playlist() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlists_app(3);
+        app.playlists.as_mut().expect("playlists").selected = 1;
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Playlist);
+        let view = app.playlist.as_ref().expect("中身へ移る");
+        assert_eq!(view.playlist_id, "PL1");
+        assert_eq!(view.playlist_title, "list 1");
+        assert!(take_search(&mut session), "中身を取りに行く");
+    }
+
+    #[tokio::test]
+    async fn esc_and_slash_fold_the_playlists_list() {
+        for code in [KeyCode::Esc, KeyCode::Char('/')] {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlists_app(3);
+
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+
+            assert!(app.playlists.is_none(), "{code:?}");
+            assert_eq!(app.mode, Mode::Results, "{code:?}");
+            assert_eq!(app.view_result_ids(), ["id0", "id1", "id2", "id3"]);
+            assert!(!take_search(&mut session), "戻るだけでは取り直さない");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_arrow_keys_move_the_selection_inside_a_playlist() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlist_app(6);
+
+        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 1);
+        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 5);
+        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 4);
+        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
+        assert_eq!(app.view_selected(), 0);
+        assert_eq!(app.selected, 0, "検索結果側の選択は動かさない");
+    }
+
+    #[tokio::test]
+    async fn esc_and_slash_go_back_to_the_playlists_list() {
+        for code in [KeyCode::Esc, KeyCode::Char('/')] {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlist_app(4);
+
+            handle_key(&mut app, key(code), &tx, &mut session).await;
+
+            assert!(app.playlist.is_none(), "{code:?}");
+            assert_eq!(app.mode, Mode::Playlists, "{code:?}");
+            assert!(app.playlists.is_some(), "一覧は持ったまま");
+            assert!(!take_search(&mut session), "一覧は取り直さない");
+        }
+    }
+
+    #[tokio::test]
+    async fn r_takes_the_playlist_again() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlist_app(4);
+
+        handle_key(&mut app, key(KeyCode::Char('r')), &tx, &mut session).await;
+
+        assert!(take_search(&mut session), "同じプレイリストを取りに行く");
+        assert_eq!(app.mode, Mode::Playlist);
+    }
+
+    #[tokio::test]
+    async fn tab_does_nothing_inside_a_playlist() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlist_app(4);
+
+        handle_key(&mut app, key(KeyCode::Tab), &tx, &mut session).await;
+        handle_key(&mut app, key(KeyCode::BackTab), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Playlist);
+        assert_eq!(app.tabs.selected(), 0, "カテゴリタブは送らない");
+        assert!(!take_search(&mut session));
+    }
+
+    #[tokio::test]
+    async fn c_opens_the_channel_of_the_selected_playlist_video() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlist_app(4);
+        app.set_view_selected(2);
+
+        handle_key(&mut app, key(KeyCode::Char('c')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Channel);
+        assert_eq!(app.channel.as_ref().expect("channel").channel_id, "UC2");
+        assert!(take_search(&mut session), "チャンネルの一覧を取りに行く");
+
+        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+        assert_eq!(app.mode, Mode::Playlist, "Esc でプレイリストへ戻る");
+    }
+
+    #[tokio::test]
+    async fn d_opens_the_download_screen_from_a_playlist() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = playlist_app(2);
+
+        handle_key(&mut app, key(KeyCode::Char('d')), &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Download);
+    }
+
+    #[tokio::test]
+    async fn h_hides_the_selected_playlist_video() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let mut app = hiding_app("playlist");
+        open_playlists_on(&mut app, 1);
+        app.playlist = Some(PlaylistView::new("PL0".to_string(), "list 0".to_string()));
+        app.mode = Mode::Playlist;
+        app.set_results(
+            vec![result("v1"), result("v2")],
+            &crate::cookies::Target::Playlist("PL0".to_string()),
+        );
+        app.set_view_selected(1);
+
+        handle_key(&mut app, key(KeyCode::Char('h')), &tx, &mut session).await;
+
+        assert_eq!(app.view_result_ids(), ["v1"], "押した場で消える");
+        assert!(app.hidden.videos.contains("v2"));
+        assert_eq!(app.mode, Mode::Playlist, "一覧に留まる");
+    }
+
+    #[tokio::test]
+    async fn ctrl_keys_do_not_work_the_playlist_screens() {
+        let (tx, _rx) = channel();
+        for mut app in [playlists_app(2), playlist_app(2)] {
+            let mut session = Session::default();
+            let mode = app.mode;
+
+            for code in [KeyCode::Char('r'), KeyCode::Char('q')] {
+                handle_key(&mut app, ctrl(code), &tx, &mut session).await;
+                assert!(!take_search(&mut session), "{mode:?} {code:?}");
+                assert!(!app.should_quit, "{mode:?} {code:?}");
+                assert!(!app.confirm_quit, "{mode:?} {code:?}");
+            }
+            assert_eq!(app.mode, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn q_asks_before_quitting_from_the_playlist_screens() {
+        let (tx, _rx) = channel();
+        for mut app in [playlists_app(2), playlist_app(2)] {
+            let mut session = Session::default();
+            let mode = app.mode;
+
+            handle_key(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
+
+            assert!(!app.should_quit, "{mode:?}");
+            assert!(app.confirm_quit, "{mode:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_settings_open_from_the_playlist_screens() {
+        let (tx, _rx) = channel();
+        for code in [KeyCode::Char('S'), KeyCode::Char('s')] {
+            for mut app in [playlists_app(2), playlist_app(2)] {
+                let mut session = Session::default();
+                let back = app.mode;
+                let pressed = if code == KeyCode::Char('s') {
+                    ctrl(code)
+                } else {
+                    key(code)
+                };
+
+                handle_key(&mut app, pressed, &tx, &mut session).await;
+
+                assert_eq!(app.mode, Mode::Settings, "{back:?} {code:?}");
+            }
         }
     }
 

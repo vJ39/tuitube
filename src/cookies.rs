@@ -9,6 +9,10 @@ pub const ENV_VAR: &str = "TUITUBE_COOKIES_FROM_BROWSER";
 pub const FEED_LIMIT: usize = 30;
 /// チャンネルのタブは投稿を全部返すので、同じく上限を付ける。
 pub const CHANNEL_LIMIT: usize = 50;
+/// プレイリストも中身を全部返すので、チャンネルのタブと同じ上限を使う。
+pub const PLAYLIST_LIMIT: usize = CHANNEL_LIMIT;
+/// 自分のプレイリスト一覧。id を取らないので Target には乗せず URL 1 本で足りる。
+pub const PLAYLISTS_URL: &str = "https://www.youtube.com/feed/playlists";
 
 /// cookie の渡し方。対応ブラウザの一覧も cookies.txt の中身も検証しない
 /// (どちらも yt-dlp の更新で変わるため、検証は yt-dlp に任せる)。
@@ -422,6 +426,7 @@ pub enum Target {
     Search(String),
     Feed(Feed),
     Channel { id: String, tab: ChannelTab },
+    Playlist(String),
 }
 
 impl Target {
@@ -441,6 +446,7 @@ impl Target {
             Target::Channel { id, tab } => {
                 format!("https://www.youtube.com/channel/{id}/{}", tab.path())
             }
+            Target::Playlist(id) => format!("https://www.youtube.com/playlist?list={id}"),
         }
     }
 
@@ -462,6 +468,7 @@ impl Target {
                 ),
             },
             Target::Channel { tab, .. } => tab.empty_message(),
+            Target::Playlist(_) => "このプレイリストには動画がありません".to_string(),
         }
     }
 
@@ -1128,6 +1135,36 @@ mod tests {
                 assert!(message.contains(word), "{message}");
                 assert!(!message.contains("ログイン"), "{message}");
             }
+        }
+    }
+
+    #[test]
+    fn a_playlist_becomes_its_youtube_url() {
+        let target = Target::Playlist("PLabc123".to_string());
+        assert_eq!(
+            target.yt_dlp_url(10),
+            "https://www.youtube.com/playlist?list=PLabc123"
+        );
+        // 件数は --playlist-end で渡すので limit では変わらない。
+        assert_eq!(target.yt_dlp_url(25), target.yt_dlp_url(10));
+        // 一覧側は id を取らないので Target ではなく URL 1 本。
+        assert_eq!(PLAYLISTS_URL, "https://www.youtube.com/feed/playlists");
+    }
+
+    #[test]
+    fn a_playlist_is_not_refused_before_running() {
+        // 非公開プレイリストは cookie が要るが、公開ぶんは cookie 無しでも引けるので
+        // フィードのように先回りで断らない。
+        assert!(!Target::Playlist("PLabc123".to_string()).requires_login());
+    }
+
+    #[test]
+    fn an_empty_playlist_says_it_has_no_videos() {
+        let target = Target::Playlist("PLabc123".to_string());
+        for source in [None, Some(&source("chrome"))] {
+            let message = target.empty_message(source);
+            assert!(message.contains("プレイリスト"), "{message}");
+            assert!(!message.contains("ログイン"), "{message}");
         }
     }
 

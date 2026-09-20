@@ -108,8 +108,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Mode::Playing => draw_playing(frame, app),
         Mode::Settings => draw_settings(frame, app),
         Mode::Download => draw_download(frame, app),
-        // チャンネルも同じ 5 段の画面。中身の参照先だけが app.channel へ移る。
-        Mode::Input | Mode::Results | Mode::Channel => draw_search(frame, app),
+        // チャンネルもプレイリストも同じ 5 段の画面。
+        // 中身の参照先だけが app.channel / app.playlist へ移る。
+        Mode::Input | Mode::Results | Mode::Channel | Mode::Playlists | Mode::Playlist => {
+            draw_search(frame, app)
+        }
     }
 }
 
@@ -295,6 +298,10 @@ pub fn grid_layout(app: &App, cell: CellSize) -> Option<grid::Layout> {
 
 /// 指定の画面寸法での割り付け。リサイズは描き直す前の寸法を渡す。
 pub fn grid_layout_in(app: &App, screen: Rect, cell: CellSize) -> Option<grid::Layout> {
+    // プレイリスト一覧は結果の格子でなく行のリストを出す。画像を貼ると行に重なる。
+    if app.mode == Mode::Playlists {
+        return None;
+    }
     if app.settings.search.layout != LayoutMode::Grid {
         return None;
     }
@@ -408,20 +415,24 @@ fn draw_search(frame: &mut Frame, app: &App) {
     let video = video_target_area(app, frame.area());
     let results_area = areas[2];
 
-    // app.screen は直前の draw の寸法なので、割り付けは今のフレームで組み直す。
-    let layout = if app.settings.search.layout == LayoutMode::Grid {
-        grid::layout(
-            Block::default().borders(Borders::ALL).inner(results_area),
-            cell_size(),
-            app.view_results().len(),
-            app.view_scroll(),
-        )
+    if app.mode == Mode::Playlists {
+        draw_playlists(frame, app, results_area);
     } else {
-        None
-    };
-    match &layout {
-        Some(layout) => draw_grid(frame, app, results_area, layout),
-        None => draw_list(frame, app, results_area),
+        // app.screen は直前の draw の寸法なので、割り付けは今のフレームで組み直す。
+        let layout = if app.settings.search.layout == LayoutMode::Grid {
+            grid::layout(
+                Block::default().borders(Borders::ALL).inner(results_area),
+                cell_size(),
+                app.view_results().len(),
+                app.view_scroll(),
+            )
+        } else {
+            None
+        };
+        match &layout {
+            Some(layout) => draw_grid(frame, app, results_area, layout),
+            None => draw_list(frame, app, results_area),
+        }
     }
 
     // embedded の画像は draw の後にメインループが APC で重ねる。text はここでしか描けない。
@@ -729,6 +740,31 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// プレイリスト一覧。持っているのはタイトルだけなので 1 列のリストで出す。
+fn draw_playlists(frame: &mut Frame, app: &App, area: Rect) {
+    let entries = app.playlists.as_ref().map(|v| v.entries.as_slice());
+    let items: Vec<ListItem> = entries
+        .unwrap_or(&[])
+        .iter()
+        .map(|e| ListItem::new(e.title.clone()))
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" プレイリスト "),
+        )
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    if let Some(view) = &app.playlists
+        && !view.entries.is_empty()
+    {
+        state.select(Some(view.selected));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 /// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
 fn draw_playing(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -1008,6 +1044,8 @@ fn help_text(
         Mode::Input => input_hints(background),
         Mode::Results => results_hints(can_load_more, background),
         Mode::Channel => channel_hints(background),
+        Mode::Playlists => playlists_hints(background),
+        Mode::Playlist => playlist_hints(background),
         Mode::Playing => playing_hints(display, comments_open, can_subscribe),
         Mode::Settings => settings_hints(),
         Mode::Download => download_hints(),
@@ -1030,6 +1068,7 @@ fn input_hints(background: bool) -> Vec<String> {
         "Shift+←→:選択".to_string(),
         "Home/End:先頭/末尾".to_string(),
         "クリック:カーソル".to_string(),
+        "Ctrl+P:プレイリスト".to_string(),
     ];
     if background {
         hints.push("Ctrl+B:全画面へ".to_string());
@@ -1037,7 +1076,7 @@ fn input_hints(background: bool) -> Vec<String> {
     hints
 }
 
-/// 結果一覧の案内。ちょうど 80 桁で、80 桁端末に全部入る。
+/// 結果一覧の案内。S:設定 までちょうど 80 桁で、80 桁端末にはそこまでが出る。
 /// h は押さないと気づけないので、矢印と Esc の言葉を削ってでも入れる。
 /// もっと見られる間だけ末尾に m を足す (狭い端末では他より先に落ちる)。
 /// バックグラウンド中だけ末尾に b (前面へ戻る) を足す。
@@ -1052,6 +1091,7 @@ fn results_hints(can_load_more: bool, background: bool) -> Vec<String> {
         "Esc:検索".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
+        "p:プレイリスト".to_string(),
     ];
     if can_load_more {
         hints.push("m:もっと見る".to_string());
@@ -1073,6 +1113,40 @@ fn channel_hints(background: bool) -> Vec<String> {
         "h:隠す".to_string(),
         "r:再取得".to_string(),
         "Esc:戻る".to_string(),
+        "q:終了".to_string(),
+        "S:設定".to_string(),
+    ];
+    if background {
+        hints.push("b:全画面へ".to_string());
+    }
+    hints
+}
+
+/// プレイリスト一覧の案内。行を選んで開くだけなので短い。
+fn playlists_hints(background: bool) -> Vec<String> {
+    let mut hints = vec![
+        "↑↓:選択".to_string(),
+        "Enter:開く".to_string(),
+        "Esc:戻る".to_string(),
+        "q:終了".to_string(),
+        "S:設定".to_string(),
+    ];
+    if background {
+        hints.push("b:全画面へ".to_string());
+    }
+    hints
+}
+
+/// プレイリストの動画一覧の案内。タブが無いのでカテゴリの案内は出さない。
+/// Esc はプレイリスト一覧へ戻る。
+fn playlist_hints(background: bool) -> Vec<String> {
+    let mut hints = vec![
+        "↑↓←→".to_string(),
+        "Enter:再生".to_string(),
+        "c:チャンネル".to_string(),
+        "h:隠す".to_string(),
+        "r:再取得".to_string(),
+        "Esc:一覧へ".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ];
@@ -1170,10 +1244,10 @@ fn fit_hints(hints: &[String], width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{ChannelView, Playback};
+    use crate::app::{ChannelView, Playback, PlaylistView, PlaylistsView};
     use crate::badge::Badge;
     use crate::category::Tabs;
-    use crate::search::SearchResult;
+    use crate::search::{PlaylistEntry, SearchResult};
     use crate::seekbar::SeekBarState;
     use crate::video::{Geometry, VideoSink};
 
@@ -2127,9 +2201,62 @@ mod tests {
     }
 
     #[test]
+    fn the_playlists_help_names_the_open_and_back_keys() {
+        // タイトルだけの一覧なので、案内に出ないと開き方も戻り方も分からない。
+        let help = help_80(Mode::Playlists, DisplayMode::Embedded);
+        for key in ["↑↓:選択", "Enter:開く", "Esc:戻る", "q:終了", "S:設定"] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
+        assert!(grid::display_width(&help) <= 80, "{help}");
+    }
+
+    #[test]
+    fn the_playlist_help_sends_esc_back_to_the_playlists() {
+        // Esc の戻り先がチャンネルと違うので、言葉も「一覧へ」にする。
+        let help = help_80(Mode::Playlist, DisplayMode::Embedded);
+        for key in [
+            "Enter:再生",
+            "c:チャンネル",
+            "h:隠す",
+            "r:再取得",
+            "Esc:一覧へ",
+            "S:設定",
+        ] {
+            assert!(help.contains(key), "{key} が無い: {help}");
+        }
+        assert!(!help.contains("Tab:"), "タブの無い画面: {help}");
+        assert!(grid::display_width(&help) <= 80, "{help}");
+    }
+
+    #[test]
     fn the_results_help_names_the_channel_key() {
         // 80 桁端末で出ないと、チャンネルへ移れること自体に気づけない。
         assert!(help_80(Mode::Results, DisplayMode::Embedded).contains("c:チャンネル"));
+    }
+
+    #[test]
+    fn the_search_help_names_the_playlists_key() {
+        // 80 桁は既存の案内で埋まっているので、幅のある端末でだけ出る。
+        let results = help_text(
+            Mode::Results,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(results.contains("p:プレイリスト"), "{results}");
+        let input = help_text(
+            Mode::Input,
+            DisplayMode::Embedded,
+            false,
+            false,
+            false,
+            false,
+            200,
+        );
+        assert!(input.contains("Ctrl+P:プレイリスト"), "{input}");
     }
 
     #[test]
@@ -2750,6 +2877,71 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// プレイリスト一覧を開いた 80x24 の画面。検索結果 4 件は控えたまま。
+    fn playlists_app(count: usize) -> App {
+        let mut app = grid_app(4);
+        app.playlists = Some(PlaylistsView {
+            entries: (0..count)
+                .map(|i| PlaylistEntry {
+                    id: format!("PL{i}"),
+                    title: format!("list {i}"),
+                })
+                .collect(),
+            selected: 0,
+            loaded: true,
+        });
+        app.mode = Mode::Playlists;
+        app
+    }
+
+    #[test]
+    fn the_playlists_list_shows_the_titles_and_marks_the_selection() {
+        let mut app = playlists_app(3);
+        app.playlists.as_mut().expect("playlists").selected = 1;
+
+        let screen = rendered(&app, 80, 24);
+
+        assert!(screen.contains("プレイリスト"), "枠の見出し: {screen}");
+        for title in ["list 0", "list 1", "list 2"] {
+            assert!(screen.contains(title), "{title} が無い: {screen}");
+        }
+        assert!(
+            screen.lines().any(|line| line.contains("> list 1")),
+            "選択行に印を付ける: {screen}"
+        );
+        assert!(!screen.contains("title 0"), "検索結果は出さない: {screen}");
+    }
+
+    #[test]
+    fn the_playlists_list_never_lets_the_thumbnails_be_pasted_over_it() {
+        // 割り付けを返すと、検索結果に貼ってあった画像が一覧の行の上に乗る。
+        let app = playlists_app(3);
+        assert!(grid_layout(&app, CELL).is_none());
+        assert!(
+            grid_layout(&grid_app(4), CELL).is_some(),
+            "結果一覧では返す"
+        );
+    }
+
+    #[test]
+    fn a_playlist_draws_its_videos_like_the_results() {
+        let mut app = playlists_app(2);
+        let mut view = PlaylistView::new("PL0".to_string(), "list 0".to_string());
+        view.state.results = (0..2).map(result).collect();
+        view.state.loaded = true;
+        app.playlist = Some(view);
+        app.mode = Mode::Playlist;
+
+        let grid = rendered(&app, 80, 24);
+        assert!(grid.contains("title 0"), "{grid}");
+        assert!(!grid.contains("list 1"), "一覧の行は出さない: {grid}");
+
+        app.settings.search.layout = LayoutMode::List;
+        let list = rendered(&app, 80, 24);
+        assert!(list.contains("結果"), "リスト表示の見出し: {list}");
+        assert!(list.contains("title 1"), "{list}");
     }
 
     #[test]

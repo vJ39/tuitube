@@ -8,7 +8,7 @@ use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
 use crate::resume::Resume;
 use crate::rgb::RgbImage;
-use crate::search::{ChannelRef, SearchReport, SearchResult};
+use crate::search::{ChannelRef, PlaylistEntry, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
 use crate::settings::{
     EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_CACHE_TTL_SECS, MAX_SEARCH_LIMIT,
@@ -47,6 +47,12 @@ pub enum AppEvent {
         report: SearchReport,
         /// yt-dlp へ実際に要求した件数。TabState::requested_limit へそのまま渡す。
         requested_limit: usize,
+    },
+    /// プレイリスト一覧が返った。行が動画でないので SearchDone とは別枠。
+    /// nonce は検索と同じものを使う(打ち切りの仕組みを共用している)。
+    PlaylistsReady {
+        nonce: u64,
+        entries: Result<Vec<PlaylistEntry>, String>,
     },
     // nonce identifies the mpv instance, so events from an already replaced player are ignored.
     MpvProperty {
@@ -120,6 +126,10 @@ pub enum Mode {
     Settings,
     Channel,
     Download,
+    /// プレイリストの一覧。
+    Playlists,
+    /// 1 つのプレイリストの中の動画一覧。
+    Playlist,
 }
 
 /// ダウンロード画面でフォーカス中の行。↑↓ で巡回する。
@@ -158,8 +168,8 @@ impl DownloadField {
     }
 }
 
-/// 一覧の出どころ (チャンネルのタブ位置, カテゴリタブの位置)。
-pub type ViewKey = (Option<usize>, usize);
+/// 一覧の出どころ (チャンネルのタブ位置, カテゴリタブの位置, 開いているプレイリスト)。
+pub type ViewKey = (Option<usize>, usize, Option<String>);
 
 /// チャンネル閲覧中の状態。タブごとの一覧はカテゴリタブと同じ TabState に持つ。
 #[derive(Debug, Clone, PartialEq)]
@@ -219,6 +229,55 @@ impl ChannelView {
             id: self.channel_id.clone(),
             tab: self.tab,
         }
+    }
+}
+
+/// プレイリストの一覧を開いている間の状態。行はタイトルだけでサムネイルを持たないので、
+/// 動画一覧の TabState とは別の入れ物にする。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PlaylistsView {
+    pub entries: Vec<PlaylistEntry>,
+    pub selected: usize,
+    pub loaded: bool,
+}
+
+impl PlaylistsView {
+    pub fn select_next(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.entries.len();
+    }
+
+    pub fn select_prev(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let len = self.entries.len();
+        self.selected = (self.selected + len - 1) % len;
+    }
+}
+
+/// 1 つのプレイリストを開いている間の状態。中身は普通の動画一覧なので、
+/// チャンネルのタブと同じ TabState で持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistView {
+    pub playlist_id: String,
+    pub playlist_title: String,
+    pub state: TabState,
+}
+
+impl PlaylistView {
+    pub fn new(playlist_id: String, playlist_title: String) -> Self {
+        Self {
+            playlist_id,
+            playlist_title,
+            state: TabState::default(),
+        }
+    }
+
+    pub fn target(&self) -> Target {
+        Target::Playlist(self.playlist_id.clone())
     }
 }
 
@@ -603,6 +662,10 @@ pub struct App {
     pub tabs: Tabs,
     /// チャンネル閲覧中だけ入る。入っている間は一覧の参照先がこちらへ移る。
     pub channel: Option<ChannelView>,
+    /// プレイリストの一覧を開いている間だけ入る。
+    pub playlists: Option<PlaylistsView>,
+    /// 1 つのプレイリストを開いている間だけ入る。入っている間は一覧の参照先がこちらへ移る。
+    pub playlist: Option<PlaylistView>,
     pub thumbs: Thumbs,
     /// 再生中の動画のコメント。取得状態と表示の on/off。
     pub comments: Comments,
@@ -669,6 +732,8 @@ impl Default for App {
             confirm_quit: false,
             tabs: Tabs::default(),
             channel: None,
+            playlists: None,
+            playlist: None,
             thumbs: Thumbs::default(),
             comments: Comments::default(),
             scroll: 0,
@@ -756,54 +821,70 @@ impl App {
         self.set_error(None);
     }
 
-    /// 結果の行き先になるタブの状態。チャンネル閲覧中はその現在タブ。
+    /// 検索側のタブではなく、チャンネル/プレイリストの一覧を見ているか。
+    pub fn view_is_nested(&self) -> bool {
+        self.channel.is_some() || self.playlist.is_some()
+    }
+
+    /// 結果の行き先になるタブの状態。チャンネル閲覧中はその現在タブ、
+    /// プレイリストを開いている間はその一覧。
+    /// プレイリストの中からもチャンネルへ移れるので、両方入っているときは後から開いた
+    /// チャンネル側を見る。チャンネルを閉じればプレイリストへ戻る。
     pub fn view_state(&self) -> &TabState {
-        match &self.channel {
-            Some(channel) => channel.state(),
-            None => self.tabs.state(),
+        match (&self.channel, &self.playlist) {
+            (Some(channel), _) => channel.state(),
+            (None, Some(playlist)) => &playlist.state,
+            (None, None) => self.tabs.state(),
         }
     }
 
     pub fn view_state_mut(&mut self) -> &mut TabState {
-        match &mut self.channel {
-            Some(channel) => channel.state_mut(),
-            None => self.tabs.state_mut(),
+        match (&mut self.channel, &mut self.playlist) {
+            (Some(channel), _) => channel.state_mut(),
+            (None, Some(playlist)) => &mut playlist.state,
+            (None, None) => self.tabs.state_mut(),
         }
     }
 
-    /// 今の画面が見ている一覧。チャンネル閲覧中はその現在タブ、それ以外は検索結果。
+    /// 今の画面が見ている一覧。チャンネル/プレイリストを開いている間はそちら、
+    /// それ以外は検索結果。
     pub fn view_results(&self) -> &[SearchResult] {
-        match &self.channel {
-            Some(channel) => &channel.state().results,
-            None => &self.results,
+        match (&self.channel, &self.playlist) {
+            (Some(channel), _) => &channel.state().results,
+            (None, Some(playlist)) => &playlist.state.results,
+            (None, None) => &self.results,
         }
     }
 
     pub fn view_selected(&self) -> usize {
-        match &self.channel {
-            Some(channel) => channel.state().selected,
-            None => self.selected,
+        match (&self.channel, &self.playlist) {
+            (Some(channel), _) => channel.state().selected,
+            (None, Some(playlist)) => playlist.state.selected,
+            (None, None) => self.selected,
         }
     }
 
     pub fn view_scroll(&self) -> usize {
-        match &self.channel {
-            Some(channel) => channel.state().scroll,
-            None => self.scroll,
+        match (&self.channel, &self.playlist) {
+            (Some(channel), _) => channel.state().scroll,
+            (None, Some(playlist)) => playlist.state.scroll,
+            (None, None) => self.scroll,
         }
     }
 
     pub fn set_view_selected(&mut self, index: usize) {
-        match &mut self.channel {
-            Some(channel) => channel.state_mut().selected = index,
-            None => self.selected = index,
+        match (&mut self.channel, &mut self.playlist) {
+            (Some(channel), _) => channel.state_mut().selected = index,
+            (None, Some(playlist)) => playlist.state.selected = index,
+            (None, None) => self.selected = index,
         }
     }
 
     pub fn set_view_scroll(&mut self, scroll: usize) {
-        match &mut self.channel {
-            Some(channel) => channel.state_mut().scroll = scroll,
-            None => self.scroll = scroll,
+        match (&mut self.channel, &mut self.playlist) {
+            (Some(channel), _) => channel.state_mut().scroll = scroll,
+            (None, Some(playlist)) => playlist.state.scroll = scroll,
+            (None, None) => self.scroll = scroll,
         }
     }
 
@@ -826,15 +907,15 @@ impl App {
 
     /// 今の一覧に出ているチャンネル ID。登録済みかを確認する対象に使う。
     /// チャンネルを開いている間は行が channel_id を持たないので、開いた 1 つを返す。
+    /// プレイリストの行は投稿者がばらばらなので、検索結果と同じく行から集める。
     pub fn view_channel_ids(&self) -> Vec<String> {
-        match &self.channel {
-            Some(channel) => vec![channel.channel_id.clone()],
-            None => self
-                .results
-                .iter()
-                .filter_map(|r| r.channel_id.clone())
-                .collect(),
+        if let Some(channel) = &self.channel {
+            return vec![channel.channel_id.clone()];
         }
+        self.view_results()
+            .iter()
+            .filter_map(|r| r.channel_id.clone())
+            .collect()
     }
 
     /// 選択中の行が一覧の最後の行か。0件のときは false。
@@ -881,12 +962,19 @@ impl App {
         // 取り直しの頼みはここで果たされる。
         state.reload = false;
         self.sync_from_view();
-        if self.channel.is_some() {
-            // 配信を持たないチャンネルも 0 件で来る。失敗ではないのでエラーにしない。
+        if self.view_is_nested() {
+            // 配信を持たないチャンネルも空のプレイリストも 0 件で来る。
+            // 失敗ではないのでエラーにしない。
             if self.view_results().is_empty() {
                 self.set_notice(Some(target.empty_message(self.cookies.for_search())));
             }
-            self.enter_search_mode(Mode::Channel);
+            // チャンネルはプレイリストの中からも開ける。開いている方の画面へ戻す。
+            let mode = if self.channel.is_some() {
+                Mode::Channel
+            } else {
+                Mode::Playlist
+            };
+            self.enter_search_mode(mode);
             return;
         }
         if self.results.is_empty() {
@@ -914,6 +1002,9 @@ impl App {
         (
             self.channel.as_ref().map(|channel| channel.tab.index()),
             self.tabs.selected(),
+            self.playlist
+                .as_ref()
+                .map(|playlist| playlist.playlist_id.clone()),
         )
     }
 
@@ -940,10 +1031,10 @@ impl App {
         self.thumbs.mark_dirty();
     }
 
-    /// 一覧を入れ替えた後の取り込み。チャンネル閲覧中は検索結果の写しを保ったまま、
-    /// 世代とサムネイルの状態表だけをチャンネルの一覧へ向ける。
+    /// 一覧を入れ替えた後の取り込み。チャンネル/プレイリストを開いている間は検索結果の
+    /// 写しを保ったまま、世代とサムネイルの状態表だけを開いている一覧へ向ける。
     pub fn sync_from_view(&mut self) {
-        if self.channel.is_none() {
+        if !self.view_is_nested() {
             self.sync_from_tab();
             return;
         }
@@ -956,7 +1047,7 @@ impl App {
     /// 非表示にした行を、開いている一覧からも取り除く。次の検索を待たずに消すため。
     pub fn drop_hidden(&mut self) {
         // 選択位置は App 側が持っている。先に書き戻さないと取り込みで巻き戻る。
-        if self.channel.is_none() {
+        if !self.view_is_nested() {
             self.store_to_tab();
         }
         for state in self.tabs.states_mut() {
@@ -966,6 +1057,9 @@ impl App {
             for state in &mut channel.states {
                 retain_visible(state, &self.hidden);
             }
+        }
+        if let Some(playlist) = self.playlist.as_mut() {
+            retain_visible(&mut playlist.state, &self.hidden);
         }
         self.sync_from_view();
     }
@@ -1065,6 +1159,8 @@ impl App {
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
             Mode::Results => self.search_status(self.results_status()),
             Mode::Channel => self.search_status(self.channel_status()),
+            Mode::Playlists => self.search_status(self.playlists_status()),
+            Mode::Playlist => self.search_status(self.playlist_status()),
             Mode::Settings => self.settings_status(),
             Mode::Download => self.download_status(),
         };
@@ -1120,6 +1216,32 @@ impl App {
             self.background_marker(),
             channel.channel_title,
             channel.tab.label(),
+            self.results_body()
+        )
+    }
+
+    /// プレイリストの一覧は動画一覧と別の入れ物なので、件数も選択も別に数える。
+    fn playlists_status(&self) -> String {
+        let Some(playlists) = &self.playlists else {
+            return self.results_status();
+        };
+        let count = format!("{} 件", playlists.entries.len());
+        let body = match playlists.entries.get(playlists.selected) {
+            Some(entry) => format!("{count}  |  {}", entry.title),
+            None => count,
+        };
+        format!("{}{body}", self.background_marker())
+    }
+
+    /// プレイリスト名は検索欄に出ないので、チャンネルと同じく状態行の先頭に出す。
+    fn playlist_status(&self) -> String {
+        let Some(playlist) = &self.playlist else {
+            return self.results_status();
+        };
+        format!(
+            "{}{}  |  {}",
+            self.background_marker(),
+            playlist.playlist_title,
             self.results_body()
         )
     }
@@ -1778,6 +1900,210 @@ mod tests {
         assert!(line.contains("Some Channel"), "{line}");
         assert!(line.contains("動画"), "{line}");
         assert!(line.contains("1 件"), "{line}");
+    }
+
+    fn entry(id: &str, title: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    /// 検索結果を 2 件持ち、そこからプレイリストの動画一覧まで開いた App。
+    /// 選択位置はまだタブへ書き戻していない。取り込みで巻き戻さないことも見たいため。
+    fn playlist_app() -> App {
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.selected = 1;
+        app.scroll = 4;
+        app.playlists = Some(PlaylistsView {
+            entries: vec![entry("PL1", "作業用BGM"), entry("PL2", "あとで見る")],
+            selected: 0,
+            loaded: true,
+        });
+        app.playlist = Some(PlaylistView::new(
+            "PL1".to_string(),
+            "作業用BGM".to_string(),
+        ));
+        app.mode = Mode::Playlist;
+        app.sync_from_view();
+        app
+    }
+
+    #[test]
+    fn a_playlist_view_starts_empty_and_knows_its_target() {
+        let app = App::default();
+        assert!(app.playlists.is_none(), "通常の検索画面では持たない");
+        assert!(app.playlist.is_none());
+
+        let list = PlaylistsView::default();
+        assert!(list.entries.is_empty());
+        assert_eq!(list.selected, 0);
+        assert!(!list.loaded);
+
+        let view = PlaylistView::new("PL1".to_string(), "作業用BGM".to_string());
+        assert!(view.state.results.is_empty());
+        assert!(!view.state.loaded);
+        assert_eq!(view.target(), Target::Playlist("PL1".to_string()));
+    }
+
+    #[test]
+    fn the_playlists_selection_wraps_around_like_the_results() {
+        let mut list = PlaylistsView {
+            entries: vec![entry("PL1", "作業用BGM"), entry("PL2", "あとで見る")],
+            selected: 0,
+            loaded: true,
+        };
+
+        list.select_next();
+        assert_eq!(list.selected, 1);
+        list.select_next();
+        assert_eq!(list.selected, 0, "末尾から下は先頭へ");
+        list.select_prev();
+        assert_eq!(list.selected, 1, "先頭から上は末尾へ");
+    }
+
+    #[test]
+    fn an_empty_playlists_list_has_nothing_to_select() {
+        let mut list = PlaylistsView::default();
+        list.select_next();
+        list.select_prev();
+        assert_eq!(list.selected, 0);
+    }
+
+    #[test]
+    fn the_view_follows_the_open_playlist_and_leaves_the_search_results_alone() {
+        let mut app = playlist_app();
+        app.playlist.as_mut().expect("playlist").state.results =
+            vec![result("v0"), result("v1"), result("v2")];
+
+        assert_eq!(app.view_result_ids(), ["v0", "v1", "v2"]);
+        assert_eq!(app.result_ids(), ["a", "b"], "検索結果はそのまま");
+
+        app.set_view_selected(2);
+        app.set_view_scroll(3);
+        assert_eq!(app.view_selected(), 2);
+        assert_eq!(app.view_scroll(), 3);
+        assert_eq!(
+            app.view_selected_result().map(|r| r.id.as_str()),
+            Some("v2")
+        );
+        assert_eq!(app.selected, 1, "検索結果側の選択は動かさない");
+        assert_eq!(app.scroll, 4);
+
+        // プレイリストを閉じれば検索結果へ戻る。一覧画面はまだ開いたまま。
+        app.playlist = None;
+        assert_eq!(app.view_result_ids(), ["a", "b"]);
+        assert_eq!(app.view_selected(), 1);
+        assert_eq!(app.view_scroll(), 4);
+    }
+
+    #[test]
+    fn a_channel_opened_from_a_playlist_takes_over_the_view() {
+        // プレイリストの中からもチャンネルへ移れる。後から開いた方が一覧の主になり、
+        // 閉じるとプレイリストへ戻る。
+        let mut app = playlist_app();
+        app.playlist.as_mut().expect("playlist").state.results = vec![result("v0")];
+        app.channel = Some(ChannelView::new(
+            "UCabc".to_string(),
+            "Some Channel".to_string(),
+        ));
+        app.channel.as_mut().expect("channel").state_mut().results =
+            vec![result("c0"), result("c1")];
+
+        assert_eq!(app.view_result_ids(), ["c0", "c1"]);
+        assert_eq!(app.view_channel_ids(), ["UCabc"]);
+
+        app.channel = None;
+        assert_eq!(app.view_result_ids(), ["v0"], "プレイリストへ戻る");
+    }
+
+    #[test]
+    fn the_channel_ids_of_an_open_playlist_come_from_its_rows() {
+        // プレイリストの行は投稿者がばらばらなので、チャンネルと違って行から集める。
+        let mut app = playlist_app();
+        app.playlist.as_mut().expect("playlist").state.results = vec![
+            from_channel("v0", "UC1"),
+            from_channel("v1", "UC2"),
+            result("v2"),
+        ];
+
+        assert_eq!(app.view_channel_ids(), ["UC1", "UC2"], "持たない行は飛ばす");
+    }
+
+    #[test]
+    fn set_results_writes_through_to_the_open_playlist() {
+        let mut app = playlist_app();
+        app.set_results(vec![result("v0")], &Target::Playlist("PL1".to_string()));
+
+        let playlist = app.playlist.as_ref().expect("playlist");
+        assert_eq!(playlist.state.results.len(), 1);
+        assert!(playlist.state.loaded);
+        assert_eq!(app.mode, Mode::Playlist);
+        assert_eq!(app.result_ids(), ["a", "b"], "検索結果は残す");
+        assert_eq!(app.selected, 1, "検索側の写しは触らない");
+        assert_eq!(app.scroll, 4);
+        assert!(app.error.is_none());
+        assert!(
+            !app.can_load_more(),
+            "中身は全部返っているので追加読み込みはしない"
+        );
+    }
+
+    #[test]
+    fn an_empty_playlist_is_told_as_a_notice_not_an_error() {
+        let mut app = playlist_app();
+        app.set_results(Vec::new(), &Target::Playlist("PL1".to_string()));
+
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let notice = app.notice.as_deref().expect("文言を出す");
+        assert!(
+            notice.contains("プレイリストには動画がありません"),
+            "{notice}"
+        );
+        assert_eq!(app.mode, Mode::Playlist, "検索欄へ落とさない");
+        assert!(
+            app.playlist.as_ref().expect("playlist").state.loaded,
+            "0 件でも読み込み済みにする"
+        );
+    }
+
+    #[test]
+    fn the_view_key_tells_an_open_playlist_from_the_search_results() {
+        // 鍵が変わらないと、出入りのときサムネイルを取り直す合図が出ない。
+        let mut app = playlist_app();
+        let inside = app.view_key();
+
+        app.playlist = None;
+        assert_ne!(app.view_key(), inside, "中身を閉じたら別の一覧");
+
+        app.playlist = Some(PlaylistView::new(
+            "PL2".to_string(),
+            "あとで見る".to_string(),
+        ));
+        assert_ne!(app.view_key(), inside, "別のプレイリストでも別の一覧");
+    }
+
+    #[test]
+    fn the_status_line_names_the_playlist_and_its_count() {
+        let mut app = playlist_app();
+        app.playlist.as_mut().expect("playlist").state.results = vec![result("v0")];
+        let line = app.status_line();
+        assert!(line.contains("作業用BGM"), "{line}");
+        assert!(line.contains("1 件"), "{line}");
+    }
+
+    #[test]
+    fn the_status_line_counts_the_playlists_on_the_list_screen() {
+        // 一覧画面が数えるのは動画ではなくプレイリストの件数。
+        let mut app = playlist_app();
+        app.playlist = None;
+        app.mode = Mode::Playlists;
+        app.playlists.as_mut().expect("playlists").selected = 1;
+
+        let line = app.status_line();
+        assert!(line.contains("2 件"), "{line}");
+        assert!(line.contains("あとで見る"), "{line}");
     }
 
     #[test]
@@ -2960,6 +3286,19 @@ mod tests {
         assert_eq!(app.view_result_ids(), ["v2"], "チャンネルの一覧から外す");
         // 検索側のタブは a / b を持っていた。戻ったときには a が消えている。
         assert_eq!(app.tabs.state().results.len(), 1);
+    }
+
+    #[test]
+    fn dropping_hidden_reaches_the_open_playlist() {
+        let mut app = playlist_app();
+        app.playlist.as_mut().expect("playlist").state.results =
+            vec![from_channel("v1", "UCabc"), result("v2")];
+
+        app.hidden = hiding(&["a"], &["UCabc"]);
+        app.drop_hidden();
+
+        assert_eq!(app.view_result_ids(), ["v2"], "プレイリストの一覧から外す");
+        assert_eq!(app.tabs.state().results.len(), 1, "検索側のタブも絞る");
     }
 
     #[test]

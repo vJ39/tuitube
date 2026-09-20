@@ -410,6 +410,9 @@ async fn handle_event(
             actions::start_thumbnails(app, tx, session);
             actions::start_engagement(app, tx, session);
         }
+        AppEvent::PlaylistsReady { nonce, entries } => {
+            actions::apply_playlists_ready(app, session, nonce, entries);
+        }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
                 actions::apply_property(app, session, id, data).await;
@@ -611,7 +614,7 @@ fn apply_channel_lookup_with<R>(
         app.set_notice(None);
     }
     // 押した後に再生や設定へ移っていれば、そちらから引きずり出さない。
-    if !matches!(app.mode, Mode::Results | Mode::Channel) {
+    if !matches!(app.mode, Mode::Results | Mode::Channel | Mode::Playlist) {
         return;
     }
     // 押した後に選択が動いていれば、届いたのは今の行のものではない。
@@ -725,7 +728,7 @@ fn note_cookie_failure(app: &mut App, error: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Playback;
+    use crate::app::{Playback, PlaylistView};
     use crate::cookies::CookieSource;
     use crate::fetch::fixtures::{CurlResult, FakeCurl};
     use crate::kitty::fixtures::{KITTY_RECONFIG, frame};
@@ -2448,6 +2451,32 @@ mod tests {
 
         let channel = app.channel.as_ref().expect("チャンネルへ移る");
         assert_eq!(channel.channel_title, "UCfeed");
+        finish_search(&mut session).await;
+    }
+
+    #[tokio::test]
+    async fn a_channel_lookup_started_in_a_playlist_still_moves_to_the_channel() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = looking_up();
+        let mut app = lookup_app();
+        app.playlist = Some(PlaylistView::new("PL0".to_string(), "list 0".to_string()));
+        app.mode = Mode::Playlist;
+        app.set_results(
+            vec![SearchResult {
+                uploader: Some("Row Channel".to_string()),
+                ..result("id1")
+            }],
+            &Target::Playlist("PL0".to_string()),
+        );
+        app.set_notice(Some(actions::CHANNEL_LOOKUP_NOTICE.to_string()));
+
+        lookup_done(&mut app, &mut session, &tx, 1, "id1", found("UCfeed", None));
+
+        assert_eq!(app.mode, Mode::Channel);
+        assert_eq!(
+            app.channel.as_ref().expect("チャンネルへ移る").channel_id,
+            "UCfeed"
+        );
         finish_search(&mut session).await;
     }
 

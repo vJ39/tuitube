@@ -1,4 +1,7 @@
-use crate::cookies::{CHANNEL_LIMIT, CookieOutcome, CookieSource, FEED_LIMIT, Target, classify};
+use crate::cookies::{
+    CHANNEL_LIMIT, CookieOutcome, CookieSource, FEED_LIMIT, PLAYLIST_LIMIT, PLAYLISTS_URL, Target,
+    classify,
+};
 use serde_json::Value;
 use std::future::Future;
 use std::io::ErrorKind;
@@ -64,6 +67,33 @@ fn parse_line(line: &str) -> Option<SearchResult> {
     })
 }
 
+/// プレイリスト一覧の 1 件。一覧の行は uploader が固定文字列で duration も無いので、
+/// 動画用の SearchResult とは分ける。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaylistEntry {
+    pub id: String,
+    pub title: String,
+}
+
+pub fn parse_playlist_lines(output: &str) -> Vec<PlaylistEntry> {
+    output.lines().filter_map(parse_playlist_line).collect()
+}
+
+fn parse_playlist_line(line: &str) -> Option<PlaylistEntry> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    let id = value.get("id")?.as_str()?.to_string();
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("(title unknown)")
+        .to_string();
+    Some(PlaylistEntry { id, title })
+}
+
 /// 本番は tokio Command、テストは台本どおりの Output を返す偽物。
 pub trait YtDlp {
     fn run(&self, args: Vec<String>) -> impl Future<Output = std::io::Result<Output>> + Send;
@@ -96,8 +126,25 @@ pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>, limit: usize
             args.push("--playlist-end".to_string());
             args.push(CHANNEL_LIMIT.to_string());
         }
+        Target::Playlist(_) => {
+            args.push("--playlist-end".to_string());
+            args.push(PLAYLIST_LIMIT.to_string());
+        }
         Target::Search(_) => {}
     }
+    if let Some(cookies) = cookies {
+        args.extend(cookies.yt_dlp_args());
+    }
+    args
+}
+
+/// プレイリスト一覧を取る引数。返る行は動画でないので parse_playlist_lines で読む。
+pub fn playlists_args(cookies: Option<&CookieSource>) -> Vec<String> {
+    let mut args = vec![
+        PLAYLISTS_URL.to_string(),
+        "--flat-playlist".to_string(),
+        "--dump-json".to_string(),
+    ];
     if let Some(cookies) = cookies {
         args.extend(cookies.yt_dlp_args());
     }
@@ -143,6 +190,32 @@ pub async fn fetch_channel(runner: &impl YtDlp, url: &str) -> Result<Option<Chan
         return Err(format!("yt-dlp が失敗しました: {}", stderr_detail(&stderr)));
     }
     Ok(found)
+}
+
+/// プレイリスト一覧を取る。返る行が動画でないので run_search とは別経路。
+pub async fn fetch_playlists(
+    runner: &impl YtDlp,
+    cookies: Option<&CookieSource>,
+    timeout: Duration,
+) -> Result<Vec<PlaylistEntry>, String> {
+    let args = playlists_args(cookies);
+    let output = match tokio::time::timeout(timeout, runner.run(args)).await {
+        Err(_) => {
+            return Err(format!(
+                "プレイリスト一覧の取得がタイムアウトしました ({} 秒)",
+                timeout.as_secs()
+            ));
+        }
+        Ok(Err(e)) => return Err(launch_error(&e)),
+        Ok(Ok(output)) => output,
+    };
+    let entries = parse_playlist_lines(&String::from_utf8_lossy(&output.stdout));
+    // 警告つきで終わっても行が揃っていればそれを使う。
+    if entries.is_empty() && !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("yt-dlp が失敗しました: {}", stderr_detail(&stderr)));
+    }
+    Ok(entries)
 }
 
 #[derive(Debug)]
@@ -606,6 +679,178 @@ mod tests {
     fn yt_dlp_args_take_the_result_count_from_the_setting() {
         let args = yt_dlp_args(&Target::Search("q".to_string()), None, 25);
         assert_eq!(args[0], "ytsearch25:q");
+    }
+
+    /// プレイリスト一覧の行。uploader は固定文字列で、duration/channel_id は null で返る。
+    const PLAYLIST_LINE: &str = r#"{"_type":"url","ie_key":"YoutubeTab","id":"PLabc123","url":"https://www.youtube.com/playlist?list=PLabc123","title":"作業用BGM","uploader":"View full playlist","duration":null,"channel_id":null}"#;
+
+    fn entry(id: &str, title: &str) -> PlaylistEntry {
+        PlaylistEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    #[test]
+    fn parses_playlist_entries() {
+        let out = format!("{PLAYLIST_LINE}\n{PLAYLIST_LINE}\n");
+        let entries = parse_playlist_lines(&out);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], entry("PLabc123", "作業用BGM"));
+    }
+
+    #[test]
+    fn playlist_entries_do_not_need_the_video_fields() {
+        // uploader は "View full playlist" 固定、duration/channel_id は null なので読まない。
+        assert_eq!(
+            parse_playlist_lines(r#"{"id":"PLabc123","title":"作業用BGM"}"#)[0],
+            entry("PLabc123", "作業用BGM")
+        );
+        // 名前が無い行も一覧には出す。
+        assert_eq!(
+            parse_playlist_lines(r#"{"id":"PLabc123"}"#)[0],
+            entry("PLabc123", "(title unknown)")
+        );
+    }
+
+    #[test]
+    fn special_playlists_are_ordinary_entries() {
+        let out = format!(
+            "{}\n{}\n",
+            r#"{"id":"LL","title":"Liked videos","uploader":"View full playlist"}"#,
+            r#"{"id":"WL","title":"Watch later","uploader":"View full playlist"}"#
+        );
+        assert_eq!(
+            parse_playlist_lines(&out),
+            [entry("LL", "Liked videos"), entry("WL", "Watch later")]
+        );
+    }
+
+    #[test]
+    fn skips_blank_and_broken_playlist_lines() {
+        let out = format!("\n  \n{PLAYLIST_LINE}\nnot json\n{{\"title\":\"no id\"}}\n\n");
+        let entries = parse_playlist_lines(&out);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "PLabc123");
+        assert!(parse_playlist_lines("").is_empty());
+    }
+
+    #[test]
+    fn playlists_args_ask_the_playlists_feed_for_a_flat_list() {
+        assert_eq!(
+            playlists_args(None),
+            [PLAYLISTS_URL, "--flat-playlist", "--dump-json"]
+        );
+        // cookie は検索と同じく後ろに足す (自分の一覧なので cookie が無いと空で返る)。
+        let args = playlists_args(Some(&source("chrome")));
+        assert_eq!(
+            args[args.len() - 2..],
+            ["--cookies-from-browser".to_string(), "chrome".to_string()]
+        );
+    }
+
+    #[test]
+    fn yt_dlp_args_limit_a_playlist() {
+        let target = Target::Playlist("PLabc123".to_string());
+        assert_eq!(
+            yt_dlp_args(&target, None, 10),
+            [
+                "https://www.youtube.com/playlist?list=PLabc123",
+                "--flat-playlist",
+                "--dump-json",
+                "--playlist-end",
+                &PLAYLIST_LIMIT.to_string(),
+            ]
+        );
+        let args = yt_dlp_args(&target, Some(&source("chrome")), 10);
+        assert!(has_cookie_flag(&args));
+    }
+
+    #[test]
+    fn a_playlist_page_is_read_by_the_video_parser() {
+        // プレイリストの中身は通常の動画検索と同じ形で返るので、既存の parse_lines を使う。
+        let line = r#"{"_type":"url","ie_key":"Youtube","id":"awX7DUp-r14","title":"Rust TUI Tutorial","duration":2404.0,"channel_id":"UCxxx","uploader":"Green Tea Coding"}"#;
+        let results = parse_lines(line);
+        assert_eq!(
+            results,
+            [SearchResult {
+                id: "awX7DUp-r14".to_string(),
+                title: "Rust TUI Tutorial".to_string(),
+                duration: Some(2404.0),
+                uploader: Some("Green Tea Coding".to_string()),
+                channel_id: Some("UCxxx".to_string()),
+            }]
+        );
+    }
+
+    const PLAYLISTS_TIMEOUT: Duration = Duration::from_secs(20);
+
+    #[tokio::test]
+    async fn fetch_playlists_reads_the_playlists_feed() {
+        let runner = FakeYtDlp::new([done(0, PLAYLIST_LINE, "")]);
+        assert_eq!(
+            fetch_playlists(&runner, None, PLAYLISTS_TIMEOUT).await,
+            Ok(vec![entry("PLabc123", "作業用BGM")])
+        );
+        assert_eq!(runner.calls(), [playlists_args(None)]);
+    }
+
+    #[tokio::test]
+    async fn fetch_playlists_passes_the_cookie_along() {
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+        let cookies = source("chrome");
+        assert_eq!(
+            fetch_playlists(&runner, Some(&cookies), PLAYLISTS_TIMEOUT).await,
+            Ok(vec![])
+        );
+        assert!(has_cookie_flag(&runner.calls()[0]));
+    }
+
+    #[tokio::test]
+    async fn an_empty_playlists_feed_is_not_a_failure() {
+        // cookie が無い・1 件も作っていない場合は、失敗せず空で返る。
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+        assert_eq!(
+            fetch_playlists(&runner, None, PLAYLISTS_TIMEOUT).await,
+            Ok(vec![])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_playlists_reports_the_error_line_when_yt_dlp_fails() {
+        let runner = FakeYtDlp::new([done(1, "", "ERROR: Sign in to confirm\nWARNING: cache\n")]);
+        let error = fetch_playlists(&runner, None, PLAYLISTS_TIMEOUT)
+            .await
+            .expect_err("失敗する");
+        assert!(error.contains("Sign in to confirm"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_playlists_keeps_json_that_arrived_despite_a_non_zero_exit() {
+        let runner = FakeYtDlp::new([done(1, PLAYLIST_LINE, "WARNING: something\n")]);
+        assert_eq!(
+            fetch_playlists(&runner, None, PLAYLISTS_TIMEOUT).await,
+            Ok(vec![entry("PLabc123", "作業用BGM")])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_playlists_reports_a_missing_binary() {
+        let runner = FakeYtDlp::new([missing()]);
+        let error = fetch_playlists(&runner, None, PLAYLISTS_TIMEOUT)
+            .await
+            .expect_err("起動できない");
+        assert!(error.contains("yt-dlp"), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_playlists_times_out() {
+        let runner = FakeYtDlp::new([Step::Hang]);
+        let error = fetch_playlists(&runner, None, PLAYLISTS_TIMEOUT)
+            .await
+            .expect_err("返らない");
+        assert!(error.contains("タイムアウト"), "{error}");
+        assert!(error.contains("20"), "{error}");
     }
 
     #[test]
