@@ -75,10 +75,11 @@ pub struct RawThumbnails {
     pub timeout_secs: Option<i64>,
 }
 
-/// ダウンロード画面 (`Mode::Download`) の保存先。設定画面 (v1) には出さない。
+/// ダウンロード画面 (`Mode::Download`) の保存先。dir は自由文字列のため設定画面 (v1) には出さない。
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 pub struct RawDownload {
     pub dir: Option<String>,
+    pub debug: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
@@ -257,6 +258,8 @@ impl ThumbnailSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DownloadSettings {
     pub dir: Option<PathBuf>,
+    /// yt-dlp への実引数・終了コード・標準出力/エラーを download-debug.log へ記録するか。
+    pub debug: bool,
 }
 
 /// 検証済みの値。App が持つのはこれ。
@@ -540,7 +543,11 @@ fn validate_download(raw: RawDownload, notices: &mut Vec<String>) -> DownloadSet
     if raw.dir.is_some() && dir.is_none() {
         notices.push("[download] dir が空です。既定の場所を使います".to_string());
     }
-    DownloadSettings { dir }
+    let defaults = DownloadSettings::default();
+    DownloadSettings {
+        dir,
+        debug: raw.debug.unwrap_or(defaults.debug),
+    }
 }
 
 /// 先頭の `~/` だけ $HOME へ置き換える。そのままだと "~" という名前の
@@ -959,6 +966,20 @@ pub fn render(settings: &Settings) -> String {
         thumbnails.timeout.as_secs()
     ));
 
+    let download = &settings.download;
+    out.push_str("\n[download]\n");
+    out.push_str("# ダウンロード画面 (D) の保存先。空欄のまま使うと $HOME/Downloads (無ければ空欄) から始まる。\n");
+    out.push_str(&string_line(
+        "dir",
+        download.dir.as_deref().and_then(Path::to_str),
+        "~/Movies",
+    ));
+    out.push_str(
+        "# true にすると、yt-dlp への実引数・終了コード・標準出力/エラーを\n# $XDG_CONFIG_HOME/tuitube/download-debug.log (無ければ $HOME/.config/tuitube/...) へ追記する。\n",
+    );
+    out.push_str("# ダウンロードがうまく動かないときの調査用。使い終わったら false に戻す (ログは増え続ける)。\n");
+    out.push_str(&format!("debug = {}\n", download.debug));
+
     out.push_str("\n# カテゴリタブ。書いた場合は既定の一覧を丸ごと置き換える。\n");
     out.push_str("# 先頭の「すべて」タブは常に自動で付くので書かない。\n");
     out.push_str(&format!(
@@ -1219,6 +1240,21 @@ mod tests {
     }
 
     #[test]
+    fn rendering_keeps_the_configured_download_dir_when_only_debug_changes() {
+        // debug の toggle だけを保存しても、[download] dir が消えないこと
+        // (render() が [download] セクション全体を書く前提が壊れていないか)。
+        let mut settings = settings_of("[download]\ndir = \"/tmp/out\"\n");
+        assert_eq!(settings.download.dir, Some(PathBuf::from("/tmp/out")));
+        settings.download.debug = true;
+
+        let rendered = render(&settings);
+
+        let reloaded = settings_of(&rendered);
+        assert_eq!(reloaded.download.dir, Some(PathBuf::from("/tmp/out")));
+        assert!(reloaded.download.debug);
+    }
+
+    #[test]
     fn a_blank_download_dir_falls_back_with_a_notice() {
         let text = "[download]\ndir = \"  \"\n";
         assert_eq!(settings_of(text).download.dir, None);
@@ -1231,6 +1267,42 @@ mod tests {
     fn an_unset_download_dir_is_none_without_a_notice() {
         assert_eq!(settings_of("").download.dir, None);
         assert!(notices_of("").is_empty());
+    }
+
+    #[test]
+    fn download_debug_defaults_to_false_without_a_notice() {
+        assert!(!settings_of("").download.debug);
+        assert!(notices_of("").is_empty());
+        assert!(!DownloadSettings::default().debug);
+    }
+
+    #[test]
+    fn download_debug_is_read_from_the_download_section() {
+        let text = "[download]\ndebug = true\n";
+        assert!(settings_of(text).download.debug);
+        assert!(notices_of(text).is_empty());
+    }
+
+    #[test]
+    fn render_round_trips_the_download_section() {
+        let custom = Settings {
+            download: DownloadSettings {
+                dir: Some(PathBuf::from("/tmp/out")),
+                debug: true,
+            },
+            ..Settings::default()
+        };
+        let text = render(&custom);
+        assert!(text.contains("[download]"), "{text}");
+        assert!(text.contains("dir = \"/tmp/out\""), "{text}");
+        assert!(text.contains("debug = true"), "{text}");
+        assert_eq!(settings_of(&text), custom);
+
+        // 既定 (dir 未設定) は書き方の例をコメントで出し、debug は false のまま。
+        let text = render(&Settings::default());
+        assert!(text.contains("# dir = "), "{text}");
+        assert!(text.contains("debug = false"), "{text}");
+        assert_eq!(settings_of(&text), Settings::default());
     }
 
     #[test]

@@ -1444,6 +1444,7 @@ pub fn start_download<D>(
     let nonce = session.download_nonce;
     let audio_only = app.download_audio_only;
     let url = app.download_url.clone();
+    let debug_log_path = download_debug_log_path(app.settings.download.debug);
     // 期限では消さず、終わった時点 (DownloadDone) で畳む。
     app.set_notice(Some(format!(
         "{}{filename_text}",
@@ -1451,10 +1452,29 @@ pub fn start_download<D>(
     )));
     let tx = tx.clone();
     session.download_task = Some(tokio::spawn(async move {
-        let notice = download::run(&downloader, &dir_text, &filename_text, audio_only, &url).await;
+        let notice = download::run(
+            &downloader,
+            &dir_text,
+            &filename_text,
+            audio_only,
+            &url,
+            debug_log_path.as_deref(),
+        )
+        .await;
         let _ = tx.send(AppEvent::DownloadDone { nonce, notice });
     }));
     close_download(app);
+}
+
+/// `[download] debug` が有効なときだけログの置き場を返す。無効なら None
+/// (= download::run へ渡さず、今までと同じくログを書かない)。
+fn download_debug_log_path(enabled: bool) -> Option<std::path::PathBuf> {
+    if !enabled {
+        return None;
+    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    download::debug_log_path(xdg.as_deref(), home.as_deref())
 }
 
 /// 先行のダウンロードを打ち切る。nonce を進めるので、届いてしまった結果は捨てられる
@@ -5870,5 +5890,17 @@ mod tests {
 
         assert_ne!(session.download_nonce, first_nonce, "世代が進む");
         assert!(session.download_task.is_some(), "新しい方は走らせたまま");
+    }
+
+    #[test]
+    fn download_debug_log_path_is_none_unless_enabled() {
+        // [download] debug が既定 (false) の間は、今までどおりログの置き場を求めない。
+        assert_eq!(download_debug_log_path(false), None);
+        // enabled のときの実際の置き場計算 (env から求める) は download::debug_log_path 側、
+        // それを使ったログの書き込みは download::run 側でそれぞれ確かめている。
+        assert!(
+            download_debug_log_path(true).is_some(),
+            "HOME はテスト環境にもある"
+        );
     }
 }

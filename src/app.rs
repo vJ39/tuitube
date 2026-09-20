@@ -231,9 +231,10 @@ pub enum SettingsItem {
     ThumbnailsEnabled,
     ThumbnailsMaxCached,
     ThumbnailsTimeoutSecs,
+    DownloadDebug,
 }
 
-pub const SETTINGS_ITEMS: [SettingsItem; 13] = [
+pub const SETTINGS_ITEMS: [SettingsItem; 14] = [
     SettingsItem::DisplayMode,
     SettingsItem::DisplayQuality,
     SettingsItem::FpsCap,
@@ -247,6 +248,7 @@ pub const SETTINGS_ITEMS: [SettingsItem; 13] = [
     SettingsItem::ThumbnailsEnabled,
     SettingsItem::ThumbnailsMaxCached,
     SettingsItem::ThumbnailsTimeoutSecs,
+    SettingsItem::DownloadDebug,
 ];
 
 /// 数値項目の 1 回ぶんの刻み。
@@ -289,6 +291,7 @@ impl SettingsItem {
             Self::ThumbnailsEnabled => "thumbnails.enabled",
             Self::ThumbnailsMaxCached => "thumbnails.max_cached",
             Self::ThumbnailsTimeoutSecs => "thumbnails.timeout_secs",
+            Self::DownloadDebug => "download.debug",
         }
     }
 
@@ -311,6 +314,7 @@ impl SettingsItem {
             Self::ThumbnailsEnabled => settings.thumbnails.enabled.to_string(),
             Self::ThumbnailsMaxCached => settings.thumbnails.max_cached.to_string(),
             Self::ThumbnailsTimeoutSecs => settings.thumbnails.timeout.as_secs().to_string(),
+            Self::DownloadDebug => settings.download.debug.to_string(),
         }
     }
 
@@ -356,7 +360,8 @@ impl SettingsItem {
             | Self::WindowOntop
             | Self::SearchLayout
             | Self::SearchCacheEnabled
-            | Self::ThumbnailsEnabled => return 0,
+            | Self::ThumbnailsEnabled
+            | Self::DownloadDebug => return 0,
         };
         max.to_string().len()
     }
@@ -399,7 +404,8 @@ impl SettingsItem {
             | Self::WindowOntop
             | Self::SearchLayout
             | Self::SearchCacheEnabled
-            | Self::ThumbnailsEnabled => return false,
+            | Self::ThumbnailsEnabled
+            | Self::DownloadDebug => return false,
         }
         true
     }
@@ -473,6 +479,7 @@ impl SettingsItem {
                 let secs = step(current, THUMB_TIMEOUT_STEP, min, MAX_THUMB_TIMEOUT_SECS, up);
                 settings.thumbnails.timeout = Duration::from_secs(secs);
             }
+            Self::DownloadDebug => settings.download.debug = !settings.download.debug,
         }
     }
 }
@@ -2175,6 +2182,7 @@ mod tests {
                 "thumbnails.enabled",
                 "thumbnails.max_cached",
                 "thumbnails.timeout_secs",
+                "download.debug",
             ]
         );
     }
@@ -2198,8 +2206,22 @@ mod tests {
                 "thumbnails.enabled: true",
                 "thumbnails.max_cached: 500",
                 "thumbnails.timeout_secs: 10",
+                "download.debug: false",
             ]
         );
+    }
+
+    #[test]
+    fn the_download_debug_toggle_flips_either_way() {
+        let mut settings = Settings::default();
+        for delta in [-1, 1] {
+            SettingsItem::DownloadDebug.adjust(&mut settings, delta);
+            assert!(settings.download.debug, "{delta}");
+            SettingsItem::DownloadDebug.adjust(&mut settings, delta);
+            assert!(!settings.download.debug, "{delta}");
+        }
+        assert!(!SettingsItem::DownloadDebug.is_numeric());
+        assert!(!SettingsItem::DownloadDebug.apply_numeric(&mut settings, "1"));
     }
 
     #[test]
