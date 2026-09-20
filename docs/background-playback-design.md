@@ -64,7 +64,7 @@ pub fn video_target_area(app: &App, screen: Rect) -> Option<Rect> {
 
 `present_video` は貼ってあるサムネイルを剥がす `session.owe_clear` の処理も兼ねており、映像が無い間(設定画面など)もこの一手だけがそれを処理できる。そのため `video_target_area` が `None` でも `present_video` の呼び出し自体は毎フレーム続ける。`area` は `video_present_area` ヘルパー(`video_target_area` が `None` のとき `ui::video_area(app.screen)` にフォールバックする)を介して渡す。呼び出しごと省くと、映像が無い状態で `Mode::Settings`/`Mode::Download` を開いたときにサムネイルが剥がれず前面に残る。
 
-`draw_search`(Input/Results/Channel共通の画面)は、`ui::video_target_area(app, frame.area())` が `Some` を返す間(=このモードに来る時点で `Mode::Playing` ではないので、必ずミニの方)、結果一覧の矩形(`search_areas` の3番目)からその幅ぶんを右側に切り取ってから `grid::layout`/`draw_list` へ渡す。`grid::layout` は渡された矩形の幅で列数を決め直すだけなので、ここ以外の変更は要らない(端末リサイズで列数が変わるのと同じ仕組み)。
+`draw_search`(Input/Results/Channel共通の画面)は、結果一覧の矩形(`search_areas` の3番目)を狭めない。ミニプレイヤーは上部 `MINI_VIDEO_ROWS` 分にしか映らないため、一覧側の幅を全高にわたって狭めると、映像の無い下の行に空白の帯が残り続けて崩れて見える(実機で確認した不具合。2026/09/20修正)。ミニプレイヤーは一覧の上に重ねて描くだけにする(embeddedはKitty画像、textはratatuiのBufferへ直接書く。いずれも毎フレーム描き直すので、隅の数コマがミニプレイヤーに隠れる以外の副作用は無い)。
 
 ## 状態表示
 

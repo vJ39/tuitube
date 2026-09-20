@@ -386,15 +386,11 @@ fn draw_search(frame: &mut Frame, app: &App) {
     frame.render_widget(input, areas[0]);
     draw_tabs(frame, app, areas[1]);
 
-    // バックグラウンド中はミニプレイヤーの幅ぶんを結果一覧から空ける。
+    // バックグラウンド中のミニプレイヤーは結果一覧の上に重ねて描くだけにする。
+    // 上部 MINI_VIDEO_ROWS 分にしか映らないので、一覧側の幅を全高にわたって
+    // 狭めると映像の無い下の行に空白の帯が残り続けて崩れて見える (実機で確認した不具合)。
     let video = video_target_area(app, frame.area());
-    let results_area = match video {
-        Some(video) => Rect {
-            width: areas[2].width.saturating_sub(video.width),
-            ..areas[2]
-        },
-        None => areas[2],
-    };
+    let results_area = areas[2];
 
     // app.screen は直前の draw の寸法なので、割り付けは今のフレームで組み直す。
     let layout = if app.settings.search.layout == LayoutMode::Grid {
@@ -1447,12 +1443,14 @@ mod tests {
     }
 
     #[test]
-    fn draw_search_narrows_the_results_block_for_the_mini_player() {
+    fn draw_search_does_not_narrow_the_results_block_for_the_mini_player() {
+        // ミニプレイヤーは上部 MINI_VIDEO_ROWS 分にしか映らないので、結果ブロックを
+        // 全高にわたって狭めると、映像の無い下の行に空白の帯が残り続けて崩れて見える
+        // (実機で確認した不具合)。狭めず、ミニプレイヤーは上に重ねて描くだけにする。
         let screen = Rect::new(0, 0, 80, 24);
         let row = search_areas(screen)[2].y;
         let column = screen.width - 1;
 
-        // 通常時 (再生していない = 映像が無い) は結果ブロックが右端まで届く。
         let normal = App {
             mode: Mode::Results,
             screen,
@@ -1462,16 +1460,17 @@ mod tests {
         let full_corner = symbol_at(&normal, screen.width, screen.height, column, row);
         assert_ne!(full_corner, " ", "背景無しなら結果ブロックが右端まで届く");
 
-        // バックグラウンド中 (映像を持ったまま検索側にいる) はミニプレイヤー分だけ避ける。
+        // バックグラウンド中でも結果ブロックは同じく右端まで届く (映像は上に重なるだけ)。
         let backgrounded = App {
             results: vec![result(0)],
             background: true,
             ..video_app(Mode::Results, DisplayMode::Embedded)
         };
-        let narrowed_corner = symbol_at(&backgrounded, screen.width, screen.height, column, row);
+        let corner_while_backgrounded =
+            symbol_at(&backgrounded, screen.width, screen.height, column, row);
         assert_eq!(
-            narrowed_corner, " ",
-            "ミニプレイヤー分は結果ブロックを避ける"
+            corner_while_backgrounded, full_corner,
+            "バックグラウンド中も結果ブロックの幅は変えない"
         );
     }
 
