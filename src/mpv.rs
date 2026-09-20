@@ -779,6 +779,7 @@ mod tests {
                 &crate::subtitles::SubtitleSettings::default(),
                 false,
             ),
+            resume_at: None,
             extra_args: extra.to_vec(),
         };
         let args = launch_args(

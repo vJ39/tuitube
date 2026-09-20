@@ -231,10 +231,23 @@ pub async fn seek_absolute(
     app.playback.begin_seek(target, now);
 }
 
+/// 入れ替わる/消える直前の再生位置を記憶する。まだ何も再生していない
+/// (id が空、または位置・長さが未知) ときは何もしない。書き込みの失敗は無視する
+/// (視聴の続きを覚えられるだけの機能で、失敗を利用者へ伝える強さは無い)。
+pub fn remember_playback_position(app: &mut App) {
+    if app.playback.id.is_empty() {
+        return;
+    }
+    if let (Some(position), Some(duration)) = (app.playback.time_pos, app.playback.duration) {
+        let _ = app.resume.remember(&app.playback.id, position, duration);
+    }
+}
+
 pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<String>) {
     stop_playback(session).await;
     cancel_comments(session);
     app.comments.end();
+    remember_playback_position(app);
     app.playback = Playback::default();
     app.seek_bar = SeekBarState::default();
     app.video = None;
@@ -1044,6 +1057,10 @@ fn playback_plan(app: &App) -> (VideoSink, LaunchPlan) {
     plan.speed = app.speed;
     // 非表示で始めてもトラックは用意される。再生中に s で出せる。
     plan.subtitles = SubtitleLaunch::new(&app.settings.subtitles, app.subtitles.wanted());
+    // 完了していない続きがあれば、そこから再開する。
+    plan.resume_at = app
+        .view_selected_result()
+        .and_then(|result| app.resume.lookup(&result.id));
     // 検索で cookie が効くと確かめた後だけ再生にも渡す (再生側では劣化を検知できない)。
     plan.extra_args
         .extend(app.cookies.for_playback().map(|source| source.mpv_arg()));
@@ -1056,11 +1073,16 @@ pub fn enter_playback(
     session: &mut Session,
     title: String,
     url: String,
+    id: String,
     video: VideoSink,
 ) {
+    // バックグラウンド再生中に別の動画へ差し替える経路もここを通るので、
+    // 入れ替わる前の位置をここで記憶する。
+    remember_playback_position(app);
     app.playback = Playback {
         title,
         url,
+        id,
         ..Playback::default()
     };
     app.seek_bar = SeekBarState::default();
@@ -1086,7 +1108,14 @@ pub async fn start_playback(app: &mut App, tx: &UnboundedSender<AppEvent>, sessi
     let url = result.url();
     match MpvController::launch(&url, nonce, tx.clone(), video.clone(), &plan).await {
         Ok(controller) => {
-            enter_playback(app, session, result.title.clone(), url.clone(), video);
+            enter_playback(
+                app,
+                session,
+                result.title.clone(),
+                url.clone(),
+                result.id.clone(),
+                video,
+            );
             session.player = Some(Player {
                 sink: Box::new(controller),
                 nonce,
@@ -1710,6 +1739,37 @@ mod tests {
         assert!(!app.background);
     }
 
+    fn resume_temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tuitube-actions-resume-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn end_playback_remembers_the_position_of_the_video_it_leaves() {
+        let dir = resume_temp_dir("end-playback");
+        let mut app = App {
+            mode: Mode::Playing,
+            resume: crate::resume::load_from(Some(&dir.join("resume.toml"))),
+            playback: Playback {
+                id: "v1".to_string(),
+                time_pos: Some(120.0),
+                duration: Some(600.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        let mut session = Session::default();
+
+        end_playback(&mut app, &mut session, None).await;
+
+        assert_eq!(app.resume.lookup("v1"), Some(120.0));
+    }
+
     #[test]
     fn enter_playback_resets_background() {
         // バックグラウンド中 (Mode::Results 等) に別の動画で Enter を押した経路を再現する。
@@ -1724,10 +1784,60 @@ mod tests {
             &mut session,
             "title".to_string(),
             "https://example.com/watch".to_string(),
+            "id0".to_string(),
             sink(),
         );
         assert_eq!(app.mode, Mode::Playing);
         assert!(!app.background);
+    }
+
+    #[test]
+    fn enter_playback_remembers_the_position_of_the_video_it_replaces() {
+        // バックグラウンド再生中に別の動画を選んだ経路 (design: enter_playback も保存箇所)。
+        let dir = resume_temp_dir("enter-playback");
+        let mut app = App {
+            mode: Mode::Results,
+            background: true,
+            resume: crate::resume::load_from(Some(&dir.join("resume.toml"))),
+            playback: Playback {
+                id: "v1".to_string(),
+                time_pos: Some(120.0),
+                duration: Some(600.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        let mut session = Session::default();
+
+        enter_playback(
+            &mut app,
+            &mut session,
+            "title".to_string(),
+            "https://example.com/watch".to_string(),
+            "v2".to_string(),
+            sink(),
+        );
+
+        assert_eq!(
+            app.resume.lookup("v1"),
+            Some(120.0),
+            "前の動画の位置を覚える"
+        );
+        assert_eq!(app.playback.id, "v2");
+    }
+
+    #[test]
+    fn remember_playback_position_does_nothing_without_a_video() {
+        let dir = resume_temp_dir("no-video");
+        let mut app = App {
+            resume: crate::resume::load_from(Some(&dir.join("resume.toml"))),
+            ..App::default()
+        };
+
+        remember_playback_position(&mut app);
+
+        assert_eq!(app.resume.lookup(""), None);
+        assert!(!dir.join("resume.toml").exists());
     }
 
     #[tokio::test]
@@ -2633,6 +2743,40 @@ mod tests {
         let (_video, plan) = playback_plan(&App::default());
         assert_eq!(plan.speed, Speed::NORMAL);
         assert!(!plan.args().iter().any(|a| a.starts_with("--speed")));
+    }
+
+    #[test]
+    fn playback_plan_resumes_a_previously_remembered_position() {
+        let dir = resume_temp_dir("playback-plan-resume");
+        let mut resume = crate::resume::load_from(Some(&dir.join("resume.toml")));
+        resume.remember("v1", 120.0, 600.0).expect("書ける");
+        let app = App {
+            results: vec![result("v1")],
+            resume,
+            ..playing_app()
+        };
+
+        let (_video, plan) = playback_plan(&app);
+
+        assert_eq!(plan.resume_at, Some(120.0));
+        assert!(
+            plan.args().contains(&"--start=120".to_string()),
+            "{:?}",
+            plan.args()
+        );
+    }
+
+    #[test]
+    fn playback_plan_starts_from_the_beginning_without_a_remembered_position() {
+        let app = App {
+            results: vec![result("v1")],
+            ..playing_app()
+        };
+
+        let (_video, plan) = playback_plan(&app);
+
+        assert_eq!(plan.resume_at, None);
+        assert!(!plan.args().iter().any(|a| a.starts_with("--start")));
     }
 
     #[tokio::test]
@@ -3749,7 +3893,7 @@ mod tests {
     }
 
     #[test]
-    fn entering_playback_keeps_the_url_of_the_video() {
+    fn entering_playback_keeps_the_url_and_id_of_the_video() {
         let mut app = grid_app(4);
         let mut session = Session::default();
         enter_playback(
@@ -3757,9 +3901,11 @@ mod tests {
             &mut session,
             "song".to_string(),
             URL.to_string(),
+            "id0".to_string(),
             sink(),
         );
         assert_eq!(app.playback.url, URL);
+        assert_eq!(app.playback.id, "id0");
     }
 
     #[test]
@@ -3771,6 +3917,7 @@ mod tests {
             &mut session,
             "song".to_string(),
             URL.to_string(),
+            "id0".to_string(),
             sink(),
         );
 
@@ -3946,6 +4093,7 @@ mod tests {
             &mut session,
             "song".to_string(),
             URL.to_string(),
+            "id0".to_string(),
             sink(),
         );
 
@@ -3970,6 +4118,7 @@ mod tests {
             &mut session,
             "song".to_string(),
             URL.to_string(),
+            "id0".to_string(),
             sink(),
         );
         assert!(!playback_plan(&app).1.args().iter().any(|a| a == "--sid=no"));

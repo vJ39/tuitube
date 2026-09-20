@@ -5,6 +5,7 @@ use crate::display::{DisplayMode, FpsCap};
 use crate::hidden::Hidden;
 use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
+use crate::resume::Resume;
 use crate::rgb::RgbImage;
 use crate::search::{ChannelRef, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
@@ -497,6 +498,8 @@ pub struct Playback {
     pub title: String,
     /// 再生中の動画の URL。コピー用にここで持つ。
     pub url: String,
+    /// 再生中の動画 ID。再開位置を記憶するときの検索キー。
+    pub id: String,
     pub paused: Option<bool>,
     pub time_pos: Option<f64>,
     pub duration: Option<f64>,
@@ -600,6 +603,8 @@ pub struct App {
     pub env_overridden: EnvOverridden,
     /// ローカル非表示リスト。一覧へ入れる前にここで外す。
     pub hidden: Hidden,
+    /// 動画ごとの再生位置の記憶。次に選んだときの再開位置をここから引く。
+    pub resume: Resume,
     /// ダウンロード画面を開いた元のモード。閉じたらここへ戻る。
     pub download_return: Mode,
     /// 保存先の入力欄。開いた時点で `[download] dir` かその既定値を入れておく。
@@ -652,6 +657,7 @@ impl Default for App {
             settings_edit: None,
             env_overridden: EnvOverridden::default(),
             hidden: Hidden::default(),
+            resume: Resume::default(),
             download_return: Mode::Input,
             download_dir: QueryEditor::default(),
             download_filename: QueryEditor::default(),

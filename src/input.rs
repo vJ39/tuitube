@@ -5,10 +5,11 @@ use crate::actions::{
     close_download, close_settings, config_path_from_env, copy_url_with, cycle_display_mode,
     enter_background, hide_current_channel, hide_selected, leave_background, leave_channel,
     like_video, load_more, move_download_focus, move_selection, move_settings_selection,
-    open_channel, open_download, open_settings, reload_channel_tab, reload_tab, reset_speed,
-    save_settings, scroll_comments, seek_absolute, seek_relative, select_channel_tab, select_tab,
-    send_to_player, start_download, start_playback, start_search, stop_playback, subscribe_channel,
-    switch_channel_tab, switch_tab, toggle_comments, toggle_subtitles,
+    open_channel, open_download, open_settings, reload_channel_tab, reload_tab,
+    remember_playback_position, reset_speed, save_settings, scroll_comments, seek_absolute,
+    seek_relative, select_channel_tab, select_tab, send_to_player, start_download, start_playback,
+    start_search, stop_playback, subscribe_channel, switch_channel_tab, switch_tab,
+    toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -32,6 +33,7 @@ pub async fn handle_key(
     session: &mut Session,
 ) {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        remember_playback_position(app);
         stop_playback(session).await;
         app.should_quit = true;
         return;
@@ -44,6 +46,7 @@ pub async fn handle_key(
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     // Ctrl+C の即終了と同じく、バックグラウンド中の再生を持ったまま終了しない。
+                    remember_playback_position(app);
                     stop_playback(session).await;
                     app.should_quit = true;
                     app.confirm_quit = false;
@@ -1045,6 +1048,34 @@ mod tests {
         assert!(app.should_quit);
         assert!(!app.confirm_quit);
         assert_eq!(*sent.lock().expect("溜め込み先"), [mpv::quit().to_line()]);
+    }
+
+    #[tokio::test]
+    async fn confirm_quit_remembers_the_playback_position_before_stopping() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let dir = std::env::temp_dir().join(format!(
+            "tuitube-input-confirm-quit-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = App {
+            confirm_quit: true,
+            resume: crate::resume::load_from(Some(&dir.join("resume.toml"))),
+            playback: Playback {
+                id: "v1".to_string(),
+                time_pos: Some(120.0),
+                duration: Some(600.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+
+        handle_key(&mut app, key(KeyCode::Char('y')), &tx, &mut session).await;
+
+        assert!(app.should_quit);
+        assert_eq!(app.resume.lookup("v1"), Some(120.0));
     }
 
     #[test]
@@ -2480,6 +2511,35 @@ mod tests {
         handle_key(&mut app, ctrl_c, &tx, &mut session).await;
 
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_remembers_the_playback_position_before_quitting() {
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        let dir = std::env::temp_dir().join(format!(
+            "tuitube-input-ctrl-c-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = App {
+            mode: Mode::Playing,
+            resume: crate::resume::load_from(Some(&dir.join("resume.toml"))),
+            playback: Playback {
+                id: "v1".to_string(),
+                time_pos: Some(120.0),
+                duration: Some(600.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        };
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        handle_key(&mut app, ctrl_c, &tx, &mut session).await;
+
+        assert!(app.should_quit);
+        assert_eq!(app.resume.lookup("v1"), Some(120.0));
     }
 
     #[tokio::test]

@@ -261,6 +261,8 @@ pub struct LaunchPlan {
     pub speed: Speed,
     /// 字幕の要求。設定で無効なら引数を一切出さない。
     pub subtitles: SubtitleLaunch,
+    /// 前回の再生位置。None なら最初から。
+    pub resume_at: Option<f64>,
     /// [mpv] extra_args と cookie 連携の追加引数。
     pub extra_args: Vec<String>,
 }
@@ -275,6 +277,8 @@ impl LaunchPlan {
             speed: Speed::NORMAL,
             // 表示するかは持ち越しの状態で決まるので、呼び出し側が差し替える。
             subtitles: SubtitleLaunch::new(&settings.subtitles, true),
+            // 再開位置も選んだ動画で決まるので、呼び出し側が差し替える。
+            resume_at: None,
             extra_args: settings.extra_args.clone(),
         }
     }
@@ -303,6 +307,7 @@ impl LaunchPlan {
         // 速度と字幕は VO と独立。表示モードによらず同じ引数で渡す。
         args.extend(self.speed.launch_arg());
         args.extend(self.subtitles.args());
+        args.extend(self.resume_at.map(|secs| format!("--start={secs}")));
         args.extend_from_slice(&self.extra_args);
         args
     }
@@ -534,6 +539,7 @@ mod tests {
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
             subtitles: SubtitleLaunch::Disabled,
+            resume_at: None,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -559,6 +565,7 @@ mod tests {
             window: WindowOptions::default(),
             speed: Speed::from_tenths(15).expect("1.5x"),
             subtitles: SubtitleLaunch::Disabled,
+            resume_at: None,
             extra_args: extra.clone(),
         };
         let args = plan.args();
@@ -599,6 +606,7 @@ mod tests {
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
             subtitles: SubtitleLaunch::Disabled,
+            resume_at: None,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -621,6 +629,7 @@ mod tests {
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
             subtitles: SubtitleLaunch::Disabled,
+            resume_at: None,
             extra_args: Vec::new(),
         };
         let args = plan.args();
@@ -730,10 +739,64 @@ mod tests {
             window: WindowOptions::default(),
             speed: Speed::NORMAL,
             subtitles: SubtitleLaunch::Disabled,
+            resume_at: None,
             extra_args: extra.clone(),
         };
         let args = plan.args();
         assert_eq!(args[args.len() - 2..], extra[..]);
+    }
+
+    #[test]
+    fn launch_args_carry_the_resume_position_only_when_set() {
+        let plan = LaunchPlan {
+            mode: DisplayMode::Embedded,
+            geometry: geometry(80, 22),
+            fps_cap: Some(cap(15)),
+            window: WindowOptions::default(),
+            speed: Speed::NORMAL,
+            subtitles: SubtitleLaunch::Disabled,
+            resume_at: Some(42.5),
+            extra_args: Vec::new(),
+        };
+        assert!(
+            plan.args().contains(&"--start=42.5".to_string()),
+            "{:?}",
+            plan.args()
+        );
+
+        let from_the_start = LaunchPlan {
+            resume_at: None,
+            ..plan
+        };
+        assert!(
+            !from_the_start
+                .args()
+                .iter()
+                .any(|a| a.starts_with("--start")),
+            "{:?}",
+            from_the_start.args()
+        );
+    }
+
+    #[test]
+    fn the_resume_position_comes_after_the_subtitles_and_before_the_extra_args() {
+        let extra = vec!["--hwdec=no".to_string()];
+        let plan = LaunchPlan {
+            mode: DisplayMode::Embedded,
+            geometry: geometry(80, 22),
+            fps_cap: Some(cap(15)),
+            window: WindowOptions::default(),
+            speed: Speed::NORMAL,
+            subtitles: SubtitleLaunch::Disabled,
+            resume_at: Some(10.0),
+            extra_args: extra.clone(),
+        };
+        let args = plan.args();
+        let at = args
+            .iter()
+            .position(|a| a == "--start=10")
+            .unwrap_or_else(|| panic!("--start がない: {args:?}"));
+        assert_eq!(args[at + 1..], extra[..]);
     }
 
     #[test]
@@ -786,6 +849,7 @@ mod tests {
             window: WindowOptions::default(),
             speed: Speed::from_tenths(15).expect("1.5x"),
             subtitles: SubtitleLaunch::new(&subtitle_settings(true).subtitles, true),
+            resume_at: None,
             extra_args: extra.clone(),
         };
         let args = plan.args();
