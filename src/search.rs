@@ -37,16 +37,21 @@ pub fn parse_lines(output: &str) -> Vec<SearchResult> {
     output.lines().filter_map(parse_line).collect()
 }
 
-/// Target ごとのパース。検索結果ページはチャンネルの行も混ぜて返すので動画だけ残し、
-/// どの種別でも公開日の新しい順に並べ替える。
+/// Target ごとのパース。検索結果ページはチャンネルの行も混ぜて返すので動画だけ残す。
+/// Feed (後で見る・履歴・登録チャンネル・おすすめ) は YouTube 側の返却順に追加順・
+/// 視聴順等の意味があるので並べ替えない。それ以外は公開日の新しい順に並べ替える。
 pub fn parse_target_lines(target: &Target, output: &str) -> Vec<SearchResult> {
     let mut lines: Vec<ParsedLine> = output
         .lines()
         .filter_map(parse_entry)
         .filter(|line| !matches!(target, Target::Search(_)) || line.is_video)
         .collect();
-    // 日付が無い行同士は元の順序を保つ (安定ソート)。日付が取れない種別は並びが変わらない。
-    lines.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    // timestamp は動画自体の公開日で、プレイリストへの追加日ではない。Feed でこれを
+    // 使うと YouTube 側の意味のある返却順を壊すので、Feed だけは並べ替えない。
+    // 日付が無い行同士は元の順序を保つ (安定ソート)。
+    if !matches!(target, Target::Feed(_)) {
+        lines.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    }
     lines.into_iter().map(|line| line.result).collect()
 }
 
@@ -614,7 +619,11 @@ mod tests {
             video_line("new", Some(1_750_000_000)),
             video_line("mid", Some(1_700_000_000))
         );
-        for target in all_targets() {
+        // Feed は並べ替えない (feed_rows_keep_the_youtube_returned_order で検証)。
+        for target in all_targets()
+            .into_iter()
+            .filter(|target| !matches!(target, Target::Feed(_)))
+        {
             assert_eq!(
                 ids(&parse_target_lines(&target, &out)),
                 ["new", "mid", "old"],
@@ -624,19 +633,48 @@ mod tests {
     }
 
     #[test]
+    fn feed_rows_keep_the_youtube_returned_order() {
+        // 後で見る・履歴・登録チャンネル・おすすめは YouTube 側の返却順に追加順・視聴順等の
+        // 意味があるので、公開日 (timestamp) では並べ替えない。
+        let out = format!(
+            "{}\n{}\n{}\n",
+            video_line("old", Some(1_600_000_000)),
+            video_line("new", Some(1_750_000_000)),
+            video_line("mid", Some(1_700_000_000))
+        );
+        for feed in [
+            Feed::Recommended,
+            Feed::History,
+            Feed::Subscriptions,
+            Feed::WatchLater,
+        ] {
+            let target = Target::Feed(feed);
+            assert_eq!(
+                ids(&parse_target_lines(&target, &out)),
+                ["old", "new", "mid"],
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rows_without_a_date_keep_their_order_after_the_dated_ones() {
-        // 履歴・登録チャンネルの行には日付が乗らないので、並べ替えで混ぜ返さない。
+        // 日付の無い行同士は元の順序を保つ (安定ソート)。
+        let target = Target::Channel {
+            id: "UCabc".to_string(),
+            tab: ChannelTab::Videos,
+        };
         let out = format!(
             "{}\n{}\n{}\n",
             video_line("a", None),
             video_line("dated", Some(1_700_000_000)),
             video_line("b", None)
         );
-        let results = parse_target_lines(&Target::Feed(Feed::History), &out);
+        let results = parse_target_lines(&target, &out);
         assert_eq!(ids(&results), ["dated", "a", "b"]);
         // 全部日付が無ければ元の順のまま。
         let out = format!("{}\n{}\n", video_line("a", None), video_line("b", None));
-        let results = parse_target_lines(&Target::Feed(Feed::History), &out);
+        let results = parse_target_lines(&target, &out);
         assert_eq!(ids(&results), ["a", "b"]);
     }
 
