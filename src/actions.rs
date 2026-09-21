@@ -1858,6 +1858,9 @@ pub fn toggle_search_layout(app: &mut App, config: Option<&Path>, now: std::time
             app.settings.search.layout = layout;
             // 保存した値が Esc の戻り先になる。他の項目は開いた時点の値のまま残す。
             app.settings_backup.search.layout = layout;
+            // 画像は ratatui の Buffer と別レイヤーなので、テキスト側を描き直すだけでは
+            // 古いサムネイルが残る。grid → list, list → grid のどちらでも貼り直させる。
+            app.thumbs.mark_dirty();
         }
         Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
     }
@@ -2841,6 +2844,20 @@ mod tests {
         let written = std::fs::read_to_string(&path).expect("読める");
         assert_eq!(written, "[search]\nlayout = \"list\"\n", "{written}");
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn toggling_marks_the_thumbnails_dirty_so_a_stale_image_is_cleared() {
+        // grid → list へ切り替えると Kitty 画像がテキストの上に残ったままになる
+        // (画像は ratatui の Buffer と別レイヤーなので、テキスト側の描き直しだけでは消えない)。
+        // dirty を立てて次の present_thumbs で a=d クリアを送らせる。
+        let path = settings_temp_dir("toggle-layout-dirty").join("config.toml");
+        let mut app = App::default();
+        app.thumbs.take_dirty(); // 素の状態を落としておく
+
+        toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
+
+        assert!(app.thumbs.take_dirty(), "貼ってある画像を消させる");
     }
 
     #[test]
