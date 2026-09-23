@@ -14,6 +14,8 @@ pub const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 pub const SUBSCRIPTIONS_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/subscriptions";
 pub const RATE_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/videos/rate";
 pub const VIDEOS_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/videos";
+pub const PLAYLISTS_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/playlists";
+pub const PLAYLIST_ITEMS_ENDPOINT: &str = "https://www.googleapis.com/youtube/v3/playlistItems";
 
 const APP_DIR: &str = "tuitube";
 const CLIENT_FILE: &str = "oauth_client.toml";
@@ -33,11 +35,20 @@ const LIKED_PAGE_SIZE: u32 = 50;
 const LIKED_PAGE_MAX: usize = 20;
 /// 登録確認 1 回で渡すチャンネル ID の数。forChannelId の上限が公表されていないので安全側。
 pub const CHANNEL_CHUNK: usize = 50;
+/// 保存先のプレイリスト名。名前が完全に同じものを使い、無ければ作る。
+const SAVE_PLAYLIST_TITLE: &str = "tuitube";
+/// 自分のプレイリスト一覧 1 ページの件数。API の上限。
+const PLAYLIST_PAGE_SIZE: u32 = 50;
+/// 保存先を探すときに辿るページ数の上限。
+const PLAYLIST_PAGE_MAX: usize = 20;
 
 pub const SUBSCRIBE_NOTICE: &str = "チャンネル登録中…";
 pub const LIKE_NOTICE: &str = "いいねを送信中…";
 pub const SUBSCRIBED_NOTICE: &str = "チャンネル登録しました";
 pub const LIKED_NOTICE: &str = "いいねしました";
+pub const SAVE_NOTICE: &str = "tuitube に保存中…";
+pub const SAVED_NOTICE: &str = "tuitube に保存しました";
+pub const ALREADY_SAVED_NOTICE: &str = "既に tuitube に保存しています";
 pub const STATE_MISMATCH: &str = "認可の応答が要求と一致しません";
 pub const NO_CODE: &str = "認可コードを受け取れませんでした";
 pub const NO_CONFIG_PATH: &str = "設定ファイルの置き場が分かりません ($HOME を設定してください)";
@@ -104,6 +115,8 @@ pub struct Tokens {
 pub enum Action {
     Subscribe(String),
     Like(String),
+    /// 動画を tuitube のプレイリストへ足す。
+    Save(String),
 }
 
 impl Action {
@@ -112,6 +125,7 @@ impl Action {
         match self {
             Action::Subscribe(_) => SUBSCRIBE_NOTICE,
             Action::Like(_) => LIKE_NOTICE,
+            Action::Save(_) => SAVE_NOTICE,
         }
     }
 
@@ -119,6 +133,7 @@ impl Action {
         match self {
             Action::Subscribe(_) => SUBSCRIBED_NOTICE,
             Action::Like(_) => LIKED_NOTICE,
+            Action::Save(_) => SAVED_NOTICE,
         }
     }
 }
@@ -372,6 +387,89 @@ pub fn rate_request(access_token: &str, video_id: &str) -> Request {
     }
 }
 
+/// 自分のプレイリスト一覧の 1 ページ。
+pub fn list_my_playlists_request(access_token: &str, page_token: Option<&str>) -> Request {
+    let mut url =
+        format!("{PLAYLISTS_ENDPOINT}?part=snippet&mine=true&maxResults={PLAYLIST_PAGE_SIZE}");
+    if let Some(token) = page_token {
+        url.push_str(&format!("&pageToken={}", percent_encode(token)));
+    }
+    let mut args = base_args();
+    args.push(url);
+    Request {
+        args,
+        secrets: vec![bearer(access_token)],
+    }
+}
+
+/// 保存先のプレイリストを非公開で作る。
+pub fn create_playlist_request(access_token: &str) -> Request {
+    let body = serde_json::json!({
+        "snippet": {"title": SAVE_PLAYLIST_TITLE},
+        "status": {"privacyStatus": "private"}
+    })
+    .to_string();
+    json_post(
+        access_token,
+        format!("{PLAYLISTS_ENDPOINT}?part=snippet,status"),
+        body,
+    )
+}
+
+/// プレイリストに動画が入っているかを見る。入っていれば 1 件返る。
+pub fn find_playlist_item_request(
+    access_token: &str,
+    playlist_id: &str,
+    video_id: &str,
+) -> Request {
+    let mut args = base_args();
+    args.push(format!(
+        "{PLAYLIST_ITEMS_ENDPOINT}?part=id&playlistId={}&videoId={}&maxResults=1",
+        percent_encode(playlist_id),
+        percent_encode(video_id)
+    ));
+    Request {
+        args,
+        secrets: vec![bearer(access_token)],
+    }
+}
+
+/// プレイリストの末尾へ動画を足す。
+pub fn insert_playlist_item_request(
+    access_token: &str,
+    playlist_id: &str,
+    video_id: &str,
+) -> Request {
+    let body = serde_json::json!({
+        "snippet": {
+            "playlistId": playlist_id,
+            "resourceId": {"kind": "youtube#video", "videoId": video_id}
+        }
+    })
+    .to_string();
+    json_post(
+        access_token,
+        format!("{PLAYLIST_ITEMS_ENDPOINT}?part=snippet"),
+        body,
+    )
+}
+
+/// JSON の本文を POST する。本文とトークンは設定ファイルとして stdin から渡す。
+fn json_post(access_token: &str, url: String, body: String) -> Request {
+    let mut args = base_args();
+    args.extend([
+        "-X".to_string(),
+        "POST".to_string(),
+        "-H".to_string(),
+        "Content-Type: application/json".to_string(),
+        url,
+    ]);
+    Request {
+        args,
+        secrets: vec![bearer(access_token), ("--data".to_string(), body)],
+    }
+}
+
 /// 自分がいいねした動画一覧の 1 ページ。myRating は id と同時に指定できないので、
 /// 動画 ID を渡して 1 件だけ確認する経路が無く、一覧を辿ることになる。
 pub fn list_liked_videos_request(access_token: &str, page_token: Option<&str>) -> Request {
@@ -491,6 +589,43 @@ fn liked_page_of(response: &Response) -> Result<(Vec<String>, Option<String>), S
         .and_then(|v| v.as_str())
         .map(str::to_string);
     Ok((ids, next))
+}
+
+/// プレイリスト一覧の 1 ページから、保存先と同じ名前のものの ID と次のページを取り出す。
+fn save_playlist_page_of(response: &Response) -> Result<(Option<String>, Option<String>), String> {
+    let value = api_json(response, "プレイリスト一覧")?;
+    let found = value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.pointer("/snippet/title").and_then(|v| v.as_str()) == Some(SAVE_PLAYLIST_TITLE)
+            })
+        })
+        .and_then(|item| item.get("id").and_then(|v| v.as_str()))
+        .map(str::to_string);
+    let next = value
+        .get("nextPageToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok((found, next))
+}
+
+/// 作ったプレイリストの ID。
+fn created_playlist_of(response: &Response) -> Result<String, String> {
+    api_json(response, "作ったプレイリスト")?
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "作ったプレイリストの ID が返りませんでした".to_string())
+}
+
+/// 1 件でも返ってきたか。
+fn has_items(response: &Response) -> Result<bool, String> {
+    Ok(api_json(response, "プレイリストの中身")?
+        .get("items")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| !items.is_empty()))
 }
 
 /// 登録済みとして返ってきたチャンネル ID。
@@ -729,6 +864,7 @@ async fn call_api<B: Backend>(
     let request = match action {
         Action::Subscribe(channel_id) => subscribe_request(access_token, channel_id),
         Action::Like(video_id) => rate_request(access_token, video_id),
+        Action::Save(video_id) => return save_to_playlist(backend, access_token, video_id).await,
     };
     let response = backend.curl(request).await?;
     // 既に登録済み / いいね済みは操作としては望みどおりなので成功と同じ扱いにする。
@@ -737,6 +873,62 @@ async fn call_api<B: Backend>(
         return Ok(action.done_notice().to_string());
     }
     Err(api_error(&response))
+}
+
+/// tuitube のプレイリストへ足す。無ければ作り、既に入っていれば足さない。
+async fn save_to_playlist<B: Backend>(
+    backend: &B,
+    access_token: &str,
+    video_id: &str,
+) -> Result<String, String> {
+    let playlist_id = match find_save_playlist(backend, access_token).await? {
+        Some(id) => id,
+        None => created_playlist_of(&backend.curl(create_playlist_request(access_token)).await?)?,
+    };
+    let found = backend
+        .curl(find_playlist_item_request(
+            access_token,
+            &playlist_id,
+            video_id,
+        ))
+        .await?;
+    if has_items(&found)? {
+        return Ok(ALREADY_SAVED_NOTICE.to_string());
+    }
+    let inserted = backend
+        .curl(insert_playlist_item_request(
+            access_token,
+            &playlist_id,
+            video_id,
+        ))
+        .await?;
+    // call_api と同じく、届かなかったときの 0 を成功として通さない。
+    if !(100..400).contains(&inserted.status) {
+        return Err(api_error(&inserted));
+    }
+    Ok(SAVED_NOTICE.to_string())
+}
+
+/// 自分のプレイリストから保存先を探す。見つからなければ None。
+async fn find_save_playlist<B: Backend>(
+    backend: &B,
+    access_token: &str,
+) -> Result<Option<String>, String> {
+    let mut page: Option<String> = None;
+    for _ in 0..PLAYLIST_PAGE_MAX {
+        let response = backend
+            .curl(list_my_playlists_request(access_token, page.as_deref()))
+            .await?;
+        let (found, next) = save_playlist_page_of(&response)?;
+        if found.is_some() {
+            return Ok(found);
+        }
+        match next {
+            Some(token) => page = Some(token),
+            None => break,
+        }
+    }
+    Ok(None)
 }
 
 // ---- 状態確認 ----
@@ -2232,10 +2424,249 @@ mod tests {
             SUBSCRIBE_NOTICE
         );
         assert_eq!(Action::Like("v".to_string()).notice(), LIKE_NOTICE);
+        assert_eq!(Action::Save("v".to_string()).notice(), SAVE_NOTICE);
     }
 
     #[test]
     fn config_escape_writes_the_control_characters_as_escapes() {
         assert_eq!(config_escape("a\tb\rc\u{b}d"), "a\\tb\\rc\\vd");
+    }
+
+    // ---- tuitube への保存 ----
+
+    /// 自分のプレイリスト一覧の 1 ページ。
+    fn playlist_page(items: &[(&str, &str)], next: Option<&str>) -> String {
+        let items: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(id, title)| serde_json::json!({"id": id, "snippet": {"title": title}}))
+            .collect();
+        let mut page = serde_json::json!({ "items": items });
+        if let Some(next) = next {
+            page["nextPageToken"] = serde_json::json!(next);
+        }
+        page.to_string()
+    }
+
+    fn json_body(request: &Request) -> serde_json::Value {
+        serde_json::from_str(&secret_of(request, "--data")).expect("JSON の本文")
+    }
+
+    /// 保存済みの refresh_token を持つ置き場。ブラウザでの認可を飛ばす。
+    fn signed_in(name: &str) -> Paths {
+        let paths = paths(name);
+        save_refresh_token(&paths.token, "rt-1").expect("書ける");
+        paths
+    }
+
+    const NO_ITEMS: &str = r#"{"items":[]}"#;
+
+    #[test]
+    fn list_my_playlists_request_asks_for_a_page_of_my_playlists() {
+        let first = list_my_playlists_request("at-1", None);
+        assert_eq!(
+            first.url(),
+            format!("{PLAYLISTS_ENDPOINT}?part=snippet&mine=true&maxResults=50")
+        );
+        assert_eq!(secret_of(&first, "--header"), "Authorization: Bearer at-1");
+        let next = list_my_playlists_request("at-1", Some("p 2"));
+        assert!(next.url().ends_with("&pageToken=p%202"), "{}", next.url());
+    }
+
+    #[test]
+    fn create_playlist_request_makes_a_private_tuitube_playlist() {
+        let request = create_playlist_request("at-1");
+        assert_eq!(
+            request.url(),
+            format!("{PLAYLISTS_ENDPOINT}?part=snippet,status")
+        );
+        assert!(request.args.contains(&"POST".to_string()));
+        let body = json_body(&request);
+        assert_eq!(
+            body.pointer("/snippet/title"),
+            Some(&serde_json::json!("tuitube"))
+        );
+        assert_eq!(
+            body.pointer("/status/privacyStatus"),
+            Some(&serde_json::json!("private"))
+        );
+        assert_argv_is_clean(&request, &["at-1"]);
+    }
+
+    #[test]
+    fn find_playlist_item_request_looks_for_the_video_in_the_playlist() {
+        let request = find_playlist_item_request("at-1", "PL 1", "vid 1");
+        assert_eq!(
+            request.url(),
+            format!(
+                "{PLAYLIST_ITEMS_ENDPOINT}?part=id&playlistId=PL%201&videoId=vid%201&maxResults=1"
+            )
+        );
+        assert_eq!(
+            secret_of(&request, "--header"),
+            "Authorization: Bearer at-1"
+        );
+    }
+
+    #[test]
+    fn insert_playlist_item_request_adds_the_video() {
+        let request = insert_playlist_item_request("at-1", "PL1", "vid1");
+        assert_eq!(
+            request.url(),
+            format!("{PLAYLIST_ITEMS_ENDPOINT}?part=snippet")
+        );
+        assert!(request.args.contains(&"POST".to_string()));
+        let body = json_body(&request);
+        assert_eq!(
+            body.pointer("/snippet/playlistId"),
+            Some(&serde_json::json!("PL1"))
+        );
+        assert_eq!(
+            body.pointer("/snippet/resourceId"),
+            Some(&serde_json::json!({"kind": "youtube#video", "videoId": "vid1"}))
+        );
+        assert_argv_is_clean(&request, &["at-1"]);
+    }
+
+    #[tokio::test]
+    async fn saving_adds_the_video_to_the_tuitube_playlist() {
+        let paths = signed_in("save-existing");
+        let backend = FakeBackend::new().with_responses(vec![
+            ok(REFRESHED_JSON),
+            ok(&playlist_page(
+                &[("PL0", "作業用BGM"), ("PL1", "tuitube")],
+                None,
+            )),
+            ok(NO_ITEMS),
+            ok(r#"{"id":"item1"}"#),
+        ]);
+
+        let notice = run(&backend, &paths, &Action::Save("vid1".to_string()))
+            .await
+            .expect("通る");
+
+        assert_eq!(notice, SAVED_NOTICE);
+        let calls = backend.calls();
+        assert_eq!(calls.len(), 4, "トークン・一覧・入っているかの確認・追加");
+        assert!(
+            url_of(&calls, 2).contains("playlistId=PL1"),
+            "{}",
+            url_of(&calls, 2)
+        );
+        assert_eq!(
+            json_body(&calls[3]).pointer("/snippet/playlistId"),
+            Some(&serde_json::json!("PL1"))
+        );
+        assert_eq!(
+            secret_of(&calls[3], "--header"),
+            "Authorization: Bearer at-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_finds_the_playlist_on_a_later_page() {
+        let paths = signed_in("save-later-page");
+        let backend = FakeBackend::new().with_responses(vec![
+            ok(REFRESHED_JSON),
+            ok(&playlist_page(&[("PL0", "作業用BGM")], Some("p2"))),
+            ok(&playlist_page(&[("PL9", "tuitube")], None)),
+            ok(NO_ITEMS),
+            ok(r#"{"id":"item1"}"#),
+        ]);
+
+        run(&backend, &paths, &Action::Save("vid1".to_string()))
+            .await
+            .expect("通る");
+
+        let calls = backend.calls();
+        assert!(
+            url_of(&calls, 2).ends_with("&pageToken=p2"),
+            "{}",
+            url_of(&calls, 2)
+        );
+        assert_eq!(
+            json_body(&calls[4]).pointer("/snippet/playlistId"),
+            Some(&serde_json::json!("PL9"))
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_makes_the_playlist_when_there_is_none() {
+        let paths = signed_in("save-create");
+        let backend = FakeBackend::new().with_responses(vec![
+            ok(REFRESHED_JSON),
+            // 名前が完全に同じものだけを使う。
+            ok(&playlist_page(&[("PL0", "tuitube のメモ")], None)),
+            ok(r#"{"id":"PLnew"}"#),
+            ok(NO_ITEMS),
+            ok(r#"{"id":"item1"}"#),
+        ]);
+
+        let notice = run(&backend, &paths, &Action::Save("vid1".to_string()))
+            .await
+            .expect("通る");
+
+        assert_eq!(notice, SAVED_NOTICE);
+        let calls = backend.calls();
+        assert_eq!(
+            url_of(&calls, 2),
+            format!("{PLAYLISTS_ENDPOINT}?part=snippet,status")
+        );
+        assert_eq!(
+            json_body(&calls[4]).pointer("/snippet/playlistId"),
+            Some(&serde_json::json!("PLnew"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_video_already_in_the_playlist_is_not_added_twice() {
+        let paths = signed_in("save-duplicate");
+        let backend = FakeBackend::new().with_responses(vec![
+            ok(REFRESHED_JSON),
+            ok(&playlist_page(&[("PL1", "tuitube")], None)),
+            ok(r#"{"items":[{"id":"item1"}]}"#),
+        ]);
+
+        let notice = run(&backend, &paths, &Action::Save("vid1".to_string()))
+            .await
+            .expect("通る");
+
+        assert_eq!(notice, ALREADY_SAVED_NOTICE);
+        assert_eq!(backend.calls().len(), 3, "追加は送らない");
+    }
+
+    #[tokio::test]
+    async fn a_refused_save_says_why() {
+        let paths = signed_in("save-refused");
+        let backend = FakeBackend::new().with_responses(vec![
+            ok(REFRESHED_JSON),
+            ok(&playlist_page(&[("PL1", "tuitube")], None)),
+            ok(NO_ITEMS),
+            failed(
+                403,
+                r#"{"error":{"message":"quota","errors":[{"reason":"quotaExceeded"}]}}"#,
+            ),
+        ]);
+
+        let error = run(&backend, &paths, &Action::Save("vid1".to_string()))
+            .await
+            .expect_err("通らない");
+
+        assert!(error.contains("quota"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_playlist_list_that_cannot_be_read_stops_the_save() {
+        let paths = signed_in("save-list-refused");
+        let backend = FakeBackend::new().with_responses(vec![
+            ok(REFRESHED_JSON),
+            failed(401, r#"{"error":{"message":"invalid credentials"}}"#),
+        ]);
+
+        let error = run(&backend, &paths, &Action::Save("vid1".to_string()))
+            .await
+            .expect_err("通らない");
+
+        assert!(error.contains("invalid credentials"), "{error}");
+        assert_eq!(backend.calls().len(), 2, "作りも足しもしない");
     }
 }

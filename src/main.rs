@@ -547,11 +547,9 @@ fn apply_oauth_done(
     session.oauth_task = None;
     let action = session.oauth_action.take();
     // 失敗のときはエラーを出すだけでは「…中」が残るので、ここで畳む。
-    if app
-        .notice
-        .as_deref()
-        .is_some_and(|n| n == oauth::SUBSCRIBE_NOTICE || n == oauth::LIKE_NOTICE)
-    {
+    if app.notice.as_deref().is_some_and(|n| {
+        n == oauth::SUBSCRIBE_NOTICE || n == oauth::LIKE_NOTICE || n == oauth::SAVE_NOTICE
+    }) {
         app.set_notice(None);
     }
     match result {
@@ -573,6 +571,9 @@ fn remember_engagement(app: &mut App, action: &oauth::Action, now: std::time::Sy
         oauth::Action::Like(video_id) => app.engagement.remember_like(video_id, true, now),
         oauth::Action::Subscribe(channel_id) => {
             app.engagement.remember_subscription(channel_id, true, now)
+        }
+        oauth::Action::Save(video_id) => {
+            app.saved_videos.insert(video_id.clone());
         }
     }
 }
@@ -2959,6 +2960,47 @@ mod tests {
         handle_event(&mut app, event, &tx, &mut session).await;
 
         assert_eq!(app.error.as_deref(), Some("いいねできませんでした"));
+    }
+
+    #[tokio::test]
+    async fn a_finished_save_marks_the_video_and_replaces_the_progress_notice() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            oauth_action: Some(oauth::Action::Save("v1".to_string())),
+            ..Session::default()
+        };
+        let mut app = App::default();
+        app.set_notice(Some(oauth::SAVE_NOTICE.to_string()));
+
+        let event = AppEvent::OauthDone {
+            nonce: session.oauth_nonce,
+            result: Ok(oauth::SAVED_NOTICE.to_string()),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert!(app.saved_videos.contains("v1"));
+        assert_eq!(app.notice.as_deref(), Some(oauth::SAVED_NOTICE));
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_folds_the_progress_notice() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            oauth_action: Some(oauth::Action::Save("v1".to_string())),
+            ..Session::default()
+        };
+        let mut app = App::default();
+        app.set_notice(Some(oauth::SAVE_NOTICE.to_string()));
+
+        let event = AppEvent::OauthDone {
+            nonce: session.oauth_nonce,
+            result: Err("quota".to_string()),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.notice, None, "「保存中」を残さない");
+        assert_eq!(app.error.as_deref(), Some("quota"));
+        assert!(app.saved_videos.is_empty());
     }
 
     #[tokio::test]

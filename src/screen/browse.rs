@@ -5,7 +5,7 @@
 use crate::actions::{
     Oauth, Session, config_path_from_env, hide_current_channel, hide_selected, leave_background,
     leave_channel, load_more, move_selection, open_channel, reload_channel_tab, reload_tab,
-    select_channel_tab, select_tab, start_playback, start_search, subscribe_channel,
+    save_video, select_channel_tab, select_tab, start_playback, start_search, subscribe_channel,
     switch_channel_tab, switch_tab, toggle_search_layout,
 };
 use crate::app::{App, AppEvent, ChannelView, Mode, format_time};
@@ -130,16 +130,17 @@ pub async fn handle_key_results(
     session: &mut Session,
 ) {
     let config = config_path_from_env();
-    handle_key_results_with(app, key, tx, session, config.as_deref()).await;
+    handle_key_results_with(app, key, tx, session, Oauth::real(), config.as_deref()).await;
 }
 
-/// 設定ファイルの置き場を差し替えられる形。テストはここに一時ファイルを渡して
-/// 利用者の設定を書き換えない。
-async fn handle_key_results_with(
+/// oauth の実装先と設定ファイルの置き場を差し替えられる形。テストはここに偽物と
+/// 一時ファイルを渡して、実際の通信も利用者の設定の書き換えも起こさない。
+async fn handle_key_results_with<B: oauth::Backend + 'static>(
     app: &mut App,
     key: KeyEvent,
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
+    deps: Oauth<B>,
     config: Option<&Path>,
 ) {
     match key.code {
@@ -165,6 +166,7 @@ async fn handle_key_results_with(
         KeyCode::Char('r') => reload_tab(app, tx, session),
         KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('d') => open_download(app, session),
+        KeyCode::Char('a') => save_video(app, tx, session, deps),
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         KeyCode::Char('p') => open_playlists(app, tx, session),
         // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
@@ -218,6 +220,7 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         KeyCode::Char('r') => reload_channel_tab(app, tx, session),
         KeyCode::Char('s') => subscribe_channel(app, tx, session, deps),
         KeyCode::Char('d') => open_download(app, session),
+        KeyCode::Char('a') => save_video(app, tx, session, deps),
         KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
         // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
         KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
@@ -237,16 +240,17 @@ pub async fn handle_key_playlist(
     session: &mut Session,
 ) {
     let config = config_path_from_env();
-    handle_key_playlist_with(app, key, tx, session, config.as_deref()).await;
+    handle_key_playlist_with(app, key, tx, session, Oauth::real(), config.as_deref()).await;
 }
 
-/// 設定ファイルの置き場を差し替えられる形。テストはここに一時ファイルを渡して
-/// 利用者の設定を書き換えない。
-async fn handle_key_playlist_with(
+/// oauth の実装先と設定ファイルの置き場を差し替えられる形。テストはここに偽物と
+/// 一時ファイルを渡して、実際の通信も利用者の設定の書き換えも起こさない。
+async fn handle_key_playlist_with<B: oauth::Backend + 'static>(
     app: &mut App,
     key: KeyEvent,
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
+    deps: Oauth<B>,
     config: Option<&Path>,
 ) {
     match key.code {
@@ -261,6 +265,7 @@ async fn handle_key_playlist_with(
         KeyCode::Char('r') => reload_playlist(app, tx, session),
         KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('d') => open_download(app, session),
+        KeyCode::Char('a') => save_video(app, tx, session, deps),
         // プレイリストごと隠す手はないので、チャンネルと違い動画 1 件だけを隠す。
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
@@ -883,6 +888,7 @@ pub fn results_hints(can_load_more: bool, background: bool) -> Vec<String> {
         hints.push("b:全画面へ".to_string());
     }
     hints.push("v:表示切替".to_string());
+    hints.push("a:保存".to_string());
     hints
 }
 
@@ -905,6 +911,7 @@ pub fn channel_hints(background: bool) -> Vec<String> {
         hints.push("b:全画面へ".to_string());
     }
     hints.push("v:表示切替".to_string());
+    hints.push("a:保存".to_string());
     hints
 }
 
@@ -925,6 +932,7 @@ pub fn playlist_hints(background: bool) -> Vec<String> {
         hints.push("b:全画面へ".to_string());
     }
     hints.push("v:表示切替".to_string());
+    hints.push("a:保存".to_string());
     hints
 }
 
@@ -1639,6 +1647,7 @@ mod tests {
                 key(KeyCode::Char('v')),
                 &tx,
                 &mut session,
+                fake_oauth(),
                 Some(&path),
             )
             .await;
@@ -1681,6 +1690,7 @@ mod tests {
                 key(KeyCode::Char('v')),
                 &tx,
                 &mut session,
+                fake_oauth(),
                 Some(&path),
             )
             .await;
@@ -2875,6 +2885,83 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_saves_the_selected_video_on_the_list_screens() {
+            let (tx, _rx) = channel();
+
+            let mut session = Session::default();
+            let mut app = grid_app(3);
+            app.selected = 1;
+            handle_key_results_with(
+                &mut app,
+                key(KeyCode::Char('a')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                session.oauth_action,
+                Some(crate::oauth::Action::Save("id1".to_string()))
+            );
+
+            let mut session = Session::default();
+            let mut app = channel_app(2);
+            handle_key_channel_with(
+                &mut app,
+                key(KeyCode::Char('a')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+            assert!(
+                matches!(&session.oauth_action, Some(crate::oauth::Action::Save(_))),
+                "{:?}",
+                session.oauth_action
+            );
+
+            let mut session = Session::default();
+            let mut app = playlist_app(2);
+            handle_key_playlist_with(
+                &mut app,
+                key(KeyCode::Char('a')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                session.oauth_action,
+                Some(crate::oauth::Action::Save("v0".to_string()))
+            );
+        }
+
+        #[tokio::test]
+        async fn a_on_an_empty_list_saves_nothing() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = App {
+                mode: Mode::Results,
+                ..App::default()
+            };
+
+            handle_key_results_with(
+                &mut app,
+                key(KeyCode::Char('a')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+
+            assert!(session.oauth_task.is_none());
+        }
+
+        #[tokio::test]
         async fn h_hides_the_selected_result() {
             let (tx, _rx) = channel();
             let mut session = Session::default();
@@ -3802,6 +3889,21 @@ mod tests {
             let back = "b:全画面へ".to_string();
             assert!(!playlist_hints(false).contains(&back));
             assert!(playlist_hints(true).contains(&back));
+        }
+
+        #[test]
+        fn the_list_help_names_the_save_key_last() {
+            for hints in [
+                results_hints(false, false),
+                channel_hints(false),
+                playlist_hints(false),
+            ] {
+                assert_eq!(
+                    hints.last().map(String::as_str),
+                    Some("a:保存"),
+                    "{hints:?}"
+                );
+            }
         }
 
         #[test]

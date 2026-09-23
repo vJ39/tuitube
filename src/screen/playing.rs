@@ -4,9 +4,9 @@
 
 use crate::actions::{
     CommentScroll, Oauth, SEEK_STEP_SECS, Session, change_speed, config_path_from_env,
-    copy_url_with, cycle_display_mode, enter_background, like_video, reset_speed, scroll_comments,
-    seek_absolute, seek_relative, send_to_player, subscribe_playing_channel, toggle_comments,
-    toggle_subtitles,
+    copy_url_with, cycle_display_mode, enter_background, like_video, reset_speed, save_video,
+    scroll_comments, seek_absolute, seek_relative, send_to_player, subscribe_playing_channel,
+    toggle_comments, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, Mode, format_time};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -227,6 +227,7 @@ async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
     match key.code {
         KeyCode::Char('l') => like_video(app, tx, session, deps),
         KeyCode::Char('u') => subscribe_playing_channel(app, tx, session, deps),
+        KeyCode::Char('a') => save_video(app, tx, session, deps),
         _ => {}
     }
     if key.code == KeyCode::Char('d') {
@@ -300,6 +301,7 @@ async fn handle_mouse_playing_with<B: oauth::Backend + 'static>(
         match kind {
             ActionKind::Like => like_video(app, tx, session, deps),
             ActionKind::Subscribe => subscribe_playing_channel(app, tx, session, deps),
+            ActionKind::Save => save_video(app, tx, session, deps),
         }
         return;
     }
@@ -441,6 +443,7 @@ fn draw_seek_bar(frame: &mut Frame, app: &App, area: Rect) {
 pub enum ActionKind {
     Like,
     Subscribe,
+    Save,
 }
 
 /// ラベルの区切り。
@@ -451,6 +454,7 @@ impl ActionKind {
         match self {
             ActionKind::Like => "♥いいね",
             ActionKind::Subscribe => "＋登録",
+            ActionKind::Save => "★保存",
         }
     }
 
@@ -459,6 +463,7 @@ impl ActionKind {
         match self {
             ActionKind::Like => Color::Red,
             ActionKind::Subscribe => Color::Green,
+            ActionKind::Save => Color::Yellow,
         }
     }
 }
@@ -493,6 +498,11 @@ fn action_pieces(app: &App) -> Vec<ActionPiece> {
             done: app.engagement.is_subscribed(channel_id).unwrap_or(false),
         });
     }
+    pieces.push(ActionPiece::Gap);
+    pieces.push(ActionPiece::Label {
+        kind: ActionKind::Save,
+        done: app.saved_videos.contains(&app.playback.id),
+    });
     pieces
 }
 
@@ -570,6 +580,7 @@ pub fn playing_hints(
     if can_subscribe {
         hints.push("＋u:登録".to_string());
     }
+    hints.push("★a:保存".to_string());
     hints.extend([
         "s:字幕".to_string(),
         "o:コメント".to_string(),
@@ -1360,6 +1371,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_while_playing_saves_the_video() {
+            let mut session = Session::default();
+            let mut app = playing_url_app();
+
+            press_while_playing(&mut app, KeyCode::Char('a'), &mut session).await;
+
+            assert_eq!(
+                session.oauth_action,
+                Some(crate::oauth::Action::Save("abc".to_string()))
+            );
+            assert_eq!(app.notice.as_deref(), Some(crate::oauth::SAVE_NOTICE));
+        }
+
+        #[tokio::test]
+        async fn clicking_the_save_icon_saves() {
+            let mut session = Session::default();
+            let mut app = playing_channel_app();
+            // いいね・区切り・登録・区切りの右。
+            let column = (crate::grid::display_width(ActionKind::Like.label())
+                + 2
+                + crate::grid::display_width(ActionKind::Subscribe.label())
+                + 2) as u16;
+
+            click_while_playing(&mut app, action_click(column), &mut session).await;
+
+            assert_eq!(
+                session.oauth_action,
+                Some(crate::oauth::Action::Save("abc".to_string()))
+            );
+            assert_eq!(app.playback.time_pos, Some(0.0), "シークは走らない");
+        }
+
+        #[tokio::test]
+        async fn the_save_icon_sits_right_after_the_like_without_a_channel() {
+            let mut session = Session::default();
+            let mut app = playing_url_app();
+            let column = crate::grid::display_width(ActionKind::Like.label()) as u16 + 2;
+
+            click_while_playing(&mut app, action_click(column), &mut session).await;
+
+            assert_eq!(
+                session.oauth_action,
+                Some(crate::oauth::Action::Save("abc".to_string()))
+            );
+        }
+
+        #[tokio::test]
         async fn a_click_next_to_the_icons_does_nothing() {
             let mut session = Session::default();
             let mut app = playing_channel_app();
@@ -1973,6 +2031,18 @@ mod tests {
         }
 
         #[test]
+        fn the_action_row_shows_the_save_label_colored_once_saved() {
+            let gray = Style::default().fg(Color::Gray);
+            let mut app = action_app(None);
+            let row = drawn_row(&app, action_area(app.screen).y);
+            assert!(row.contains("★保存"), "{row}");
+            assert_eq!(action_style(&app, "保存"), gray);
+
+            app.saved_videos.insert("v1".to_string());
+            assert_ne!(action_style(&app, "保存"), gray, "保存した動画は色を付ける");
+        }
+
+        #[test]
         fn a_done_action_is_colored_and_an_undone_one_is_gray() {
             let gray = Style::default().fg(Color::Gray);
             let now = std::time::SystemTime::UNIX_EPOCH;
@@ -2062,6 +2132,20 @@ mod tests {
             );
             assert!(no_channel.contains("l:いいね"), "{no_channel}");
             assert!(!no_channel.contains("u:登録"), "{no_channel}");
+        }
+
+        #[test]
+        fn playing_help_mentions_the_save_key() {
+            let wide = help_text(
+                Mode::Playing,
+                DisplayMode::Embedded,
+                false,
+                false,
+                false,
+                false,
+                200,
+            );
+            assert!(wide.contains("a:保存"), "{wide}");
         }
 
         #[test]

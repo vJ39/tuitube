@@ -23,6 +23,7 @@ use crate::video::VideoSink;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// シークを送ってから確定値を待つ間、ポーリングの古い値を無視する時間。
@@ -340,6 +341,9 @@ pub struct App {
     pub resume: Resume,
     /// いいね済み/チャンネル登録済みの控え。印の判定と再確認の要否をここから引く。
     pub engagement: EngagementCache,
+    /// この起動中に tuitube のプレイリストへ保存した (保存済みと分かった) 動画。
+    /// アクション行の印にだけ使い、ディスクには残さない。
+    pub saved_videos: HashSet<String>,
     /// ダウンロード画面の状態。
     pub download: DownloadForm,
 }
@@ -387,6 +391,7 @@ impl Default for App {
             hidden: Hidden::default(),
             resume: Resume::default(),
             engagement: EngagementCache::default(),
+            saved_videos: HashSet::new(),
             download: DownloadForm::default(),
         }
     }

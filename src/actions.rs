@@ -606,6 +606,29 @@ pub fn like_video<B>(
     start_oauth(app, tx, session, oauth::Action::Like(video_id), deps);
 }
 
+/// 動画を tuitube のプレイリストへ保存する。再生中はその動画、一覧では選んでいる動画。
+/// 動画 ID を取れなければ何もしない。
+pub fn save_video<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    let video_id = match app.mode {
+        Mode::Playing => oauth::video_id_from_url(&app.playback.url),
+        _ => app
+            .view_selected_result()
+            .map(|result| result.id.clone())
+            .filter(|id| !id.is_empty()),
+    };
+    let Some(video_id) = video_id else {
+        return;
+    };
+    start_oauth(app, tx, session, oauth::Action::Save(video_id), deps);
+}
+
 /// 認証から送信までを 1 タスクで進める。ブラウザでの認可を挟むので待ち時間は読めない。
 /// 知らせは期限では消さず、結果が届いた時点で畳む。
 pub fn start_oauth<B>(
@@ -3247,6 +3270,70 @@ mod tests {
 
         assert!(session.oauth_task.is_none());
         assert!(app.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn saving_while_playing_saves_the_playing_video() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            playback: Playback {
+                url: "https://www.youtube.com/watch?v=song1".to_string(),
+                ..Playback::default()
+            },
+            ..playing_app()
+        };
+
+        save_video(&mut app, &tx, &mut session, hanging_oauth("save-playing"));
+
+        assert_eq!(
+            session.oauth_action,
+            Some(oauth::Action::Save("song1".to_string()))
+        );
+        assert_eq!(app.notice.as_deref(), Some(oauth::SAVE_NOTICE));
+        assert!(session.oauth_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn saving_from_a_list_saves_the_selected_video() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(3);
+        app.selected = 1;
+
+        save_video(&mut app, &tx, &mut session, hanging_oauth("save-list"));
+
+        assert_eq!(
+            session.oauth_action,
+            Some(oauth::Action::Save("id1".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn saving_without_a_video_does_nothing() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+
+        let mut playing = playing_app();
+        save_video(
+            &mut playing,
+            &tx,
+            &mut session,
+            hanging_oauth("save-none-playing"),
+        );
+        let mut empty = App {
+            mode: Mode::Results,
+            ..App::default()
+        };
+        save_video(
+            &mut empty,
+            &tx,
+            &mut session,
+            hanging_oauth("save-none-list"),
+        );
+
+        assert!(session.oauth_task.is_none());
+        assert!(playing.notice.is_none() && empty.notice.is_none());
     }
 
     #[tokio::test]
