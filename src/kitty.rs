@@ -402,6 +402,42 @@ mod tests {
     }
 
     #[test]
+    fn other_escape_strings_in_the_stream_do_not_swallow_the_next_image() {
+        for noise in [
+            // タイトルの OSC は BEL でも ST でも閉じる。
+            &b"\x1b]0;mpv\x07"[..],
+            b"\x1b]0;mpv\x1b\\",
+            // DCS・PM・SOS と G 以外の APC も終端まで読み飛ばす。
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1b^private\x1b\\",
+            b"\x1bXsos\x1b\\",
+            b"\x1b_Xother\x1b\\",
+            // 途中で切れた CSI や、続けて来た ESC は次の列の頭で打ち切る。
+            b"\x1b[1;",
+            b"\x1b",
+        ] {
+            let commands = parse(&[noise, SINGLE].concat());
+            assert_eq!(commands.len(), 1, "{noise:?}");
+            assert_eq!(commands[0].raw, SINGLE, "{noise:?}");
+        }
+    }
+
+    #[test]
+    fn a_command_without_a_payload_still_reads_its_keys() {
+        let commands = parse(b"\x1b_Ga=d,q=2\x1b\\");
+        assert_eq!(
+            commands[0].keys,
+            [('a', "d".to_string()), ('q', "2".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_key_longer_than_one_letter_is_not_read() {
+        let commands = parse(b"\x1b_Gab=1,c=2;AAAA\x1b\\");
+        assert_eq!(commands[0].keys, [('c', "2".to_string())]);
+    }
+
+    #[test]
     fn apc_parser_gives_the_same_result_for_every_split_point() {
         let input = mixed_stream();
         let whole = parse(&input);
@@ -535,6 +571,25 @@ mod tests {
             };
             assert_eq!((frame.width_px, frame.height_px), (width, height));
         }
+    }
+
+    #[test]
+    fn an_unknown_action_leaves_the_open_frame_alone() {
+        let mut assembler = assembler();
+        let first = parse(b"\x1b_Ga=T,f=24,s=2,v=1,m=1;AAAA\x1b\\");
+        let query = parse(b"\x1b_Ga=q,i=1;AAAA\x1b\\");
+        let last = parse(b"\x1b_Gm=0;AAAA\x1b\\");
+
+        assert_eq!(assembler.push(first[0].clone()), None);
+        assert_eq!(
+            assembler.push(query[0].clone()),
+            None,
+            "問い合わせは無視する"
+        );
+        let Some(FrameEvent::Frame(frame)) = assembler.push(last[0].clone()) else {
+            panic!("組み立て中のフレームが残っている");
+        };
+        assert_eq!((frame.width_px, frame.height_px), (2, 1));
     }
 
     #[test]

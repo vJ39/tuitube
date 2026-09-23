@@ -1010,4 +1010,11 @@ mod tests {
         sink.clear_redraw();
         assert!(sink.request_redraw());
     }
+
+    #[test]
+    fn a_boolean_option_is_passed_as_yes_or_no() {
+        assert_eq!(option_arg(&json!(true)), "yes");
+        assert_eq!(option_arg(&json!(false)), "no");
+        assert_eq!(option_arg(&json!(3)), "3");
+    }
 }

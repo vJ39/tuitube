@@ -1461,6 +1461,38 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn moving_over_the_bar_marks_where_a_click_would_seek() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playing_app();
+
+            let moved = mouse(MouseEventKind::Moved, 13, 20);
+            handle_mouse(&mut app, moved, &tx, &mut session).await;
+
+            assert_eq!(app.seek_bar.hover, Some(13));
+            assert_eq!(
+                app.playback.time_pos,
+                Some(0.0),
+                "動かすだけではシークしない"
+            );
+        }
+
+        #[tokio::test]
+        async fn dragging_along_the_bar_follows_the_pointer_until_the_release() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playing_app();
+
+            let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
+            handle_mouse(&mut app, down, &tx, &mut session).await;
+            let drag = mouse(MouseEventKind::Drag(MouseButton::Left), 13, 20);
+            handle_mouse(&mut app, drag, &tx, &mut session).await;
+
+            assert_eq!(app.seek_bar.drag, Some(13));
+            assert_eq!(app.playback.time_pos, Some(0.0), "離すまではシークしない");
+        }
+
+        #[tokio::test]
         async fn a_release_from_another_button_does_not_end_the_drag() {
             let (tx, _rx) = channel();
             let mut session = Session::default();

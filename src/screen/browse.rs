@@ -933,6 +933,7 @@ mod tests {
     // 観点ごとに画面の組み立て方が違うので、小分けにしてそれぞれにヘルパーを持たせる。
     /// 状態行。
     mod state {
+        use super::super::{channel_status, playlist_status, results_status};
         use crate::app::{App, ChannelView, Mode, Playback, PlaylistView};
         use crate::cookies::Target;
         use crate::screen::playlists::PlaylistsView;
@@ -1066,6 +1067,14 @@ mod tests {
             assert!(line.contains("Some Channel"), "{line}");
             assert!(line.contains("動画"), "{line}");
             assert!(line.contains("1 件"), "{line}");
+        }
+
+        #[test]
+        fn the_channel_and_playlist_status_fall_back_to_the_results_without_a_view() {
+            let mut app = App::default();
+            app.set_results(vec![result("a")], &search_target());
+            assert_eq!(channel_status(&app), results_status(&app));
+            assert_eq!(playlist_status(&app), results_status(&app));
         }
 
         #[test]
@@ -1539,6 +1548,21 @@ mod tests {
 
             app.background = true;
             handle_key_channel(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+            assert_eq!(app.mode, Mode::Playing);
+            assert!(!app.background);
+        }
+
+        #[tokio::test]
+        async fn b_key_returns_to_playing_from_a_playlist_only_while_backgrounded() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlist_app(2);
+
+            handle_key(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+            assert_eq!(app.mode, Mode::Playlist);
+
+            app.background = true;
+            handle_key(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
             assert_eq!(app.mode, Mode::Playing);
             assert!(!app.background);
         }
@@ -3771,6 +3795,13 @@ mod tests {
             }
             assert!(!help.contains("Tab:"), "タブの無い画面: {help}");
             assert!(grid::display_width(&help) <= 80, "{help}");
+        }
+
+        #[test]
+        fn the_playlist_help_offers_the_way_back_to_the_player_only_while_backgrounded() {
+            let back = "b:全画面へ".to_string();
+            assert!(!playlist_hints(false).contains(&back));
+            assert!(playlist_hints(true).contains(&back));
         }
 
         #[test]

@@ -969,4 +969,17 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn an_exit_status_names_the_code_or_the_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            describe_status(ExitStatus::from_raw(1 << 8)),
+            "終了コード 1"
+        );
+        assert_eq!(
+            describe_status(ExitStatus::from_raw(9)),
+            "シグナルにより終了"
+        );
+    }
 }

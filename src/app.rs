@@ -1736,6 +1736,16 @@ mod tests {
     }
 
     #[test]
+    fn the_text_display_label_names_the_fps_but_not_the_quality() {
+        // 画質はピクセル予算なので、文字ブロックの表示では出さない。
+        let app = App {
+            display: DisplayMode::Text,
+            ..App::default()
+        };
+        assert_eq!(app.display_label(), "[テキスト 15fps]");
+    }
+
+    #[test]
     fn display_label_marks_the_transition_until_mpv_confirms() {
         let mut app = App {
             display: DisplayMode::Window,

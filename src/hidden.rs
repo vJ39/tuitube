@@ -363,6 +363,28 @@ mod tests {
         assert_eq!(leftover_temp_files(&dir), Vec::<String>::new());
     }
 
+    #[test]
+    fn a_hand_written_file_without_a_final_newline_stays_readable_after_adding() {
+        // 手で書いて最後の改行を付けずに保存したファイル。
+        let dir = temp_dir("no-final-newline");
+        let path = dir.join("hidden.toml");
+        fs::write(&path, "[[videos]]\nid = \"v1\"\ntitle = \"手で足した\"").expect("書ける");
+        let mut hidden = load_from(Some(&path));
+
+        hidden.add_video("v2", "あとから").expect("書ける");
+
+        let reloaded = load_from(Some(&path));
+        assert_eq!(
+            reloaded.videos,
+            HashSet::from(["v1".to_string(), "v2".to_string()])
+        );
+        let written = fs::read_to_string(&path).expect("読める");
+        assert!(
+            written.contains("手で足した\"\n\n[[videos]]"),
+            "間を 1 行空けて足す: {written}"
+        );
+    }
+
     /// 置き換えに使った一時ファイルの残り。名前はプロセスごとに変わる。
     fn leftover_temp_files(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)

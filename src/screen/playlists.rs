@@ -374,6 +374,25 @@ mod tests {
         }
 
         #[test]
+        fn the_playlists_status_counts_an_empty_list_and_falls_back_without_one() {
+            let mut app = playlist_app();
+            app.playlist = None;
+            app.mode = Mode::Playlists;
+            app.playlists = Some(PlaylistsView::default());
+            assert!(
+                playlists_status(&app).ends_with("0 件"),
+                "{}",
+                playlists_status(&app)
+            );
+
+            app.playlists = None;
+            assert_eq!(
+                playlists_status(&app),
+                crate::screen::browse::results_status(&app)
+            );
+        }
+
+        #[test]
         fn the_status_line_counts_the_playlists_on_the_list_screen() {
             // 一覧画面が数えるのは動画ではなくプレイリストの件数。
             let mut app = playlist_app();
@@ -537,6 +556,21 @@ mod tests {
                 assert!(!take_search(&mut session), "戻るだけでは取り直さない");
             }
         }
+
+        #[tokio::test]
+        async fn b_key_returns_to_playing_from_the_list_only_while_backgrounded() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlists_app(2);
+
+            handle_key(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+            assert_eq!(app.mode, Mode::Playlists);
+
+            app.background = true;
+            handle_key(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
+            assert_eq!(app.mode, Mode::Playing);
+            assert!(!app.background);
+        }
     }
 
     /// 一覧の描画と案内。
@@ -632,6 +666,13 @@ mod tests {
             // 画面の最下行 (ui のフッタ) にも同じ文言が出る。
             let screen = rendered(&playlists_app(3), 80, 24);
             assert_eq!(screen.lines().last().unwrap_or_default().trim_end(), help);
+        }
+
+        #[test]
+        fn the_playlists_help_offers_the_way_back_to_the_player_only_while_backgrounded() {
+            let back = "b:全画面へ".to_string();
+            assert!(!playlists_hints(false).contains(&back));
+            assert!(playlists_hints(true).contains(&back));
         }
 
         #[test]

@@ -1490,6 +1490,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_search_that_could_not_decrypt_the_cookies_says_so() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            cookies: CookieState::Armed(source()),
+            ..App::default()
+        };
+        // 後に続くサムネイル取得・状態確認は外へ出るので止めておく。
+        app.settings.thumbnails.enabled = false;
+        app.settings.engagement.enabled = false;
+        let event = AppEvent::SearchDone {
+            nonce: 1,
+            target: Target::Search("q".to_string()),
+            report: SearchReport {
+                results: Ok(vec![result("a")]),
+                outcome: CookieOutcome::Degraded("failed to decrypt".to_string()),
+                fell_back: false,
+                timeout: search::YT_DLP_TIMEOUT,
+            },
+            requested_limit: 1,
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Results, "結果は出す");
+        assert!(app.error.is_none());
+        let notice = app.notice.expect("説明を出す");
+        assert!(notice.contains("cookie を復号できませんでした"), "{notice}");
+    }
+
+    #[tokio::test]
     async fn a_timeout_names_the_seconds_the_search_actually_waited() {
         // 検索中に設定画面で秒数を変えても、文言は打ち切った側の秒数で出す。
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -2727,5 +2760,222 @@ mod tests {
             ..App::default()
         };
         assert_eq!(app.tabs.labels(), ["すべて", "将棋"]);
+    }
+
+    // ---- 再生中のイベント ----
+
+    /// 送ったものを捨てる player。nonce の照合だけを見たいテストで使う。
+    struct NullSink;
+
+    impl actions::PlayerSink for NullSink {
+        fn send<'a>(&'a mut self, _command: &'a mpv::MpvCommand) -> actions::Sending<'a> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// nonce 2 の player で再生中。一覧に 1 件あるので、終われば結果へ戻る。
+    fn playing(session: &mut Session) -> App {
+        session.player = Some(actions::Player {
+            sink: Box::new(NullSink),
+            nonce: 2,
+        });
+        App {
+            mode: Mode::Playing,
+            results: vec![result("a")],
+            video: Some(sink()),
+            playback: Playback {
+                title: "song".to_string(),
+                time_pos: Some(5.0),
+                ..Playback::default()
+            },
+            ..App::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn events_from_a_replaced_player_leave_the_playback_alone() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing(&mut session);
+        app.video.as_ref().expect("映像").request_redraw();
+
+        for event in [
+            AppEvent::MpvProperty {
+                nonce: 1,
+                id: mpv::REQ_TIME_POS,
+                data: Some(serde_json::json!(40.0)),
+            },
+            AppEvent::VideoFrame { nonce: 1 },
+            AppEvent::VideoError {
+                nonce: 1,
+                error: "前の映像".to_string(),
+            },
+            AppEvent::MpvExited {
+                nonce: 1,
+                error: Some("前の mpv".to_string()),
+            },
+        ] {
+            handle_event(&mut app, event, &tx, &mut session).await;
+        }
+
+        assert_eq!(app.mode, Mode::Playing);
+        assert_eq!(
+            app.playback.time_pos,
+            Some(5.0),
+            "前の再生位置で上書きしない"
+        );
+        assert!(
+            !app.video.as_ref().expect("映像").request_redraw(),
+            "前の再生の描き直し要求は受け取らない"
+        );
+        assert_eq!(app.error, None);
+        assert!(session.player.is_some(), "今の再生は続ける");
+    }
+
+    #[tokio::test]
+    async fn a_property_from_the_current_player_updates_the_playback() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing(&mut session);
+
+        let event = AppEvent::MpvProperty {
+            nonce: 2,
+            id: mpv::REQ_TIME_POS,
+            data: Some(serde_json::json!(40.0)),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.playback.time_pos, Some(40.0));
+    }
+
+    #[tokio::test]
+    async fn a_frame_from_the_current_player_takes_the_redraw_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing(&mut session);
+        app.video.as_ref().expect("映像").request_redraw();
+
+        handle_event(
+            &mut app,
+            AppEvent::VideoFrame { nonce: 2 },
+            &tx,
+            &mut session,
+        )
+        .await;
+
+        assert!(
+            app.video.as_ref().expect("映像").request_redraw(),
+            "受け取った後は次の要求を通す"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_video_error_from_the_current_player_ends_the_playback() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing(&mut session);
+
+        let event = AppEvent::VideoError {
+            nonce: 2,
+            error: "映像が読めません".to_string(),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Results);
+        assert_eq!(app.error.as_deref(), Some("映像が読めません"));
+        assert!(session.player.is_none());
+        assert!(app.video.is_none());
+    }
+
+    #[tokio::test]
+    async fn mpv_exiting_ends_the_current_playback() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = playing(&mut session);
+
+        let event = AppEvent::MpvExited {
+            nonce: 2,
+            error: None,
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.mode, Mode::Results);
+        assert_eq!(app.error, None, "普通に終わったらエラーは出さない");
+        assert!(session.player.is_none());
+    }
+
+    // ---- 振り分け ----
+
+    #[tokio::test]
+    async fn a_playlists_list_reaches_the_open_list() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            mode: Mode::Playlists,
+            playlists: Some(screen::playlists::PlaylistsView::default()),
+            ..App::default()
+        };
+
+        let entries = vec![search::PlaylistEntry {
+            id: "PL1".to_string(),
+            title: "作業用BGM".to_string(),
+        }];
+        let event = AppEvent::PlaylistsReady {
+            nonce: session.search_nonce,
+            entries: Ok(entries.clone()),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        let playlists = app.playlists.as_ref().expect("一覧");
+        assert_eq!(playlists.entries, entries);
+        assert!(playlists.loaded);
+    }
+
+    #[tokio::test]
+    async fn a_finished_download_reaches_the_status_line() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        let event = AppEvent::DownloadDone {
+            nonce: session.download_nonce,
+            notice: Ok("保存しました: /tmp/a.mp4".to_string()),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.notice.as_deref(), Some("保存しました: /tmp/a.mp4"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_like_reaches_the_status_line() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        let event = AppEvent::OauthDone {
+            nonce: session.oauth_nonce,
+            result: Err("いいねできませんでした".to_string()),
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(app.error.as_deref(), Some("いいねできませんでした"));
+    }
+
+    #[tokio::test]
+    async fn the_engagement_state_reaches_the_cache() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App::default();
+
+        let event = AppEvent::EngagementReady {
+            nonce: session.search_nonce,
+            liked_videos: Some(vec!["v1".to_string()]),
+            asked_channels: vec!["UC1".to_string()],
+            subscribed_channels: vec!["UC1".to_string()],
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert!(app.engagement.is_liked("v1"));
+        assert_eq!(app.engagement.is_subscribed("UC1"), Some(true));
     }
 }

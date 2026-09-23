@@ -1300,6 +1300,31 @@ mod tests {
         assert_eq!(report.outcome, CookieOutcome::TimedOut);
     }
 
+    #[tokio::test]
+    async fn run_search_says_why_yt_dlp_could_not_be_started() {
+        let denied = Step::Done(Err(std::io::Error::from(ErrorKind::PermissionDenied)));
+        for (step, expected) in [
+            (missing(), "yt-dlp が見つかりません"),
+            (denied, "yt-dlp の起動に失敗しました"),
+        ] {
+            let runner = FakeYtDlp::new([step]);
+            let report = run_search(
+                &runner,
+                &Target::Search("q".to_string()),
+                Some(&source("chrome")),
+                10,
+                YT_DLP_TIMEOUT,
+            )
+            .await;
+
+            assert_eq!(runner.calls().len(), 1, "起動できないものは出し直さない");
+            let error = report.results.expect_err("結果は返らない");
+            assert!(error.starts_with(expected), "{error}");
+            assert_eq!(report.outcome, CookieOutcome::Unknown);
+            assert!(!report.fell_back);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn run_search_waits_for_the_timeout_it_is_given() {
         for secs in [5, 90, 300] {

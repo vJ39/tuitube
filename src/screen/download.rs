@@ -557,6 +557,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_filename_row_takes_the_cursor_keys_and_the_typing() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+        app.download.focus = DownloadField::Filename;
+        app.download.filename = QueryEditor::from("ab");
+        let dir = app.download.dir.text().to_string();
+
+        // ← で 1 文字戻り、→ で末尾へ戻ってから打つ。
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Char('c')] {
+            handle_key_download_with(
+                &mut app,
+                key(code),
+                &tx,
+                &mut session,
+                crate::download::fixtures::FakeDownloader::new([]),
+            )
+            .await;
+        }
+
+        assert_eq!(app.download.filename.text(), "abc");
+        assert_eq!(app.download.dir.text(), dir, "保存先の欄は触らない");
+    }
+
+    #[tokio::test]
+    async fn the_download_screen_gets_its_keys_through_the_dispatcher() {
+        let mut app = download_app();
+        let (tx, _rx) = channel();
+        let mut session = Session::default();
+
+        crate::input::handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
+
+        assert_eq!(app.download.focus, DownloadField::Filename);
+    }
+
+    #[tokio::test]
     async fn typing_inserts_into_the_focused_editor() {
         let mut app = download_app();
         let (tx, _rx) = channel();
@@ -1121,5 +1157,72 @@ mod tests {
             download_debug_log_path(true).is_some(),
             "HOME はテスト環境にもある"
         );
+    }
+
+    // ---- 完了の反映 ----
+
+    /// 走っているダウンロードを 1 件持った状態。nonce は今の世代。
+    fn downloading(session: &mut Session) -> App {
+        let mut app = App::default();
+        app.set_notice(Some(format!("{}title", download::DOWNLOADING_PREFIX)));
+        session.download_nonce = 2;
+        session.download_task = Some(tokio::spawn(std::future::pending()));
+        app
+    }
+
+    #[tokio::test]
+    async fn a_result_from_a_cancelled_download_is_dropped() {
+        let mut session = Session::default();
+        let mut app = downloading(&mut session);
+
+        apply_download_done(&mut app, &mut session, 1, Err("古い失敗".to_string()));
+
+        assert_eq!(app.error, None, "打ち切った方の失敗は出さない");
+        assert_eq!(app.notice.as_deref(), Some("ダウンロード中: title"));
+        assert!(session.download_task.is_some(), "今の方は走らせたまま");
+        session.download_task.take().expect("タスク").abort();
+    }
+
+    #[tokio::test]
+    async fn a_finished_download_says_so_for_a_while() {
+        let mut session = Session::default();
+        let mut app = downloading(&mut session);
+
+        apply_download_done(
+            &mut app,
+            &mut session,
+            2,
+            Ok("保存しました: /tmp/title.mp4".to_string()),
+        );
+
+        assert!(session.download_task.is_none());
+        assert_eq!(app.notice.as_deref(), Some("保存しました: /tmp/title.mp4"));
+        let until = app.notice_until.expect("期限つき");
+        app.expire_notice(until);
+        assert_eq!(app.notice, None, "期限が来たら消える");
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_folds_the_progress_notice_and_shows_why() {
+        let mut session = Session::default();
+        let mut app = downloading(&mut session);
+
+        apply_download_done(&mut app, &mut session, 2, Err("yt-dlp が失敗".to_string()));
+
+        assert!(session.download_task.is_none());
+        assert_eq!(app.notice, None, "「ダウンロード中」を残さない");
+        assert_eq!(app.error.as_deref(), Some("yt-dlp が失敗"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_leaves_an_unrelated_notice_alone() {
+        let mut session = Session::default();
+        let mut app = downloading(&mut session);
+        app.set_notice(Some("URL をコピーしました".to_string()));
+
+        apply_download_done(&mut app, &mut session, 2, Err("yt-dlp が失敗".to_string()));
+
+        assert_eq!(app.notice.as_deref(), Some("URL をコピーしました"));
+        assert_eq!(app.error.as_deref(), Some("yt-dlp が失敗"));
     }
 }

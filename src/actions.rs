@@ -2914,6 +2914,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_resize_to_the_size_already_in_use_sends_nothing() {
+        let geometry = geometry_for(100, 40, cell_size(), MAX_FRAME_PIXELS);
+        let mut app = App {
+            video: Some(VideoSink::new(geometry)),
+            ..playing_app()
+        };
+        let mut session = Session {
+            pending_resize: Some((100, 40)),
+            ..Session::default()
+        };
+        let sent = record(&mut session, Ok(()));
+        resize(&mut app, &mut session).await;
+
+        assert!(lines(&sent).is_empty(), "寸法が同じなら送り直さない");
+    }
+
+    #[tokio::test]
+    async fn a_resize_that_cannot_reach_mpv_says_why() {
+        let mut app = App {
+            video: Some(sink()),
+            ..playing_app()
+        };
+        let mut session = Session {
+            pending_resize: Some((100, 40)),
+            ..Session::default()
+        };
+        record(&mut session, Err("mpv に届きません".to_string()));
+        resize(&mut app, &mut session).await;
+
+        assert_eq!(app.error.as_deref(), Some("mpv に届きません"));
+    }
+
     const TINY_8X4: &[u8] = include_bytes!("testdata/tiny8x4.jpg");
 
     /// 80x24 の検索画面。格子は 4 列 2 行になる。
@@ -3536,6 +3569,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_subscription_check_does_not_mark_the_channels_as_unsubscribed() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1"]);
+        let deps = oauth_deps(
+            "engagement-subscription-failure",
+            vec![
+                response(200, OAUTH_ACCESS_JSON),
+                response(200, LIKED_PAGE_JSON),
+                response(
+                    403,
+                    r#"{"error":{"message":"quota","errors":[{"reason":"quotaExceeded"}]}}"#,
+                ),
+            ],
+        );
+
+        start_engagement_with(&mut app, &tx, &mut session, deps, unix(1_000));
+
+        let event = next_engagement(&mut rx, &mut session)
+            .await
+            .expect("いいね一覧は届く");
+        let AppEvent::EngagementReady {
+            liked_videos,
+            asked_channels,
+            subscribed_channels,
+            ..
+        } = event
+        else {
+            panic!("EngagementReady でない");
+        };
+        assert_eq!(liked_videos, Some(ids(&["v1"])));
+        assert!(
+            asked_channels.is_empty(),
+            "答えが返らなかったチャンネルを未登録として控えない"
+        );
+        assert!(subscribed_channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_new_state_check_stops_the_previous_one() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = engagement_app(&["UC1"]);
+        let previous = tokio::spawn(std::future::pending::<()>());
+        let previous_abort = previous.abort_handle();
+        session.engagement_task = Some(previous);
+        app.settings.engagement.enabled = false;
+
+        start_engagement_with(
+            &mut app,
+            &tx,
+            &mut session,
+            hanging_oauth("engagement-restart"),
+            unix(1_000),
+        );
+        tokio::task::yield_now().await;
+
+        assert!(
+            previous_abort.is_finished(),
+            "走っていた問い合わせは打ち切る"
+        );
+        assert!(session.engagement_task.is_none());
+    }
+
+    #[tokio::test]
     async fn without_a_saved_token_the_state_check_does_not_open_a_browser() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut session = Session::default();
@@ -3941,6 +4039,55 @@ mod tests {
             "範囲外では動かさない"
         );
         assert_eq!(session.search_nonce, running, "走っている検索も止めない");
+    }
+
+    #[tokio::test]
+    async fn pressing_the_current_channel_tab_again_reads_it_only_while_it_is_not_loaded() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+
+        select_channel_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+        assert!(session.search_task.is_some(), "読めていないので取りに行く");
+
+        let running = session.search_nonce;
+        select_channel_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+        assert_eq!(
+            session.search_nonce, running,
+            "取りに行っている間は重ねない"
+        );
+        session.search_task.take().expect("タスク").abort();
+
+        let target = app.channel.as_ref().expect("channel").target();
+        app.set_results(vec![result("a")], &target);
+        app.searching = false;
+        select_channel_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+        assert!(session.search_task.is_none(), "読めているので取り直さない");
+    }
+
+    #[tokio::test]
+    async fn moving_to_a_channel_tab_that_is_already_loaded_does_not_read_it_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_view_app();
+        // 1 番のタブを読み終えてから 0 番へ移っておく。
+        select_channel_tab_with(&mut app, &tx, &mut session, 1, StubYtDlp);
+        session.search_task.take().expect("タスク").abort();
+        let target = app.channel.as_ref().expect("channel").target();
+        app.set_results(vec![result("s")], &target);
+        app.searching = false;
+        select_channel_tab_with(&mut app, &tx, &mut session, 0, StubYtDlp);
+        session.search_task.take().expect("タスク").abort();
+        app.searching = false;
+
+        select_channel_tab_with(&mut app, &tx, &mut session, 1, StubYtDlp);
+
+        assert_eq!(app.channel.as_ref().expect("channel").tab.index(), 1);
+        assert!(
+            session.search_task.is_none(),
+            "読み終えたタブは取り直さない"
+        );
+        assert_eq!(app.view_result_ids(), ["s"]);
     }
 
     #[tokio::test]
@@ -5387,6 +5534,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thumbnails_already_in_hand_are_not_fetched_again() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(2);
+        let image = || RgbImage::new(2, 2, vec![0; 12]).expect("長さは合っている");
+        app.thumbs.apply(
+            vec![
+                ("id0".to_string(), Ok(image())),
+                ("id1".to_string(), Ok(image())),
+            ],
+            (144, 80),
+        );
+
+        start_thumbnails_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Wrote, b""),
+        );
+
+        assert!(session.thumbs_task.is_none());
+        assert!(!app.thumbs.is_fetching(), "取得中の表示を出さない");
+    }
+
+    #[tokio::test]
+    async fn a_new_thumbnail_fetch_stops_the_previous_one() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(2);
+        let previous = tokio::spawn(std::future::pending::<()>());
+        let previous_abort = previous.abort_handle();
+        session.thumbs_task = Some(previous);
+        app.settings.thumbnails.enabled = false;
+
+        start_thumbnails_with(
+            &mut app,
+            &tx,
+            &mut session,
+            FakeCurl::new(CurlResult::Wrote, b""),
+        );
+        tokio::task::yield_now().await;
+
+        assert!(previous_abort.is_finished(), "走っていた取得は打ち切る");
+        assert!(session.thumbs_task.is_none());
+    }
+
+    #[tokio::test]
     async fn a_resize_while_not_playing_repaints_and_refetches_from_the_cache() {
         let dir = thumb_dir("resize");
         std::fs::write(dir.join("id0.jpg"), TINY_8X4).expect("書ける");
@@ -5467,6 +5661,19 @@ mod tests {
         // 可視範囲の中で動くだけなら貼り直さない。
         assert_eq!(app.scroll, 0);
         assert!(!app.thumbs.take_dirty());
+    }
+
+    #[test]
+    fn moving_past_the_last_visible_row_scrolls_and_repaints_the_thumbnails() {
+        // CELL なら 4 列 2 行。5 番から ↓ で 9 番 (3 行目) へ移ると 1 行ぶん送る。
+        let mut app = grid_app(12);
+        app.selected = 5;
+
+        move_selection_with(&mut app, CELL, Dir::Down);
+
+        assert_eq!(app.selected, 9);
+        assert_eq!(app.scroll, 4);
+        assert!(app.thumbs.take_dirty(), "送った後の並びで貼り直す");
     }
 
     #[test]

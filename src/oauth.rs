@@ -2233,4 +2233,9 @@ mod tests {
         );
         assert_eq!(Action::Like("v".to_string()).notice(), LIKE_NOTICE);
     }
+
+    #[test]
+    fn config_escape_writes_the_control_characters_as_escapes() {
+        assert_eq!(config_escape("a\tb\rc\u{b}d"), "a\\tb\\rc\\vd");
+    }
 }

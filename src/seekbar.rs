@@ -478,4 +478,12 @@ mod tests {
         assert_eq!(row_symbols(&buf, 0), "█████░░░┃░░░░░░  01:23 / 34:05");
         assert_eq!(buf.cell((17, 0)).expect("ラベル先頭").fg, Color::Yellow);
     }
+
+    #[test]
+    fn a_row_too_narrow_for_a_track_clamps_every_column_to_its_left_edge() {
+        let layout = SeekBarLayout::new(Rect::new(5, 20, 4, 1), 8);
+        assert_eq!(layout.track.width, 0);
+        assert_eq!(layout.clamp_column(40), 5);
+        assert_eq!(layout.clamp_column(0), 5);
+    }
 }
