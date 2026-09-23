@@ -224,8 +224,47 @@ pub fn open_playlist_with<R>(
     else {
         return;
     };
+    let view = PlaylistView::new(entry.id.clone(), entry.title.clone());
+    enter_playlist_with(app, tx, session, view, runner);
+}
+
+/// 検索欄に貼られた URL のプレイリストを開く。名前は中身と一緒に届く。
+pub fn open_playlist_by_url(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    playlist_id: String,
+) {
+    open_playlist_by_url_with(app, tx, session, playlist_id, RealYtDlp);
+}
+
+pub fn open_playlist_by_url_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    playlist_id: String,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
+    // 戻ったときに同じ位置から続けられるよう、検索側の選択を控える。
+    app.store_to_tab();
+    let view = PlaylistView::new(playlist_id, String::new());
+    enter_playlist_with(app, tx, session, view, runner);
+}
+
+/// プレイリストの中身の画面へ移り、中身を取りに行く。
+fn enter_playlist_with<R>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    view: PlaylistView,
+    runner: R,
+) where
+    R: YtDlp + Send + Sync + 'static,
+{
     // 取り込み先が要るので、検索を積む前に開いておく。
-    app.playlist = Some(PlaylistView::new(entry.id.clone(), entry.title.clone()));
+    app.playlist = Some(view);
     app.mode = Mode::Playlist;
     app.set_error(None);
     app.sync_from_view();
@@ -258,7 +297,8 @@ pub fn leave_playlist(app: &mut App, session: &mut Session) {
     app.playlist = None;
     app.set_error(None);
     app.sync_from_view();
-    app.mode = Mode::Playlists;
+    // URL で開いたときはプレイリスト一覧が無いので、検索側へ戻る。
+    app.mode = search_return_mode(app);
 }
 
 /// プレイリスト一覧を畳んで元の検索画面へ戻る。
@@ -925,6 +965,24 @@ mod tests {
             let args = runner.calls();
             assert_eq!(args[0][0], "https://www.youtube.com/playlist?list=PL2");
             assert!(args[0].iter().any(|a| a == "--playlist-end"), "{args:?}");
+        }
+
+        #[tokio::test]
+        async fn a_playlist_opened_by_url_goes_back_to_the_search_side() {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let mut session = Session::default();
+            let mut app = grid_app(2);
+
+            open_playlist_by_url_with(&mut app, &tx, &mut session, "PLabc".to_string(), StubYtDlp);
+            assert_eq!(app.mode, Mode::Playlist);
+            assert!(app.searching, "中身を取りに行く");
+            assert_eq!(app.playlist.as_ref().expect("開く").playlist_title, "");
+
+            leave_playlist(&mut app, &mut session);
+
+            assert!(app.playlist.is_none());
+            assert_eq!(app.mode, Mode::Results, "プレイリスト一覧は開いていない");
+            assert_eq!(app.view_result_ids(), ["id0", "id1"]);
         }
 
         #[tokio::test]

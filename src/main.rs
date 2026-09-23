@@ -30,6 +30,7 @@ mod tct;
 mod thumbs;
 mod ui;
 mod video;
+mod youtube_url;
 
 use actions::{Session, apply_resize, end_playback, on_tick, schedule_resize, stop_playback};
 use anyhow::Result;
@@ -420,6 +421,9 @@ async fn handle_event(
             apply_search_done(app, session, &target, report, requested_limit);
             actions::start_thumbnails(app, tx, session);
             actions::start_engagement(app, tx, session);
+            if plays_on_arrival(&target, app) {
+                actions::start_playback(app, tx, session).await;
+            }
         }
         AppEvent::PlaylistsReady { nonce, entries } => {
             screen::playlists::apply_playlists_ready(app, session, nonce, entries);
@@ -630,6 +634,14 @@ fn apply_channel_lookup_with<R>(
 }
 
 /// cookie の状態を進めてから、結果かエラーを画面へ渡す。
+/// URL で指した動画が届いたらそのまま再生する。届くまでに別の画面へ移っていたら始めない。
+fn plays_on_arrival(target: &Target, app: &App) -> bool {
+    matches!(target, Target::Video(_))
+        && app.mode == Mode::Results
+        && app.error.is_none()
+        && app.view_results().len() == 1
+}
+
 fn apply_search_done(
     app: &mut App,
     session: &mut Session,
@@ -637,6 +649,14 @@ fn apply_search_done(
     report: search::SearchReport,
     requested_limit: usize,
 ) {
+    // URL で開いたプレイリストは名前を持たずに開くので、届いた中身から入れる。
+    if let (Target::Playlist(id), Some(title)) = (target, &report.playlist_title)
+        && let Some(view) = app.playlist.as_mut()
+        && view.playlist_id == *id
+        && view.playlist_title.is_empty()
+    {
+        view.playlist_title = title.clone();
+    }
     let armed = matches!(app.cookies, CookieState::Armed(_));
     let source = app.cookies.for_search().cloned();
     // 待った上限は報告から取る。検索中に設定画面で変えられても文言がずれない。
@@ -939,6 +959,7 @@ mod tests {
                 outcome: CookieOutcome::NotUsed,
                 fell_back: false,
                 timeout: search::YT_DLP_TIMEOUT,
+                playlist_title: None,
             },
             // Target::Channel には requested_limit を立てないので値は無関係。
             requested_limit: 0,
@@ -1047,6 +1068,7 @@ mod tests {
                     outcome: CookieOutcome::TimedOut,
                     fell_back: false,
                     timeout: Duration::from_secs(30),
+                    playlist_title: None,
                 },
                 requested_limit: 0,
             },
@@ -1102,6 +1124,7 @@ mod tests {
                 outcome,
                 fell_back: false,
                 timeout: search::YT_DLP_TIMEOUT,
+                playlist_title: None,
             },
             requested_limit,
         }
@@ -1181,6 +1204,7 @@ mod tests {
                     outcome: CookieOutcome::Ok,
                     fell_back: false,
                     timeout: search::YT_DLP_TIMEOUT,
+                    playlist_title: None,
                 },
                 requested_limit: 30,
             },
@@ -1199,6 +1223,110 @@ mod tests {
             app.settings.search.limit,
             app.cookies.for_search().is_some(),
         ));
+    }
+
+    #[test]
+    fn only_a_video_asked_by_url_starts_playing_when_it_lands() {
+        let video = Target::Video("jNQXAC9IVRw".to_string());
+        let landed = || App {
+            mode: Mode::Results,
+            results: vec![result("jNQXAC9IVRw")],
+            ..App::default()
+        };
+        assert!(plays_on_arrival(&video, &landed()));
+
+        assert!(
+            !plays_on_arrival(&Target::Search("q".to_string()), &landed()),
+            "普通の検索では始めない"
+        );
+        let moved_away = App {
+            mode: Mode::Settings,
+            ..landed()
+        };
+        assert!(
+            !plays_on_arrival(&video, &moved_away),
+            "設定画面へ移っていたら始めない"
+        );
+        let failed = App {
+            error: Some("失敗".to_string()),
+            ..landed()
+        };
+        assert!(!plays_on_arrival(&video, &failed));
+        let empty = App {
+            mode: Mode::Input,
+            ..App::default()
+        };
+        assert!(!plays_on_arrival(&video, &empty));
+    }
+
+    #[tokio::test]
+    async fn a_playlist_opened_by_url_takes_its_name_from_the_results() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            mode: Mode::Playlist,
+            playlist: Some(PlaylistView::new("PLabc".to_string(), String::new())),
+            ..App::default()
+        };
+        // 後に続くサムネイル取得・状態確認は外へ出るので止めておく。
+        app.settings.thumbnails.enabled = false;
+        app.settings.engagement.enabled = false;
+        let event = AppEvent::SearchDone {
+            nonce: 1,
+            target: Target::Playlist("PLabc".to_string()),
+            report: SearchReport {
+                results: Ok(vec![result("v1")]),
+                outcome: CookieOutcome::NotUsed,
+                fell_back: false,
+                timeout: search::YT_DLP_TIMEOUT,
+                playlist_title: Some("作業用BGM".to_string()),
+            },
+            requested_limit: 1,
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        let playlist = app.playlist.as_ref().expect("開いたまま");
+        assert_eq!(playlist.playlist_title, "作業用BGM");
+    }
+
+    #[tokio::test]
+    async fn a_playlist_opened_from_the_list_keeps_its_name() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session {
+            search_nonce: 1,
+            ..Session::default()
+        };
+        let mut app = App {
+            mode: Mode::Playlist,
+            playlist: Some(PlaylistView::new(
+                "PLabc".to_string(),
+                "一覧の名前".to_string(),
+            )),
+            ..App::default()
+        };
+        app.settings.thumbnails.enabled = false;
+        app.settings.engagement.enabled = false;
+        let event = AppEvent::SearchDone {
+            nonce: 1,
+            target: Target::Playlist("PLabc".to_string()),
+            report: SearchReport {
+                results: Ok(vec![result("v1")]),
+                outcome: CookieOutcome::NotUsed,
+                fell_back: false,
+                timeout: search::YT_DLP_TIMEOUT,
+                playlist_title: Some("別の名前".to_string()),
+            },
+            requested_limit: 1,
+        };
+        handle_event(&mut app, event, &tx, &mut session).await;
+
+        assert_eq!(
+            app.playlist.as_ref().expect("開いたまま").playlist_title,
+            "一覧の名前"
+        );
     }
 
     #[tokio::test]
@@ -1285,6 +1413,7 @@ mod tests {
                     outcome: CookieOutcome::LoginRequired,
                     fell_back: false,
                     timeout: search::YT_DLP_TIMEOUT,
+                    playlist_title: None,
                 },
                 requested_limit: 0,
             },
@@ -1477,6 +1606,7 @@ mod tests {
                 ),
                 fell_back: true,
                 timeout: search::YT_DLP_TIMEOUT,
+                playlist_title: None,
             },
             requested_limit: 1,
         };
@@ -1512,6 +1642,7 @@ mod tests {
                 outcome: CookieOutcome::Degraded("failed to decrypt".to_string()),
                 fell_back: false,
                 timeout: search::YT_DLP_TIMEOUT,
+                playlist_title: None,
             },
             requested_limit: 1,
         };
@@ -1545,6 +1676,7 @@ mod tests {
                 outcome: CookieOutcome::TimedOut,
                 fell_back: false,
                 timeout: Duration::from_secs(30),
+                playlist_title: None,
             },
             requested_limit: 10,
         };

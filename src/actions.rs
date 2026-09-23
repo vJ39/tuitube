@@ -5543,6 +5543,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_video_url_in_the_search_box_asks_yt_dlp_for_that_video() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = App {
+            query: QueryEditor::from("https://youtu.be/jNQXAC9IVRw"),
+            ..App::default()
+        };
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+
+        start_search_with(&mut app, &tx, &mut session, runner.clone());
+        finish_search(&mut session).await;
+
+        let calls = runner.calls();
+        assert_eq!(calls[0][0], "https://www.youtube.com/watch?v=jNQXAC9IVRw");
+    }
+
+    #[tokio::test]
     async fn a_search_from_the_input_box_returns_to_the_all_tab() {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut session = Session::default();

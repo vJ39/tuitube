@@ -19,7 +19,8 @@ use crate::query::QueryEditor;
 use crate::screen::download::open_download;
 use crate::screen::playing as playing_screen;
 use crate::screen::playlists::{
-    self as playlists_screen, is_playlists_key, leave_playlist, open_playlists, reload_playlist,
+    self as playlists_screen, is_playlists_key, leave_playlist, open_playlist_by_url,
+    open_playlists, reload_playlist,
 };
 use crate::screen::settings::{is_settings_key, open_settings};
 use crate::ui::{draw_footer, grid_layout, search_areas};
@@ -71,10 +72,15 @@ pub fn playlist_status(app: &App) -> String {
     let Some(playlist) = &app.playlist else {
         return results_status(app);
     };
+    // URL で開いたプレイリストの名前は中身と一緒に届く。それまでは種類だけ出す。
+    let title = if playlist.playlist_title.is_empty() {
+        "プレイリスト"
+    } else {
+        &playlist.playlist_title
+    };
     format!(
-        "{}{}  |  {}",
+        "{}{title}  |  {}",
         app.background_marker(),
-        playlist.playlist_title,
         results_body(app)
     )
 }
@@ -89,7 +95,10 @@ pub async fn handle_key_input(
 ) {
     let extend = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Enter => start_search(app, tx, session),
+        KeyCode::Enter => match crate::youtube_url::playlist_id(app.query.text()) {
+            Some(id) => open_playlist_by_url(app, tx, session, id),
+            None => start_search(app, tx, session),
+        },
         KeyCode::Tab => switch_tab(app, tx, session, true),
         KeyCode::BackTab => switch_tab(app, tx, session, false),
         KeyCode::Backspace => app.query.backspace(),
@@ -1086,6 +1095,17 @@ mod tests {
         }
 
         #[test]
+        fn a_playlist_without_a_name_yet_is_called_a_playlist() {
+            let mut app = playlist_app();
+            app.playlist.as_mut().expect("playlist").playlist_title = String::new();
+            assert!(
+                playlist_status(&app).starts_with("プレイリスト  |"),
+                "{}",
+                playlist_status(&app)
+            );
+        }
+
+        #[test]
         fn the_status_line_names_the_playlist_and_its_count() {
             let mut app = playlist_app();
             app.playlist.as_mut().expect("playlist").state.results = vec![result("v0")];
@@ -1472,6 +1492,25 @@ mod tests {
             handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
             assert!(!app.should_quit, "タブを送っただけでアプリが落ちる");
             assert_eq!(app.mode, Mode::Input);
+        }
+
+        #[tokio::test]
+        async fn enter_on_a_playlist_url_opens_that_playlist() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = App {
+                query: QueryEditor::from(
+                    "https://www.youtube.com/playlist?list=PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI",
+                ),
+                ..App::default()
+            };
+
+            handle_key_input(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
+
+            assert_eq!(app.mode, Mode::Playlist);
+            let playlist = app.playlist.as_ref().expect("中身へ移る");
+            assert_eq!(playlist.playlist_id, "PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI");
+            assert!(take_search(&mut session), "中身を取りに行く");
         }
 
         #[tokio::test]

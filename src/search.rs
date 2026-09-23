@@ -177,6 +177,7 @@ pub fn yt_dlp_args(target: &Target, cookies: Option<&CookieSource>, limit: usize
         Target::Feed(_) => FEED_LIMIT.to_string(),
         Target::Channel { .. } => CHANNEL_LIMIT.to_string(),
         Target::Playlist(_) => PLAYLIST_LIMIT.to_string(),
+        Target::Video(_) => "1".to_string(),
     });
     if let Some(cookies) = cookies {
         args.extend(cookies.yt_dlp_args());
@@ -273,11 +274,14 @@ pub struct SearchReport {
     /// この検索を待った上限。結果が届くまでに設定を変えられても、
     /// 文言の秒数はこちらを使う。
     pub timeout: Duration,
+    /// プレイリストを取ったとき、yt-dlp が各行に入れるプレイリストの名前。
+    pub playlist_title: Option<String>,
 }
 
 struct Attempt {
     results: Result<Vec<SearchResult>, String>,
     outcome: CookieOutcome,
+    playlist_title: Option<String>,
 }
 
 pub async fn run_search(
@@ -296,6 +300,7 @@ pub async fn run_search(
             outcome: first.outcome,
             fell_back: true,
             timeout,
+            playlist_title: retry.playlist_title,
         };
     }
     SearchReport {
@@ -303,6 +308,7 @@ pub async fn run_search(
         outcome: first.outcome,
         fell_back: false,
         timeout,
+        playlist_title: first.playlist_title,
     }
 }
 
@@ -323,12 +329,14 @@ async fn attempt(
                     timeout.as_secs()
                 )),
                 outcome: outcome_of(used_cookies, CookieOutcome::TimedOut),
+                playlist_title: None,
             };
         }
         Ok(Err(e)) => {
             return Attempt {
                 results: Err(launch_error(&e)),
                 outcome: outcome_of(used_cookies, CookieOutcome::Unknown),
+                playlist_title: None,
             };
         }
         Ok(Ok(output)) => output,
@@ -340,13 +348,26 @@ async fn attempt(
     } else {
         CookieOutcome::NotUsed
     };
-    let results = parse_target_lines(target, &String::from_utf8_lossy(&output.stdout));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = parse_target_lines(target, &stdout);
     let results = if results.is_empty() && !output.status.success() {
         Err(format!("yt-dlp が失敗しました: {}", stderr_detail(&stderr)))
     } else {
         Ok(results)
     };
-    Attempt { results, outcome }
+    Attempt {
+        results,
+        outcome,
+        playlist_title: playlist_title_of(&stdout),
+    }
+}
+
+/// 最初に見つかった playlist_title。プレイリストの各行に同じ名前が入る。
+fn playlist_title_of(output: &str) -> Option<String> {
+    output
+        .lines()
+        .filter_map(parse_value)
+        .find_map(|value| value.get("playlist_title")?.as_str().map(str::to_string))
 }
 
 /// 失敗の理由を伝える一行。yt-dlp は原因を ERROR 行に書き、その後ろに警告が続くことが
@@ -983,6 +1004,60 @@ mod tests {
             args[args.len() - 2..],
             ["--cookies-from-browser".to_string(), "chrome".to_string()]
         );
+    }
+
+    #[test]
+    fn yt_dlp_args_ask_for_one_video() {
+        let target = Target::Video("jNQXAC9IVRw".to_string());
+        let args = yt_dlp_args(&target, Some(&source("chrome")), 10);
+        assert_eq!(args[0], "https://www.youtube.com/watch?v=jNQXAC9IVRw");
+        let end = args
+            .iter()
+            .position(|a| a == "--playlist-end")
+            .expect("件数");
+        assert_eq!(args[end + 1], "1");
+        assert!(has_cookie_flag(&args), "検索と同じく cookie を渡す");
+    }
+
+    /// 動画 1 本を指したときの yt-dlp の行 (実測を縮めたもの)。検索結果の行と違い ie_key が無い。
+    const SINGLE_VIDEO_LINE: &str = r#"{"_type":"video","extractor_key":"Youtube","id":"jNQXAC9IVRw","title":"Me at the zoo","duration":19,"uploader":"jawed","channel_id":"UC4QobU6STFB0P71PMvOGN5A","live_status":"not_live","timestamp":1114313512}"#;
+
+    #[test]
+    fn a_single_video_line_is_read_as_one_result() {
+        let results =
+            parse_target_lines(&Target::Video("jNQXAC9IVRw".to_string()), SINGLE_VIDEO_LINE);
+        assert_eq!(results.len(), 1, "ie_key が無くても落とさない");
+        assert_eq!(results[0].id, "jNQXAC9IVRw");
+        assert_eq!(results[0].title, "Me at the zoo");
+        assert_eq!(
+            results[0].channel_id.as_deref(),
+            Some("UC4QobU6STFB0P71PMvOGN5A")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_search_picks_up_the_playlist_title() {
+        let out = concat!(
+            r#"{"_type":"url","ie_key":"Youtube","id":"v1","title":"a","playlist_title":"Popular Music Videos"}"#,
+            "\n",
+            r#"{"_type":"url","ie_key":"Youtube","id":"v2","title":"b","playlist_title":"Popular Music Videos"}"#,
+            "\n"
+        );
+        let runner = FakeYtDlp::new([done(0, out, "")]);
+        let report = run_search(
+            &runner,
+            &Target::Playlist("PLabc".to_string()),
+            None,
+            10,
+            YT_DLP_TIMEOUT,
+        )
+        .await;
+
+        assert_eq!(
+            report.playlist_title.as_deref(),
+            Some("Popular Music Videos")
+        );
+        assert_eq!(report.results.expect("結果").len(), 2);
     }
 
     #[test]

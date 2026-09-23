@@ -429,13 +429,21 @@ impl ChannelTab {
 pub enum Target {
     Search(String),
     Feed(Feed),
-    Channel { id: String, tab: ChannelTab },
+    Channel {
+        id: String,
+        tab: ChannelTab,
+    },
     Playlist(String),
+    /// 検索欄に貼られた URL が指す動画 1 本。中身は動画 ID。
+    Video(String),
 }
 
 impl Target {
     pub fn for_query(query: &str) -> Target {
         let query = query.trim();
+        if let Some(id) = crate::youtube_url::video_id(query) {
+            return Target::Video(id);
+        }
         match Feed::parse(query) {
             Some(feed) => Target::Feed(feed),
             None => Target::Search(query.to_string()),
@@ -451,6 +459,7 @@ impl Target {
                 format!("https://www.youtube.com/channel/{id}/{}", tab.path())
             }
             Target::Playlist(id) => format!("https://www.youtube.com/playlist?list={id}"),
+            Target::Video(id) => format!("https://www.youtube.com/watch?v={id}"),
         }
     }
 
@@ -473,6 +482,7 @@ impl Target {
             },
             Target::Channel { tab, .. } => tab.empty_message(),
             Target::Playlist(_) => "このプレイリストには動画がありません".to_string(),
+            Target::Video(_) => "動画が見つかりませんでした".to_string(),
         }
     }
 
@@ -1061,6 +1071,17 @@ mod tests {
         let target = Target::for_query(" :ytsubs ");
         assert_eq!(target, Target::Feed(Feed::Subscriptions));
         assert_eq!(target.yt_dlp_url(), ":ytsubs");
+    }
+
+    #[test]
+    fn a_video_url_in_the_search_box_asks_for_that_video() {
+        let target = Target::for_query(" https://youtu.be/jNQXAC9IVRw?t=10 ");
+        assert_eq!(target, Target::Video("jNQXAC9IVRw".to_string()));
+        assert_eq!(
+            target.yt_dlp_url(),
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+        );
+        assert_eq!(target.empty_message(None), "動画が見つかりませんでした");
     }
 
     #[test]

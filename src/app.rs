@@ -779,7 +779,9 @@ impl App {
     pub fn status_line(&self) -> String {
         let line = match self.mode {
             Mode::Playing => playing_screen::playing_status(self),
-            Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
+            Mode::Input => self.search_status(
+                "検索したい語句か動画・プレイリストの URL を入力して Enter".to_string(),
+            ),
             Mode::Results => self.search_status(browse_screen::results_status(self)),
             Mode::Channel => self.search_status(browse_screen::channel_status(self)),
             Mode::Playlists => self.search_status(playlists_screen::playlists_status(self)),
@@ -1499,7 +1501,10 @@ mod tests {
 
         // 環境変数が無ければ従来どおり何も足さない。
         app.cookies = CookieState::Off;
-        assert_eq!(app.status_line(), "検索したい語句を入力して Enter");
+        assert_eq!(
+            app.status_line(),
+            "検索したい語句か動画・プレイリストの URL を入力して Enter"
+        );
     }
 
     #[test]
