@@ -252,7 +252,7 @@ fn present_thumbs(
     let mut bytes = Vec::new();
     video::encode_clear(&mut bytes);
     let mut incomplete = false;
-    let shorts = ui::viewing_shorts(app);
+    let shorts = screen::browse::viewing_shorts(app);
     if let Some(layout) = ui::grid_layout(app, cell) {
         for (i, rect) in layout.cells.iter().enumerate() {
             let Some(result) = app.view_results().get(layout.offset + i) else {
@@ -286,7 +286,7 @@ fn present_thumbs(
     // 画像は CUP で絶対位置へ寄せる。入力中は検索欄へ戻さないと、
     // 次の draw までカーソルが格子の中で点滅する。
     if app.mode == Mode::Input {
-        let (x, y) = ui::input_cursor(app.screen, &app.query);
+        let (x, y) = screen::browse::input_cursor(app.screen, &app.query);
         bytes.extend_from_slice(format!("\x1b[{};{}H", y + 1, x + 1).as_bytes());
     }
     out.write_all(&bytes)?;
@@ -1730,7 +1730,7 @@ mod tests {
         app.query.set("らー");
         let out = thumbs_bytes(&mut app);
 
-        let (x, y) = ui::input_cursor(app.screen, &app.query);
+        let (x, y) = screen::browse::input_cursor(app.screen, &app.query);
         let cup = format!("\x1b[{};{}H", y + 1, x + 1).into_bytes();
         assert!(count_images(&out) > 0, "画像を貼ってからの話");
         assert!(out.ends_with(&cup), "入力欄へ戻さないと格子の中で点滅する");

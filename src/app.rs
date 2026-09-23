@@ -8,6 +8,7 @@ use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
 use crate::resume::Resume;
 use crate::rgb::RgbImage;
+use crate::screen::browse as browse_screen;
 use crate::screen::download::{self as download_screen, DownloadForm};
 use crate::screen::playing as playing_screen;
 use crate::screen::playlists::{self as playlists_screen, PlaylistsView};
@@ -774,10 +775,10 @@ impl App {
         let line = match self.mode {
             Mode::Playing => playing_screen::playing_status(self),
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
-            Mode::Results => self.search_status(self.results_status()),
-            Mode::Channel => self.search_status(self.channel_status()),
+            Mode::Results => self.search_status(browse_screen::results_status(self)),
+            Mode::Channel => self.search_status(browse_screen::channel_status(self)),
             Mode::Playlists => self.search_status(playlists_screen::playlists_status(self)),
-            Mode::Playlist => self.search_status(self.playlist_status()),
+            Mode::Playlist => self.search_status(browse_screen::playlist_status(self)),
             Mode::Settings => settings_screen::settings_status(self),
             Mode::Download => download_screen::download_status(self),
         };
@@ -795,50 +796,6 @@ impl App {
         } else {
             String::new()
         }
-    }
-
-    /// 件数と選択中のタイトルの本体。results_status/channel_status で共有する。
-    fn results_body(&self) -> String {
-        let count = format!("{} 件", self.view_results().len());
-        if self.thumbs.is_fetching() {
-            return format!("{count}  |  サムネイル取得中...");
-        }
-        match self.view_selected_result() {
-            Some(result) => format!("{count}  |  {}", result.title),
-            None => count,
-        }
-    }
-
-    /// 格子のタイトルは 18 桁ほどで切れるので、選択中の完全なタイトルはここに出す。
-    pub(crate) fn results_status(&self) -> String {
-        format!("{}{}", self.background_marker(), self.results_body())
-    }
-
-    /// チャンネル名とタブは検索欄に出ないので、状態行の先頭に出す。
-    fn channel_status(&self) -> String {
-        let Some(channel) = &self.channel else {
-            return self.results_status();
-        };
-        format!(
-            "{}{} [{}]  |  {}",
-            self.background_marker(),
-            channel.channel_title,
-            channel.tab.label(),
-            self.results_body()
-        )
-    }
-
-    /// プレイリスト名は検索欄に出ないので、チャンネルと同じく状態行の先頭に出す。
-    fn playlist_status(&self) -> String {
-        let Some(playlist) = &self.playlist else {
-            return self.results_status();
-        };
-        format!(
-            "{}{}  |  {}",
-            self.background_marker(),
-            playlist.playlist_title,
-            self.results_body()
-        )
     }
 
     fn search_status(&self, idle: String) -> String {
@@ -1027,67 +984,6 @@ mod tests {
         app.set_results(Vec::new(), &search_target());
         assert_eq!(app.mode, Mode::Input);
         assert!(app.error.is_some());
-    }
-
-    #[test]
-    fn the_results_status_shows_the_full_title_of_the_selection() {
-        // 格子ではタイトルが切り詰められるので、完全なタイトルはここでしか読めない。
-        let mut app = App {
-            mode: Mode::Results,
-            results: vec![result("a"), result("b")],
-            selected: 1,
-            ..App::default()
-        };
-        assert_eq!(app.status_line(), "2 件  |  title b");
-
-        app.thumbs.set_fetching(true);
-        assert_eq!(app.status_line(), "2 件  |  サムネイル取得中...");
-
-        // 0 件なら件数だけ。
-        let app = App {
-            mode: Mode::Results,
-            ..App::default()
-        };
-        assert_eq!(app.status_line(), "0 件");
-    }
-
-    #[test]
-    fn background_marker_leads_the_results_and_channel_status() {
-        let app = App {
-            mode: Mode::Results,
-            background: true,
-            results: vec![result("a")],
-            playback: Playback {
-                title: "song".to_string(),
-                ..Playback::default()
-            },
-            ..App::default()
-        };
-        assert_eq!(app.status_line(), "▶ song  |  1 件  |  title a");
-
-        // バックグラウンドでなければ足さない。
-        let app = App {
-            background: false,
-            ..app
-        };
-        assert_eq!(app.status_line(), "1 件  |  title a");
-
-        let mut channel = ChannelView::new("UCabc".to_string(), "channel".to_string());
-        channel.state_mut().results = vec![result("a")];
-        let app = App {
-            mode: Mode::Channel,
-            background: true,
-            channel: Some(channel),
-            playback: Playback {
-                title: "song".to_string(),
-                ..Playback::default()
-            },
-            ..App::default()
-        };
-        assert_eq!(
-            app.status_line(),
-            "▶ song  |  channel [動画]  |  1 件  |  title a"
-        );
     }
 
     #[test]
@@ -1403,16 +1299,6 @@ mod tests {
         assert!(channel.states[2].loaded, "0 件でも読み込み済みにする");
     }
 
-    #[test]
-    fn the_status_line_names_the_channel_and_the_tab() {
-        let mut app = channel_app();
-        app.channel.as_mut().expect("channel").state_mut().results = vec![result("v0")];
-        let line = app.status_line();
-        assert!(line.contains("Some Channel"), "{line}");
-        assert!(line.contains("動画"), "{line}");
-        assert!(line.contains("1 件"), "{line}");
-    }
-
     fn entry(id: &str, title: &str) -> PlaylistEntry {
         PlaylistEntry {
             id: id.to_string(),
@@ -1569,15 +1455,6 @@ mod tests {
             "あとで見る".to_string(),
         ));
         assert_ne!(app.view_key(), inside, "別のプレイリストでも別の一覧");
-    }
-
-    #[test]
-    fn the_status_line_names_the_playlist_and_its_count() {
-        let mut app = playlist_app();
-        app.playlist.as_mut().expect("playlist").state.results = vec![result("v0")];
-        let line = app.status_line();
-        assert!(line.contains("作業用BGM"), "{line}");
-        assert!(line.contains("1 件"), "{line}");
     }
 
     #[test]

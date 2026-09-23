@@ -191,7 +191,7 @@ pub fn truncate(text: &str, width: usize) -> String {
     out
 }
 
-/// 全角はセル幅 2。既存の ui::cursor_x と同じ数え方。
+/// 全角はセル幅 2。既存の screen::browse::cursor_x と同じ数え方。
 pub fn display_width(text: &str) -> usize {
     Span::raw(text).width()
 }

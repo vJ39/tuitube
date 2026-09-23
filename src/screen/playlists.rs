@@ -6,6 +6,7 @@ use crate::actions::{
     Session, cancel_search, leave_background, request_reload, search_return_mode, spawn_search,
 };
 use crate::app::{App, AppEvent, Mode, PlaylistView};
+use crate::screen::browse;
 use crate::screen::settings::{is_settings_key, open_settings};
 use crate::search::{self, PlaylistEntry, RealYtDlp, YtDlp};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -48,7 +49,7 @@ impl PlaylistsView {
 /// プレイリストの一覧は動画一覧と別の入れ物なので、件数も選択も別に数える。
 pub fn playlists_status(app: &App) -> String {
     let Some(playlists) = &app.playlists else {
-        return app.results_status();
+        return browse::results_status(app);
     };
     let count = format!("{} 件", playlists.entries.len());
     let body = match playlists.entries.get(playlists.selected) {

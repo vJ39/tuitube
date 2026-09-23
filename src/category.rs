@@ -56,7 +56,7 @@ pub struct Tabs {
     selected: usize,
     states: Vec<TabState>,
     /// タブ行に出している窓の開始位置。端末の幅は描画時にしか分からないので、
-    /// 描く側 (ui::draw_tabs) が調整した結果をここへ戻す。
+    /// 描く側 (screen::browse::draw_tabs) が調整した結果をここへ戻す。
     window: Cell<usize>,
 }
 
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn every_default_tab_label_fits_a_narrow_terminal() {
-        // 全部を一度に並べる幅はもう無いので、タブ行は窓で切り出す (ui::tab_spans)。
+        // 全部を一度に並べる幅はもう無いので、タブ行は窓で切り出す (screen::browse::tab_spans)。
         // 選択中のタブが切れずに出るために、ラベル 1 つぶんは狭い端末にも入る必要がある。
         for label in Tabs::default().labels() {
             let width = crate::grid::display_width(label);

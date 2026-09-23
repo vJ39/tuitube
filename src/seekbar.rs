@@ -223,7 +223,7 @@ impl SeekBarState {
     }
 }
 
-/// 描画。ui.rs が App から組み立てる。
+/// 描画。screen/playing.rs が App から組み立てる。
 pub struct SeekBar<'a> {
     pub layout: SeekBarLayout,
     pub filled: u16,
