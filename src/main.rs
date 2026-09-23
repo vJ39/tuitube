@@ -499,7 +499,7 @@ async fn handle_event(
             subscribed_channels,
         ),
         AppEvent::DownloadDone { nonce, notice } => {
-            apply_download_done(app, session, nonce, notice)
+            screen::download::apply_download_done(app, session, nonce, notice)
         }
     }
 }
@@ -530,33 +530,6 @@ fn apply_engagement_ready(
     }
     if changed {
         app.thumbs.mark_dirty();
-    }
-}
-
-/// ダウンロードの結果を画面へ渡す。
-fn apply_download_done(
-    app: &mut App,
-    session: &mut Session,
-    nonce: u64,
-    notice: Result<String, String>,
-) {
-    if nonce != session.download_nonce {
-        return;
-    }
-    session.download_task = None;
-    match notice {
-        Ok(notice) => app.set_temporary_notice(notice, std::time::Instant::now()),
-        Err(e) => {
-            // 失敗のときは set_error だけでは「ダウンロード中…」が残るので、ここで畳む。
-            if app
-                .notice
-                .as_deref()
-                .is_some_and(|n| n.starts_with(download::DOWNLOADING_PREFIX))
-            {
-                app.set_notice(None);
-            }
-            app.set_error(Some(e));
-        }
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::app::{App, ChannelView, DownloadField, Mode, format_time};
+use crate::app::{App, ChannelView, Mode, format_time};
 use crate::badge;
 use crate::comments;
 use crate::cookies::ChannelTab;
@@ -6,6 +6,7 @@ use crate::display::DisplayMode;
 use crate::geometry::cell_size;
 use crate::grid::{self, LayoutMode};
 use crate::query::QueryEditor;
+use crate::screen::download as download_screen;
 use crate::screen::settings as settings_screen;
 use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use crate::video::CellSize;
@@ -109,93 +110,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::Playing => draw_playing(frame, app),
         Mode::Settings => settings_screen::draw_settings(frame, app),
-        Mode::Download => draw_download(frame, app),
+        Mode::Download => download_screen::draw_download(frame, app),
         // チャンネルもプレイリストも同じ 5 段の画面。
         // 中身の参照先だけが app.channel / app.playlist へ移る。
         Mode::Input | Mode::Results | Mode::Channel | Mode::Playlists | Mode::Playlist => {
             draw_search(frame, app)
         }
     }
-}
-
-/// ダウンロード画面は設定画面と同じ [タイトル, 項目, ステータス, ヘルプ] の4段。
-pub fn download_areas(area: Rect) -> [Rect; 4] {
-    Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area)
-}
-
-const DOWNLOAD_TITLE: &str = "ダウンロード (Enter で開始。Esc は戻る)";
-const DOWNLOAD_MARKER: &str = "> ";
-const DOWNLOAD_DIR_LABEL: &str = "保存先: ";
-const DOWNLOAD_FILENAME_LABEL: &str = "ファイル名: ";
-
-/// 項目の 3 行。フォーマット行は編集不可の値をそのまま出す。
-fn download_rows(app: &App) -> Vec<String> {
-    vec![
-        format!("{DOWNLOAD_DIR_LABEL}{}", app.download_dir.text()),
-        // 拡張子は yt-dlp が決めるので、末尾に固定で見せるだけで編集はさせない。
-        format!(
-            "{DOWNLOAD_FILENAME_LABEL}{}.%(ext)s",
-            app.download_filename.text()
-        ),
-        format!(
-            "形式: {}",
-            if app.download_audio_only {
-                "音声のみ"
-            } else {
-                "動画"
-            }
-        ),
-    ]
-}
-
-fn draw_download(frame: &mut Frame, app: &App) {
-    let areas = download_areas(frame.area());
-    frame.render_widget(
-        Paragraph::new(DOWNLOAD_TITLE).style(Style::default().add_modifier(Modifier::BOLD)),
-        areas[0],
-    );
-
-    let rows = download_rows(app);
-    let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
-    let list = List::new(items)
-        .highlight_symbol(DOWNLOAD_MARKER)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default();
-    state.select(Some(app.download_focus.index()));
-    frame.render_stateful_widget(list, areas[1], &mut state);
-
-    draw_footer(frame, app, areas[2], areas[3]);
-
-    if let Some(at) = download_cursor(frame.area(), app) {
-        frame.set_cursor_position(at);
-    }
-}
-
-/// フォーカス中が Dir/Filename のときだけカーソルを出す。Format には無い。
-fn download_cursor(screen: Rect, app: &App) -> Option<(u16, u16)> {
-    let area = download_areas(screen)[1];
-    let (label, editor) = match app.download_focus {
-        DownloadField::Dir => (DOWNLOAD_DIR_LABEL, &app.download_dir),
-        DownloadField::Filename => (DOWNLOAD_FILENAME_LABEL, &app.download_filename),
-        DownloadField::Format => return None,
-    };
-    let prefix = format!("{DOWNLOAD_MARKER}{label}{}", editor.before_cursor());
-    let width = Span::raw(prefix.as_str()).width().min(u16::MAX as usize) as u16;
-    let x = area
-        .x
-        .saturating_add(width)
-        .min(area.right().saturating_sub(1));
-    let last = area.height.saturating_sub(1) as usize;
-    let y = area
-        .y
-        .saturating_add(app.download_focus.index().min(last) as u16);
-    Some((x, y))
 }
 
 /// 検索画面は [入力, タブ, 結果, ステータス, ヘルプ] の5段。結果に残り全体を渡す。
@@ -997,7 +918,7 @@ fn help_text(
         Mode::Playlist => playlist_hints(background),
         Mode::Playing => playing_hints(display, comments_open, can_subscribe),
         Mode::Settings => settings_screen::settings_hints(),
-        Mode::Download => download_hints(),
+        Mode::Download => download_screen::download_hints(),
     };
     fit_hints(&hints, width as usize)
 }
@@ -1108,16 +1029,6 @@ fn playlist_hints(background: bool) -> Vec<String> {
     }
     hints.push("v:表示切替".to_string());
     hints
-}
-
-/// ダウンロード画面の案内。全部で 40 桁ほど。
-fn download_hints() -> Vec<String> {
-    vec![
-        "↑↓:選択".to_string(),
-        "←→:カーソル/形式切替".to_string(),
-        "Enter:開始".to_string(),
-        "Esc:戻る".to_string(),
-    ]
 }
 
 /// 再生中の案内。全部で 130 桁ほどあり 80 桁端末には入らないので、
@@ -3165,85 +3076,6 @@ mod tests {
     }
 
     // ---- ダウンロード画面 ----
-
-    #[test]
-    fn download_areas_match_the_settings_screen_layout() {
-        let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(download_areas(area), settings_screen::settings_areas(area));
-    }
-
-    #[test]
-    fn download_help_lists_the_keys() {
-        let help = help_80(Mode::Download, DisplayMode::Embedded);
-        for key in ["↑↓:選択", "Enter:開始", "Esc:戻る"] {
-            assert!(help.contains(key), "{key} が落ちた: {help}");
-        }
-        assert!(grid::display_width(&help) <= 80, "{help}");
-    }
-
-    fn download_app() -> App {
-        let mut app = App {
-            mode: Mode::Download,
-            ..App::default()
-        };
-        app.download_dir = QueryEditor::from("/home/x/Downloads");
-        app.download_filename = QueryEditor::from("面白い動画");
-        app
-    }
-
-    #[test]
-    fn the_download_screen_draws_all_three_rows() {
-        let app = download_app();
-        let screen = rendered(&app, 80, 24);
-
-        assert!(screen.contains("保存先: /home/x/Downloads"), "{screen}");
-        assert!(
-            screen.contains("ファイル名: 面白い動画.%(ext)s"),
-            "{screen}"
-        );
-        assert!(screen.contains("形式: 動画"), "{screen}");
-        assert!(screen.contains("ダウンロード"), "タイトルが出る:\n{screen}");
-    }
-
-    #[test]
-    fn the_download_screen_marks_the_focused_row() {
-        let mut app = download_app();
-        app.download_focus = DownloadField::Filename;
-        let screen = rendered(&app, 80, 24);
-
-        assert!(screen.contains("> ファイル名"), "{screen}");
-        assert!(!screen.contains("> 保存先"), "{screen}");
-    }
-
-    #[test]
-    fn the_download_screen_shows_audio_only_when_set() {
-        let mut app = download_app();
-        app.download_audio_only = true;
-        let screen = rendered(&app, 80, 24);
-
-        assert!(screen.contains("形式: 音声のみ"), "{screen}");
-        assert!(!screen.contains("形式: 動画"), "{screen}");
-    }
-
-    #[test]
-    fn the_download_cursor_follows_the_focused_editor() {
-        let screen = Rect::new(0, 0, 80, 24);
-        let mut app = download_app();
-        app.download_dir = QueryEditor::from("abc");
-        app.download_focus = DownloadField::Dir;
-        let with_full_text = download_cursor(screen, &app).expect("Dir にはカーソルがある");
-
-        app.download_dir.move_left(false);
-        let after_move_left = download_cursor(screen, &app).expect("Dir にはカーソルがある");
-        assert_eq!(after_move_left.0 + 1, with_full_text.0, "1 文字ぶん手前へ");
-    }
-
-    #[test]
-    fn the_download_cursor_is_absent_on_the_format_row() {
-        let mut app = download_app();
-        app.download_focus = DownloadField::Format;
-        assert_eq!(download_cursor(Rect::new(0, 0, 80, 24), &app), None);
-    }
 
     /// 終了確認中の下段2行。モード別のエラー・通知・ヒントより優先する。
     fn confirm_quit_footer(app: &App) -> (String, String) {

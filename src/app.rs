@@ -8,6 +8,7 @@ use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
 use crate::resume::Resume;
 use crate::rgb::RgbImage;
+use crate::screen::download::{self as download_screen, DownloadForm};
 use crate::screen::settings::{self as settings_screen, SettingsScreen};
 use crate::search::{ChannelRef, PlaylistEntry, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
@@ -127,42 +128,6 @@ pub enum Mode {
     Playlists,
     /// 1 つのプレイリストの中の動画一覧。
     Playlist,
-}
-
-/// ダウンロード画面でフォーカス中の行。↑↓ で巡回する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DownloadField {
-    #[default]
-    Dir,
-    Filename,
-    Format,
-}
-
-impl DownloadField {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Dir => Self::Filename,
-            Self::Filename => Self::Format,
-            Self::Format => Self::Dir,
-        }
-    }
-
-    pub fn prev(self) -> Self {
-        match self {
-            Self::Dir => Self::Format,
-            Self::Filename => Self::Dir,
-            Self::Format => Self::Filename,
-        }
-    }
-
-    /// リストの行番号 (0 始まり)。draw_download のカーソル計算にも使う。
-    pub fn index(self) -> usize {
-        match self {
-            Self::Dir => 0,
-            Self::Filename => 1,
-            Self::Format => 2,
-        }
-    }
 }
 
 /// 一覧の出どころ (チャンネルのタブ位置, カテゴリタブの位置, 開いているプレイリスト)。
@@ -398,17 +363,8 @@ pub struct App {
     pub resume: Resume,
     /// いいね済み/チャンネル登録済みの控え。印の判定と再確認の要否をここから引く。
     pub engagement: EngagementCache,
-    /// ダウンロード画面を開いた元のモード。閉じたらここへ戻る。
-    pub download_return: Mode,
-    /// 保存先の入力欄。開いた時点で `[download] dir` かその既定値を入れておく。
-    pub download_dir: QueryEditor,
-    /// ファイル名の入力欄。拡張子 (`.%(ext)s`) は含まない。
-    pub download_filename: QueryEditor,
-    /// true なら音声のみ (`-x --audio-format mp3`)。
-    pub download_audio_only: bool,
-    pub download_focus: DownloadField,
-    /// 開いた時点の対象 URL。タイトルは初期ファイル名の計算にだけ使うので保持しない。
-    pub download_url: String,
+    /// ダウンロード画面の状態。
+    pub download: DownloadForm,
 }
 
 impl Default for App {
@@ -454,12 +410,7 @@ impl Default for App {
             hidden: Hidden::default(),
             resume: Resume::default(),
             engagement: EngagementCache::default(),
-            download_return: Mode::Input,
-            download_dir: QueryEditor::default(),
-            download_filename: QueryEditor::default(),
-            download_audio_only: false,
-            download_focus: DownloadField::default(),
-            download_url: String::new(),
+            download: DownloadForm::default(),
         }
     }
 }
@@ -701,7 +652,7 @@ impl App {
         if self.mode == Mode::Settings {
             self.settings_screen.return_mode = mode;
         } else if self.mode == Mode::Download {
-            self.download_return = mode;
+            self.download.return_mode = mode;
         } else {
             self.mode = mode;
         }
@@ -852,7 +803,7 @@ impl App {
             Mode::Playlists => self.search_status(self.playlists_status()),
             Mode::Playlist => self.search_status(self.playlist_status()),
             Mode::Settings => settings_screen::settings_status(self),
-            Mode::Download => self.download_status(),
+            Mode::Download => download_screen::download_status(self),
         };
         // エラーが出ている行に足すと読みにくいので、そのときは譲る。
         match &self.notice {
@@ -934,14 +885,6 @@ impl App {
             playlist.playlist_title,
             self.results_body()
         )
-    }
-
-    /// ダウンロード画面は保存の成否をここで返す。設定画面と同じくポーリングが無い。
-    fn download_status(&self) -> String {
-        if let Some(error) = &self.error {
-            return format!("エラー: {error}");
-        }
-        "ダウンロード保存先の入力".to_string()
     }
 
     fn search_status(&self, idle: String) -> String {
@@ -2274,12 +2217,19 @@ mod tests {
         // ダウンロード画面を開いている間に裏の検索/再生が終わっても、画面が消えない。
         let mut app = App {
             mode: Mode::Download,
-            download_return: Mode::Playing,
+            download: DownloadForm {
+                return_mode: Mode::Playing,
+                ..DownloadForm::default()
+            },
             ..App::default()
         };
         app.enter_search_mode(Mode::Results);
         assert_eq!(app.mode, Mode::Download);
-        assert_eq!(app.download_return, Mode::Results, "閉じたら結果へ戻す");
+        assert_eq!(
+            app.download.return_mode,
+            Mode::Results,
+            "閉じたら結果へ戻す"
+        );
     }
 
     fn from_channel(id: &str, channel_id: &str) -> SearchResult {
@@ -2500,48 +2450,5 @@ mod tests {
 
         assert_eq!(app.result_ids(), ["v1", "v2"]);
         assert_eq!(app.selected, 1);
-    }
-
-    #[test]
-    fn download_field_cycles_forward_and_wraps() {
-        assert_eq!(DownloadField::Dir.next(), DownloadField::Filename);
-        assert_eq!(DownloadField::Filename.next(), DownloadField::Format);
-        assert_eq!(DownloadField::Format.next(), DownloadField::Dir, "巻き戻る");
-    }
-
-    #[test]
-    fn download_field_cycles_backward_and_wraps() {
-        assert_eq!(DownloadField::Dir.prev(), DownloadField::Format, "巻き戻る");
-        assert_eq!(DownloadField::Format.prev(), DownloadField::Filename);
-        assert_eq!(DownloadField::Filename.prev(), DownloadField::Dir);
-    }
-
-    #[test]
-    fn download_field_index_matches_the_row_order() {
-        assert_eq!(DownloadField::Dir.index(), 0);
-        assert_eq!(DownloadField::Filename.index(), 1);
-        assert_eq!(DownloadField::Format.index(), 2);
-    }
-
-    #[test]
-    fn the_download_status_line_names_the_screen() {
-        let app = App {
-            mode: Mode::Download,
-            ..App::default()
-        };
-        assert_eq!(app.status_line(), "ダウンロード保存先の入力");
-    }
-
-    #[test]
-    fn the_download_status_line_shows_an_error_over_the_screen_name() {
-        let mut app = App {
-            mode: Mode::Download,
-            ..App::default()
-        };
-        app.set_error(Some("保存先とファイル名を入力してください".to_string()));
-        assert_eq!(
-            app.status_line(),
-            "エラー: 保存先とファイル名を入力してください"
-        );
     }
 }
