@@ -10,6 +10,7 @@ use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::grid::{self, Dir};
 use crate::mpv::{self, MpvCommand, MpvController};
 use crate::oauth;
+use crate::screen::playing as playing_screen;
 use crate::search::{self, RealYtDlp, SearchResult, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::settings;
@@ -1128,7 +1129,7 @@ pub fn toggle_comments(app: &mut App, session: &mut Session) {
 
 /// コメント一覧の送り。行数も送れる幅も、描画と同じ枠の内側で数える。
 pub fn scroll_comments(app: &mut App, step: CommentScroll) {
-    let view = ui::comments_viewport(app.screen);
+    let view = playing_screen::comments_viewport(app.screen);
     let height = view.height as usize;
     let total = comments::display_lines(app.comments.state(), view.width as usize).len();
     let delta = match step {
@@ -1266,10 +1267,10 @@ pub async fn leave_background(app: &mut App, session: &mut Session) {
     apply_video_placement(app, session).await;
 }
 
-/// 新しい置き場所 (ui::video_target_area) へ映像の寸法を合わせる。
+/// 新しい置き場所 (playing_screen::video_target_area) へ映像の寸法を合わせる。
 /// バックグラウンドのどちら向きの遷移でも手順は同じ。
 async fn apply_video_placement(app: &mut App, session: &mut Session) {
-    if let Some(area) = ui::video_target_area(app, app.screen) {
+    if let Some(area) = playing_screen::video_target_area(app, app.screen) {
         let geometry = Geometry::new(area, cell_size(), app.settings.display.max_pixels());
         if let Some(video) = &app.video {
             video.resize(geometry);
@@ -1853,7 +1854,7 @@ mod tests {
         assert!(app.thumbs.take_dirty());
 
         let geometry = Geometry::new(
-            ui::mini_video_area(app.screen, app.display),
+            playing_screen::mini_video_area(app.screen, app.display),
             cell_size(),
             MAX_FRAME_PIXELS,
         );
@@ -1930,7 +1931,11 @@ mod tests {
         assert_eq!(app.mode, Mode::Playing);
         assert!(session.owe_clear);
 
-        let geometry = Geometry::new(ui::video_area(app.screen), cell_size(), MAX_FRAME_PIXELS);
+        let geometry = Geometry::new(
+            playing_screen::video_area(app.screen),
+            cell_size(),
+            MAX_FRAME_PIXELS,
+        );
         assert_eq!(
             lines(&sent),
             mpv::resize_video(geometry)

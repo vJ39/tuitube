@@ -9,6 +9,7 @@ use crate::query::QueryEditor;
 use crate::resume::Resume;
 use crate::rgb::RgbImage;
 use crate::screen::download::{self as download_screen, DownloadForm};
+use crate::screen::playing as playing_screen;
 use crate::screen::playlists::{self as playlists_screen, PlaylistsView};
 use crate::screen::settings::{self as settings_screen, SettingsScreen};
 use crate::search::{ChannelRef, PlaylistEntry, SearchReport, SearchResult};
@@ -771,7 +772,7 @@ impl App {
     /// 分岐は網羅する。モードを増やしたときの書き分け漏れをコンパイラに拾わせる。
     pub fn status_line(&self) -> String {
         let line = match self.mode {
-            Mode::Playing => self.playing_status(),
+            Mode::Playing => playing_screen::playing_status(self),
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
             Mode::Results => self.search_status(self.results_status()),
             Mode::Channel => self.search_status(self.channel_status()),
@@ -784,15 +785,6 @@ impl App {
         match &self.notice {
             Some(notice) if self.error.is_none() => format!("{line}  |  {notice}"),
             _ => line,
-        }
-    }
-
-    /// 再生中はエラーで再生状況を隠さず、併記する。
-    fn playing_status(&self) -> String {
-        let line = self.playback_line();
-        match &self.error {
-            Some(error) => format!("{line}  |  エラー: {error}"),
-            None => line,
         }
     }
 
@@ -884,33 +876,6 @@ impl App {
             _ => "",
         };
         format!("[{}{detail}{transition}]", self.display.label())
-    }
-
-    fn playback_line(&self) -> String {
-        let state = match self.playback.paused {
-            Some(true) => "PAUSED",
-            Some(false) => "PLAYING",
-            None => "状態不明",
-        };
-        let volume = self
-            .playback
-            .volume
-            .map(|v| format!("  vol {v:.0}"))
-            .unwrap_or_default();
-        // 狭い端末では末尾から切れるので、字幕の印は行の前方に置く。
-        let subtitles = self
-            .subtitles
-            .marker(&self.settings.subtitles, Instant::now())
-            .map(|marker| format!("  {marker}"))
-            .unwrap_or_default();
-        format!(
-            "{state}{subtitles}  {}  {} / {}{volume}  {}  {}",
-            self.playback.title,
-            format_time(self.playback.time_pos),
-            format_time(self.playback.duration),
-            self.speed.label(),
-            self.display_label()
-        )
     }
 }
 
@@ -1022,41 +987,6 @@ mod tests {
                 .status(&app.settings.subtitles, now + crate::subtitles::LOAD_GRACE),
             SubtitleStatus::Missing
         );
-    }
-
-    #[test]
-    fn the_status_line_names_the_track_that_mpv_chose() {
-        // lang="ja-orig,ja" でも ja が選ばれることがある (実測)。印は選ばれた方を出す。
-        let mut app = playing_subtitle_app("song");
-        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
-        poll(&mut app, crate::mpv::REQ_SUB_LANG, Some(json!("ja")));
-        assert!(app.status_line().starts_with("PLAYING  字幕ja  song"));
-    }
-
-    #[test]
-    fn the_status_line_puts_the_subtitle_marker_right_after_the_state() {
-        let mut app = playing_subtitle_app("song");
-        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
-        let line = app.status_line();
-        assert!(line.starts_with("PLAYING  字幕ja-orig  song"), "{line}");
-
-        // 消しているときは桁を使わない。
-        app.subtitles.set_wanted(false, Instant::now());
-        let line = app.status_line();
-        assert!(line.starts_with("PLAYING  song"), "{line}");
-        assert!(!line.contains("字幕"), "{line}");
-    }
-
-    #[test]
-    fn the_subtitle_marker_stays_ahead_of_a_long_title() {
-        // 狭い端末では行の末尾から切れるので、印は必ずタイトルより前に出す。
-        let mut app = playing_subtitle_app(&"長いタイトル".repeat(20));
-        poll(&mut app, crate::mpv::REQ_SID, Some(json!(1)));
-        let line = app.status_line();
-        let marker_at = line.find("字幕").expect("印がある");
-        let title_at = line.find("長いタイトル").expect("タイトルがある");
-        assert!(marker_at < title_at, "{line}");
-        assert!(marker_at < 10, "{line}");
     }
 
     #[test]
@@ -1796,44 +1726,6 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_shows_the_speed_after_the_volume() {
-        let mut app = App {
-            mode: Mode::Playing,
-            speed: Speed::from_tenths(15).expect("1.5x"),
-            playback: Playback {
-                title: "song".to_string(),
-                paused: Some(false),
-                volume: Some(70.0),
-                ..Playback::default()
-            },
-            ..App::default()
-        };
-        let line = app.status_line();
-        assert!(line.contains("vol 70  1.5x  ["), "{line}");
-
-        // 等速でも出す。戻ったことが分かるため。
-        app.speed = Speed::NORMAL;
-        assert!(
-            app.status_line().contains("vol 70  1.0x  ["),
-            "{}",
-            app.status_line()
-        );
-    }
-
-    #[test]
-    fn pause_error_response_is_not_read_as_playing() {
-        let mut app = App {
-            mode: Mode::Playing,
-            ..App::default()
-        };
-        poll(&mut app, crate::mpv::REQ_PAUSE, Some(json!(true)));
-        assert!(app.status_line().starts_with("PAUSED"));
-        poll(&mut app, crate::mpv::REQ_PAUSE, None);
-        assert_eq!(app.playback.paused, None);
-        assert!(!app.status_line().starts_with("PLAYING"));
-    }
-
-    #[test]
     fn the_notice_stays_visible_until_an_error_takes_the_line() {
         // 設定を読み替えた旨は、気づけるようステータス行に出し続ける。
         let mut app = App {
@@ -1995,23 +1887,6 @@ mod tests {
     }
 
     #[test]
-    fn the_status_line_ends_with_the_display_label_while_playing() {
-        let app = App {
-            mode: Mode::Playing,
-            playback: Playback {
-                title: "song".to_string(),
-                ..Playback::default()
-            },
-            ..App::default()
-        };
-        assert!(
-            app.status_line().ends_with(&app.display_label()),
-            "{}",
-            app.status_line()
-        );
-    }
-
-    #[test]
     fn default_app_takes_the_display_mode_from_settings() {
         assert_eq!(App::default().display, Settings::default().display.mode);
         assert_eq!(App::default().settings, Settings::default());
@@ -2025,27 +1900,6 @@ mod tests {
             ..App::default()
         };
         assert_eq!(app.status_line(), "エラー: boom");
-    }
-
-    #[test]
-    fn playing_status_stays_visible_with_error() {
-        let app = App {
-            mode: Mode::Playing,
-            error: Some("boom".to_string()),
-            playback: Playback {
-                title: "song".to_string(),
-                paused: Some(true),
-                time_pos: Some(30.0),
-                duration: Some(60.0),
-                volume: Some(70.0),
-                ..Playback::default()
-            },
-            ..App::default()
-        };
-        let line = app.status_line();
-        assert!(line.starts_with("PAUSED"), "{line}");
-        assert!(line.contains("song  00:30 / 01:00  vol 70"), "{line}");
-        assert!(line.ends_with("エラー: boom"));
     }
 
     #[test]
@@ -2101,15 +1955,6 @@ mod tests {
         let pending = playback.pending_seek.expect("先行更新が入っている");
         assert_eq!(pending.target, 20.0);
         assert_eq!(pending.sent_at, t1);
-    }
-
-    #[test]
-    fn playing_status_without_pause_data_is_marked_unknown() {
-        let app = App {
-            mode: Mode::Playing,
-            ..App::default()
-        };
-        assert!(app.status_line().starts_with("状態不明"));
     }
 
     #[test]

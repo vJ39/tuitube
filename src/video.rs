@@ -32,7 +32,7 @@ pub fn cell_size(columns: u16, rows: u16, width_px: u16, height_px: u16) -> Opti
     })
 }
 
-/// mpv に渡す寸法。area は画面座標のセル矩形 (ui::video_area の戻り)。
+/// mpv に渡す寸法。area は画面座標のセル矩形 (screen::playing::video_area の戻り)。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Geometry {
     pub area: Rect,

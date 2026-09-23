@@ -1,15 +1,14 @@
 use crate::app::{App, ChannelView, Mode, format_time};
 use crate::badge;
-use crate::comments;
 use crate::cookies::ChannelTab;
 use crate::display::DisplayMode;
 use crate::geometry::cell_size;
 use crate::grid::{self, LayoutMode};
 use crate::query::QueryEditor;
 use crate::screen::download as download_screen;
+use crate::screen::playing as playing_screen;
 use crate::screen::playlists as playlists_screen;
 use crate::screen::settings as settings_screen;
-use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use crate::video::CellSize;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -17,99 +16,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-/// 別ウィンドウ再生中に映像領域へ出す案内。
-fn window_placeholder(display: DisplayMode) -> String {
-    format!("別ウィンドウで再生中  w: {}へ", display.next().label())
-}
-
-/// 再生中は [映像, シークバー, アクション, ステータス, ヘルプ] の5段。映像に残り全体を渡す。
-fn playing_areas(area: Rect) -> [Rect; 5] {
-    Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area)
-}
-
-/// mpv に渡す `--vo-kitty-*` は描画先と同じ寸法でなければならない。
-pub fn video_area(area: Rect) -> Rect {
-    playing_areas(area)[0]
-}
-
-/// 隅のミニプレイヤーの幅・高さ。設定項目にはしない固定値。
-const MINI_VIDEO_COLS: u16 = 32;
-const MINI_VIDEO_ROWS: u16 = 10;
-
-/// text は文字セルの数がそのまま解像度になるため、embedded (画像) より広く取らないと
-/// 映像に見えない (実機で確認した不具合。#62)。
-const TEXT_MINI_VIDEO_COLS: u16 = 64;
-const TEXT_MINI_VIDEO_ROWS: u16 = 18;
-
-/// 結果一覧の右上に切り出す、隅のミニプレイヤー用の矩形。
-pub fn mini_video_area(screen: Rect, display: DisplayMode) -> Rect {
-    let (max_cols, max_rows) = match display {
-        DisplayMode::Text => (TEXT_MINI_VIDEO_COLS, TEXT_MINI_VIDEO_ROWS),
-        DisplayMode::Embedded | DisplayMode::Window => (MINI_VIDEO_COLS, MINI_VIDEO_ROWS),
-    };
-    let results = search_areas(screen)[2];
-    let cols = max_cols.min(results.width / 2).max(1);
-    let rows = max_rows.min(results.height).max(1);
-    Rect::new(results.right().saturating_sub(cols), results.y, cols, rows)
-}
-
-/// 今のフレームで映像をどこに描くか。無ければ None (window 中・映像が無い)。
-pub fn video_target_area(app: &App, screen: Rect) -> Option<Rect> {
-    app.video.as_ref()?;
-    if app.mode == Mode::Playing {
-        return Some(video_area(screen));
-    }
-    match app.display {
-        DisplayMode::Window => None,
-        DisplayMode::Embedded | DisplayMode::Text => Some(mini_video_area(screen, app.display)),
-    }
-}
-
-/// シークバーの行。クリック桁から再生位置を求めるときもこの矩形を使う。
-pub fn seek_bar_area(area: Rect) -> Rect {
-    playing_areas(area)[1]
-}
-
-/// いいね・チャンネル登録の行。クリック位置から操作を求めるときもこの矩形を使う。
-pub fn action_area(area: Rect) -> Rect {
-    playing_areas(area)[2]
-}
-
-/// 再生状態を出す行。
-pub fn status_area(area: Rect) -> Rect {
-    playing_areas(area)[3]
-}
-
-/// 操作説明の行。
-pub fn help_area(area: Rect) -> Rect {
-    playing_areas(area)[4]
-}
-
-/// コメント一覧の枠の内側。描画と送り幅が同じ寸法を数える。
-pub fn comments_viewport(screen: Rect) -> Rect {
-    comments_block().inner(video_area(screen))
-}
-
-/// 描画とヒットテストが共有する割り付け。
-pub fn seek_bar_layout(app: &App) -> SeekBarLayout {
-    layout_for(app.screen, app.playback.duration)
-}
-
-fn layout_for(screen: Rect, duration: Option<f64>) -> SeekBarLayout {
-    SeekBarLayout::new(seek_bar_area(screen), label_width(duration))
-}
-
 /// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
-        Mode::Playing => draw_playing(frame, app),
+        Mode::Playing => playing_screen::draw_playing(frame, app),
         Mode::Settings => settings_screen::draw_settings(frame, app),
         Mode::Download => download_screen::draw_download(frame, app),
         // チャンネルもプレイリストも同じ 5 段の画面。
@@ -260,7 +170,7 @@ fn draw_search(frame: &mut Frame, app: &App) {
     // バックグラウンド中のミニプレイヤーは結果一覧の上に重ねて描くだけにする。
     // 上部 MINI_VIDEO_ROWS 分にしか映らないので、一覧側の幅を全高にわたって
     // 狭めると映像の無い下の行に空白の帯が残り続けて崩れて見える (実機で確認した不具合)。
-    let video = video_target_area(app, frame.area());
+    let video = playing_screen::video_target_area(app, frame.area());
     let results_area = areas[2];
 
     if app.mode == Mode::Playlists {
@@ -611,203 +521,6 @@ fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// 分岐は網羅する。モードを増やしたときの描き分け漏れをコンパイラに拾わせる。
-fn draw_playing(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let video = video_area(area);
-    if app.comments.visible() {
-        draw_comments(frame, video, app);
-    } else {
-        match app.display {
-            DisplayMode::Window => draw_window_placeholder(frame, video, app.display),
-            DisplayMode::Text => {
-                if let Some(sink) = &app.video {
-                    sink.render_text(video, frame.buffer_mut());
-                }
-            }
-            // 埋め込みの画像は draw の後にメインループが APC で重ねる。
-            DisplayMode::Embedded => {}
-        }
-    }
-    draw_seek_bar(frame, app, area);
-    draw_actions(frame, app, action_area(area));
-    draw_footer(frame, app, status_area(area), help_area(area));
-}
-
-fn comments_block() -> Block<'static> {
-    Block::default().borders(Borders::ALL).title(" コメント ")
-}
-
-/// コメント表示中は映像の代わりに一覧を出す。映像フレームの送出は present_video が止める。
-/// 上限 50 件は 1 画面に入らないので、↑↓ の送り幅ぶんだけずらして描く。
-fn draw_comments(frame: &mut Frame, area: Rect, app: &App) {
-    if area.height == 0 {
-        return;
-    }
-    let block = comments_block();
-    let inner = block.inner(area);
-    let height = inner.height as usize;
-    let lines = comments::display_lines(app.comments.state(), inner.width as usize);
-    let offset = app.comments.scroll(lines.len(), height);
-    let items: Vec<ListItem> = lines
-        .into_iter()
-        .skip(offset)
-        .take(height)
-        .map(ListItem::new)
-        .collect();
-    frame.render_widget(List::new(items).block(block), area);
-}
-
-/// 別ウィンドウ中は映像が来ないので、どこで再生しているかを映像領域に出す。
-fn draw_window_placeholder(frame: &mut Frame, area: Rect, display: DisplayMode) {
-    if area.height == 0 {
-        return;
-    }
-    let row = Rect {
-        y: area.y + area.height / 2,
-        height: 1,
-        ..area
-    };
-    frame.render_widget(
-        Paragraph::new(window_placeholder(display))
-            .style(Style::default().fg(Color::DarkGray))
-            .centered(),
-        row,
-    );
-}
-
-/// ポインタが指す列と時刻。duration が無いとシークできないので、印もラベルも出さない。
-fn seek_pointer(app: &App, layout: &SeekBarLayout) -> Option<(u16, f64)> {
-    let (column, duration) = app.seek_bar.shown_column().zip(app.playback.duration)?;
-    Some((column, layout.seconds_at(column, duration)))
-}
-
-fn draw_seek_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let layout = layout_for(area, app.playback.duration);
-    let pointer = seek_pointer(app, &layout);
-    let label = label_text(
-        pointer
-            .map(|(_, seconds)| seconds)
-            .or(app.playback.time_pos),
-        app.playback.duration,
-    );
-    let bar = SeekBar {
-        layout,
-        filled: layout.filled_cells(app.playback.time_pos, app.playback.duration),
-        marker: pointer.map(|(column, _)| column),
-        label: &label,
-        highlighted: pointer.is_some(),
-    };
-    frame.render_widget(bar, seek_bar_area(area));
-}
-
-/// アクション行に出す操作。キーでもクリックでも同じものを指す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActionKind {
-    Like,
-    Subscribe,
-}
-
-/// ラベルの区切り。
-const ACTION_GAP: &str = "  ";
-
-impl ActionKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            ActionKind::Like => "♥いいね",
-            ActionKind::Subscribe => "＋登録",
-        }
-    }
-
-    /// 済みのときの色。未は一律 Color::Gray。
-    fn done_color(self) -> Color {
-        match self {
-            ActionKind::Like => Color::Red,
-            ActionKind::Subscribe => Color::Green,
-        }
-    }
-}
-
-/// アクション行に左から並ぶもの。描画とクリックの当たり判定が同じ並びを通るように、
-/// 幅の食い方はここだけで決める。
-enum ActionPiece {
-    Gap,
-    Label { kind: ActionKind, done: bool },
-}
-
-impl ActionPiece {
-    fn text(&self) -> &'static str {
-        match self {
-            ActionPiece::Gap => ACTION_GAP,
-            ActionPiece::Label { kind, .. } => kind.label(),
-        }
-    }
-}
-
-fn action_pieces(app: &App) -> Vec<ActionPiece> {
-    let mut pieces = vec![ActionPiece::Label {
-        kind: ActionKind::Like,
-        done: app.engagement.is_liked(&app.playback.id),
-    }];
-    // チャンネル ID の無い行から始めた再生では押せないので、登録は並べない。
-    if let Some(channel_id) = app.playback.channel_id.as_deref() {
-        pieces.push(ActionPiece::Gap);
-        pieces.push(ActionPiece::Label {
-            kind: ActionKind::Subscribe,
-            // 未確認 (None) は未登録と同じ見た目にする。
-            done: app.engagement.is_subscribed(channel_id).unwrap_or(false),
-        });
-    }
-    pieces
-}
-
-fn action_spans(app: &App) -> Vec<Span<'static>> {
-    action_pieces(app)
-        .into_iter()
-        .map(|piece| match piece {
-            ActionPiece::Gap => Span::raw(ACTION_GAP),
-            ActionPiece::Label { kind, done } => {
-                let style = if done {
-                    Style::default()
-                        .fg(kind.done_color())
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Span::styled(kind.label(), style)
-            }
-        })
-        .collect()
-}
-
-fn draw_actions(frame: &mut Frame, app: &App, area: Rect) {
-    frame.render_widget(Paragraph::new(Line::from(action_spans(app))), area);
-}
-
-/// アクション行の `column` 桁にある操作。区切りの上では None。
-fn action_at_column(app: &App, column: usize) -> Option<ActionKind> {
-    let mut x = 0;
-    for piece in action_pieces(app) {
-        let cells = grid::display_width(piece.text());
-        if let ActionPiece::Label { kind, .. } = piece
-            && (x..x + cells).contains(&column)
-        {
-            return Some(kind);
-        }
-        x += cells;
-    }
-    None
-}
-
-/// 画面のこの位置にある操作。アクション行の外や区切りの上では None。
-pub fn action_at_point(app: &App, column: u16, row: u16) -> Option<ActionKind> {
-    let area = action_area(app.screen);
-    if !area.contains(Position::new(column, row)) {
-        return None;
-    }
-    action_at_column(app, (column - area.x) as usize)
-}
-
 /// 終了確認 (y/N) の案内。エラーと同じ赤で目立たせる。
 const CONFIRM_QUIT_STATUS: &str = "終了しますか？ (y/N)";
 
@@ -877,7 +590,7 @@ fn cursor_x(input_area: Rect, column: usize) -> u16 {
         .min(input_area.right().saturating_sub(2))
 }
 
-fn help_text(
+pub(crate) fn help_text(
     mode: Mode,
     display: DisplayMode,
     comments_open: bool,
@@ -892,7 +605,7 @@ fn help_text(
         Mode::Channel => channel_hints(background),
         Mode::Playlists => playlists_screen::playlists_hints(background),
         Mode::Playlist => playlist_hints(background),
-        Mode::Playing => playing_hints(display, comments_open, can_subscribe),
+        Mode::Playing => playing_screen::playing_hints(display, comments_open, can_subscribe),
         Mode::Settings => settings_screen::settings_hints(),
         Mode::Download => download_screen::download_hints(),
     };
@@ -992,40 +705,6 @@ fn playlist_hints(background: bool) -> Vec<String> {
     hints
 }
 
-/// 再生中の案内。全部で 130 桁ほどあり 80 桁端末には入らないので、
-/// 落ちて困らないものを後ろに置く。先頭 7 つは最も幅を食う w:別ウィンドウとコメント表示中でも
-/// 77 桁に収まる。
-fn playing_hints(display: DisplayMode, comments_open: bool, can_subscribe: bool) -> Vec<String> {
-    let mut hints = vec![
-        "space:一時停止".to_string(),
-        "←→:シーク".to_string(),
-        // コメント表示中の ↑↓ は一覧送りに使う。
-        if comments_open {
-            "↑↓:行送り".to_string()
-        } else {
-            "↑↓:音量".to_string()
-        },
-        "c:URLコピー".to_string(),
-        format!("w:{}", display.next().label()),
-        "Esc:停止".to_string(),
-        "q:終了".to_string(),
-        "♥l:いいね".to_string(),
-    ];
-    // チャンネル ID の無い再生では押しても何も起きないので、案内も出さない。
-    if can_subscribe {
-        hints.push("＋u:登録".to_string());
-    }
-    hints.extend([
-        "s:字幕".to_string(),
-        "o:コメント".to_string(),
-        "[ ]:速度±0.1".to_string(),
-        "BS:等速".to_string(),
-        "クリック:シーク".to_string(),
-        "b:検索へ".to_string(),
-    ]);
-    hints
-}
-
 /// 幅に入るところまでを空白 1 つでつなぐ。help は折り返さないので、
 /// 途中で切れた案内を出すより落とす。
 pub(crate) fn fit_hints(hints: &[String], width: usize) -> String {
@@ -1052,7 +731,6 @@ mod tests {
     use crate::category::Tabs;
     use crate::screen::playlists::PlaylistsView;
     use crate::search::{PlaylistEntry, SearchResult};
-    use crate::seekbar::SeekBarState;
     use crate::video::{Geometry, VideoSink};
 
     fn result(index: usize) -> SearchResult {
@@ -1064,32 +742,6 @@ mod tests {
             channel_id: None,
             is_live: false,
         }
-    }
-
-    #[test]
-    fn a_video_without_duration_gets_no_marker_to_seek_with() {
-        let mut app = App {
-            mode: Mode::Playing,
-            screen: Rect::new(0, 0, 80, 24),
-            playback: Playback {
-                time_pos: Some(10.0),
-                duration: None,
-                ..Playback::default()
-            },
-            seek_bar: SeekBarState {
-                hover: Some(10),
-                drag: None,
-            },
-            ..App::default()
-        };
-        assert_eq!(seek_pointer(&app, &seek_bar_layout(&app)), None);
-
-        // duration が届けば同じホバー列に印と時刻が出る (トラック 65 セルで 1 セル 10 秒)。
-        app.playback.duration = Some(650.0);
-        assert_eq!(
-            seek_pointer(&app, &seek_bar_layout(&app)),
-            Some((10, 100.0))
-        );
     }
 
     #[test]
@@ -1332,105 +984,6 @@ mod tests {
         assert!(help_80(Mode::Results, DisplayMode::Embedded).contains("Esc"));
     }
 
-    #[test]
-    fn help_text_names_the_next_display_mode() {
-        assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("w:テキスト"));
-        assert!(help_80(Mode::Playing, DisplayMode::Text).contains("w:別ウィンドウ"));
-        assert!(help_80(Mode::Playing, DisplayMode::Window).contains("w:埋め込み"));
-    }
-
-    #[test]
-    fn window_placeholder_names_the_next_mode() {
-        assert_eq!(
-            window_placeholder(DisplayMode::Window),
-            "別ウィンドウで再生中  w: 埋め込みへ"
-        );
-    }
-
-    #[test]
-    fn video_area_layout_is_unchanged_by_the_text_mode() {
-        // 文字ブロックは映像と同じ矩形に描くので、割り付けはモードで変わらない。
-        let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 20));
-        assert_eq!(seek_bar_area(area), Rect::new(0, 20, 80, 1));
-    }
-
-    #[test]
-    fn playing_help_mentions_the_speed_keys() {
-        // 80 桁では入らないので、広い端末での案内で見る。
-        let help = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(help.contains("[ ]"), "{help}");
-        assert!(help.contains("BS"), "{help}");
-        assert!(help.contains("速度"), "{help}");
-    }
-
-    #[test]
-    fn video_area_layout_is_unchanged_by_the_display_mode() {
-        // プレースホルダは映像と同じ矩形に描くので、割り付けはモードで変わらない。
-        let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 20));
-        assert_eq!(seek_bar_area(area), Rect::new(0, 20, 80, 1));
-    }
-
-    #[test]
-    fn mini_video_area_sits_at_the_top_right_of_the_results_block() {
-        let screen = Rect::new(0, 0, 80, 24);
-        let results = search_areas(screen)[2];
-        let mini = mini_video_area(screen, DisplayMode::Embedded);
-        assert_eq!(mini.y, results.y);
-        assert_eq!(mini.right(), results.right());
-        assert_eq!(mini.width, 32);
-        assert_eq!(mini.height, 10);
-    }
-
-    #[test]
-    fn mini_video_area_shrinks_to_fit_a_small_results_block() {
-        let screen = Rect::new(0, 0, 20, 10);
-        let results = search_areas(screen)[2];
-        let mini = mini_video_area(screen, DisplayMode::Embedded);
-        assert!(
-            mini.width <= results.width / 2 && mini.width >= 1,
-            "{mini:?}"
-        );
-        assert!(
-            mini.height <= results.height && mini.height >= 1,
-            "{mini:?}"
-        );
-    }
-
-    #[test]
-    fn mini_video_area_is_larger_for_text_than_embedded() {
-        // text は文字グリッドがそのまま解像度になるため、embedded より広く取る (#62)。
-        let screen = Rect::new(0, 0, 80, 24);
-        let embedded = mini_video_area(screen, DisplayMode::Embedded);
-        let text = mini_video_area(screen, DisplayMode::Text);
-        assert!(text.width > embedded.width, "{text:?} vs {embedded:?}");
-        assert!(text.height > embedded.height, "{text:?} vs {embedded:?}");
-    }
-
-    #[test]
-    fn mini_video_area_for_text_shrinks_to_fit_a_small_results_block() {
-        let screen = Rect::new(0, 0, 20, 10);
-        let results = search_areas(screen)[2];
-        let mini = mini_video_area(screen, DisplayMode::Text);
-        assert!(
-            mini.width <= results.width / 2 && mini.width >= 1,
-            "{mini:?}"
-        );
-        assert!(
-            mini.height <= results.height && mini.height >= 1,
-            "{mini:?}"
-        );
-    }
-
     /// video_target_area の検証用に、映像を持つ App を組み立てる。
     fn video_app(mode: Mode, display: DisplayMode) -> App {
         App {
@@ -1444,51 +997,6 @@ mod tests {
             ))),
             ..App::default()
         }
-    }
-
-    #[test]
-    fn video_target_area_is_none_without_a_video() {
-        let app = App {
-            mode: Mode::Playing,
-            screen: Rect::new(0, 0, 80, 24),
-            ..App::default()
-        };
-        assert_eq!(video_target_area(&app, app.screen), None);
-    }
-
-    #[test]
-    fn video_target_area_is_the_full_video_area_while_playing() {
-        // window であっても Mode::Playing 中は差がない (別ウィンドウでも kitty 用に用意はしてある)。
-        for display in [
-            DisplayMode::Embedded,
-            DisplayMode::Text,
-            DisplayMode::Window,
-        ] {
-            let app = video_app(Mode::Playing, display);
-            assert_eq!(
-                video_target_area(&app, app.screen),
-                Some(video_area(app.screen)),
-                "{display:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn video_target_area_is_the_mini_area_while_backgrounded() {
-        for display in [DisplayMode::Embedded, DisplayMode::Text] {
-            let app = video_app(Mode::Results, display);
-            assert_eq!(
-                video_target_area(&app, app.screen),
-                Some(mini_video_area(app.screen, display)),
-                "{display:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn video_target_area_is_none_in_window_mode_while_backgrounded() {
-        let app = video_app(Mode::Results, DisplayMode::Window);
-        assert_eq!(video_target_area(&app, app.screen), None);
     }
 
     /// 指定セルの文字だけを取り出す。rendered() は全角文字で桁がずれるので、
@@ -2233,20 +1741,6 @@ mod tests {
         assert!(shown.contains("Ctrl+B:全画面へ"), "{shown}");
     }
 
-    #[test]
-    fn the_playing_help_always_names_the_background_key() {
-        let help = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(help.contains("b:検索へ"), "{help}");
-    }
-
     /// 矩形の左上と右下。両端が同じセルを指すことを確かめるための 2 点。
     fn corners(rect: Rect) -> [(u16, u16); 2] {
         [(rect.x, rect.y), (rect.right() - 1, rect.bottom() - 1)]
@@ -2558,227 +2052,6 @@ mod tests {
         assert_eq!(results_title(0, 0, 0), " 結果 ");
     }
 
-    #[test]
-    fn playing_rows_do_not_overlap_the_video() {
-        let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_area(area), Rect::new(0, 0, 80, 20));
-        assert_eq!(seek_bar_area(area), Rect::new(0, 20, 80, 1));
-        assert_eq!(action_area(area), Rect::new(0, 21, 80, 1));
-        assert_eq!(status_area(area), Rect::new(0, 22, 80, 1));
-        assert_eq!(help_area(area), Rect::new(0, 23, 80, 1));
-    }
-
-    /// 再生中のアクション行を見るための 80x24 の App。
-    fn action_app(channel_id: Option<&str>) -> App {
-        App {
-            mode: Mode::Playing,
-            screen: Rect::new(0, 0, 80, 24),
-            playback: Playback {
-                id: "v1".to_string(),
-                channel_id: channel_id.map(str::to_string),
-                ..Playback::default()
-            },
-            ..App::default()
-        }
-    }
-
-    /// アクション行で `text` を含むラベルの style。
-    fn action_style(app: &App, text: &str) -> Style {
-        action_spans(app)
-            .into_iter()
-            .find(|span| span.content.contains(text))
-            .expect("ラベルがある")
-            .style
-    }
-
-    #[test]
-    fn the_action_row_shows_the_like_and_the_subscribe_label() {
-        let app = action_app(Some("UC1"));
-        let row = drawn_row(&app, action_area(app.screen).y);
-        assert!(row.contains("いいね"), "{row}");
-        assert!(row.contains("登録"), "{row}");
-    }
-
-    #[test]
-    fn the_action_row_hides_the_subscribe_label_without_a_channel_id() {
-        // チャンネル ID の無い行から始めた再生では押せないので、印も出さない。
-        let app = action_app(None);
-        let row = drawn_row(&app, action_area(app.screen).y);
-        assert!(row.contains("いいね"), "{row}");
-        assert!(!row.contains("登録"), "{row}");
-    }
-
-    #[test]
-    fn a_done_action_is_colored_and_an_undone_one_is_gray() {
-        let gray = Style::default().fg(Color::Gray);
-        let now = std::time::SystemTime::UNIX_EPOCH;
-        let mut app = action_app(Some("UC1"));
-        assert_eq!(action_style(&app, "いいね"), gray);
-        assert_eq!(
-            action_style(&app, "登録"),
-            gray,
-            "未確認は未登録と同じ見た目"
-        );
-
-        app.engagement.remember_subscription("UC1", false, now);
-        assert_eq!(action_style(&app, "登録"), gray);
-
-        app.engagement.remember_like("v1", true, now);
-        app.engagement.remember_subscription("UC1", true, now);
-        assert_ne!(action_style(&app, "いいね"), gray);
-        assert_ne!(action_style(&app, "登録"), gray);
-    }
-
-    #[test]
-    fn the_action_hit_test_agrees_with_the_drawn_row() {
-        for channel_id in [None, Some("UC1")] {
-            let app = action_app(channel_id);
-            // 描いた行を左から辿り、各桁がどの操作の上かを並べる。
-            let mut columns: Vec<Option<ActionKind>> = Vec::new();
-            for piece in action_pieces(&app) {
-                let cells = grid::display_width(piece.text());
-                let kind = match piece {
-                    ActionPiece::Label { kind, .. } => Some(kind),
-                    ActionPiece::Gap => None,
-                };
-                columns.extend(std::iter::repeat_n(kind, cells));
-            }
-            for column in 0..columns.len() + 2 {
-                assert_eq!(
-                    action_at_column(&app, column),
-                    columns.get(column).copied().flatten(),
-                    "{channel_id:?} / {column} 桁目"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn only_the_action_row_answers_the_action_hit_test() {
-        let app = action_app(Some("UC1"));
-        let row = action_area(app.screen).y;
-        assert_eq!(action_at_point(&app, 0, row), Some(ActionKind::Like));
-        let subscribe_x = grid::display_width(ActionKind::Like.label()) as u16 + 2;
-        assert_eq!(
-            action_at_point(&app, subscribe_x, row),
-            Some(ActionKind::Subscribe)
-        );
-        for other in [0u16, 1, row - 1, row + 1, 23] {
-            assert_eq!(
-                action_at_point(&app, 0, other),
-                None,
-                "{other} 行目はアクション行でない"
-            );
-        }
-    }
-
-    #[test]
-    fn playing_help_mentions_the_like_and_the_subscribe_key() {
-        // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            true,
-            200,
-        );
-        assert!(wide.contains("l:いいね"), "{wide}");
-        assert!(wide.contains("u:登録"), "{wide}");
-
-        let no_channel = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(no_channel.contains("l:いいね"), "{no_channel}");
-        assert!(!no_channel.contains("u:登録"), "{no_channel}");
-    }
-
-    #[test]
-    fn playing_help_keeps_the_main_keys_inside_80_columns() {
-        for display in [
-            DisplayMode::Embedded,
-            DisplayMode::Text,
-            DisplayMode::Window,
-        ] {
-            let help = help_80(Mode::Playing, display);
-            let width = grid::display_width(&help);
-            assert!(width <= 80, "{width} 桁: {help}");
-            // 切れた案内を出さない代わりに、押せないと困るキーは必ず入れる。
-            for key in [
-                "space:一時停止",
-                "c:URLコピー",
-                &format!("w:{}", display.next().label()),
-                "Esc:停止",
-                "q:終了",
-            ] {
-                assert!(help.contains(key), "{key} が落ちた: {help}");
-            }
-        }
-    }
-
-    #[test]
-    fn playing_help_drops_whole_hints_when_the_terminal_is_narrow() {
-        let wide = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(wide.contains("クリック:シーク"), "{wide}");
-
-        let narrow = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            30,
-        );
-        assert_eq!(narrow, "space:一時停止 ←→:シーク");
-        assert_eq!(
-            help_text(
-                Mode::Playing,
-                DisplayMode::Embedded,
-                false,
-                false,
-                false,
-                false,
-                0
-            ),
-            ""
-        );
-    }
-
-    #[test]
-    fn playing_help_mentions_the_subtitle_key() {
-        // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(wide.contains("s:字幕"), "{wide}");
-        // 幅に入らないぶんは丸ごと落ちる。途中で切れた案内は出さない。
-        let narrow = help_80(Mode::Playing, DisplayMode::Text);
-        assert!(grid::display_width(&narrow) <= 80, "{narrow}");
-        assert!(!narrow.contains("s:字"), "{narrow}");
-    }
-
     /// TestBackend に 1 フレーム描いて、画面の文字だけを行ごとに取り出す。
     fn rendered(app: &App, width: u16, height: u16) -> String {
         let mut terminal =
@@ -2840,162 +2113,6 @@ mod tests {
         let list = rendered(&app, 80, 24);
         assert!(list.contains("結果"), "リスト表示の見出し: {list}");
         assert!(list.contains("title 1"), "{list}");
-    }
-
-    /// コメントを取り終えた再生画面。
-    fn commented_app(list: Vec<crate::comments::Comment>) -> App {
-        let mut app = App {
-            mode: Mode::Playing,
-            display: DisplayMode::Embedded,
-            screen: Rect::new(0, 0, 80, 24),
-            ..App::default()
-        };
-        app.comments.begin("abc".to_string());
-        app.comments.apply("abc", Ok(list));
-        app
-    }
-
-    fn comment(author: &str, text: &str) -> crate::comments::Comment {
-        crate::comments::Comment {
-            author: author.to_string(),
-            text: text.to_string(),
-            like_count: Some(3),
-        }
-    }
-
-    #[test]
-    fn the_comment_list_takes_over_the_video_area() {
-        let mut app = commented_app(vec![comment("alice", "おもしろい")]);
-        app.comments.toggle();
-        let screen = rendered(&app, 80, 24);
-
-        assert!(screen.contains("alice (+3)"), "{screen}");
-        assert!(screen.contains("おもしろい"), "{screen}");
-        // 映像領域を置き換えるだけで、下 3 段はそのまま。
-        assert!(screen.contains("space:一時停止"), "{screen}");
-    }
-
-    #[test]
-    fn a_video_with_comments_disabled_says_so_instead_of_looking_broken() {
-        let mut app = commented_app(Vec::new());
-        app.comments.toggle();
-        assert!(
-            rendered(&app, 80, 24).contains(crate::comments::NO_COMMENTS),
-            "コメント無効の動画はエラーにしない"
-        );
-    }
-
-    #[test]
-    fn the_video_comes_back_when_the_comment_list_is_closed() {
-        let mut app = commented_app(vec![comment("alice", "おもしろい")]);
-        app.display = DisplayMode::Window;
-        app.comments.toggle();
-        assert!(rendered(&app, 80, 24).contains("alice"));
-
-        app.comments.toggle();
-        let screen = rendered(&app, 80, 24);
-        assert!(!screen.contains("alice"), "{screen}");
-        assert!(screen.contains("別ウィンドウで再生中"), "{screen}");
-    }
-
-    #[test]
-    fn playing_help_mentions_the_comment_key() {
-        // 80 桁では主要キーが先で入らないので、広い端末での案内で見る。
-        let wide = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(wide.contains("o:コメント"), "{wide}");
-    }
-
-    #[test]
-    fn the_arrow_hint_switches_to_the_comment_list_while_it_is_open() {
-        let open = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            true,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(open.contains("↑↓:行送り"), "{open}");
-        assert!(!open.contains("↑↓:音量"), "{open}");
-
-        let closed = help_text(
-            Mode::Playing,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            200,
-        );
-        assert!(closed.contains("↑↓:音量"), "{closed}");
-    }
-
-    /// 1 件 2 行なので、80x24 の枠 (内側 18 行) には 9 件と少ししか入らない。
-    fn many_comments(count: usize) -> App {
-        commented_app(
-            (0..count)
-                .map(|i| comment(&format!("author{i}"), &format!("本文{i}")))
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn the_comment_list_scrolls_to_the_entries_that_do_not_fit() {
-        let mut app = many_comments(comments::COMMENT_LIMIT);
-        app.comments.toggle();
-        let top = rendered(&app, 80, 24);
-        assert!(top.contains("author0"), "{top}");
-        assert!(!top.contains("author20"), "{top}");
-
-        let view = comments_viewport(app.screen);
-        let lines = comments::display_lines(app.comments.state(), view.width as usize).len();
-        app.comments.scroll_by(40, lines, view.height as usize);
-        let scrolled = rendered(&app, 80, 24);
-        assert!(scrolled.contains("author20"), "{scrolled}");
-        assert!(!scrolled.contains("author0 "), "{scrolled}");
-
-        // 最後の 1 件までは送れる。
-        app.comments
-            .scroll_by(lines as isize, lines, view.height as usize);
-        let bottom = rendered(&app, 80, 24);
-        assert!(
-            bottom.contains(&format!("author{}", comments::COMMENT_LIMIT - 1)),
-            "{bottom}"
-        );
-    }
-
-    #[test]
-    fn the_comment_viewport_is_the_inside_of_the_frame() {
-        let screen = Rect::new(0, 0, 80, 24);
-        let view = comments_viewport(screen);
-        assert_eq!(view, Rect::new(1, 1, 78, 18));
-    }
-
-    #[test]
-    fn playing_help_mentions_the_mouse() {
-        // マウスの案内は幅が余ったときだけ出す。
-        assert!(
-            help_text(
-                Mode::Playing,
-                DisplayMode::Embedded,
-                false,
-                false,
-                false,
-                false,
-                200
-            )
-            .contains("クリック")
-        );
-        assert!(help_80(Mode::Playing, DisplayMode::Embedded).contains("シーク"));
     }
 
     // ---- ダウンロード画面 ----

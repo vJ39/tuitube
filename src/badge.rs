@@ -21,7 +21,7 @@ pub enum Badge {
 }
 
 impl Badge {
-    /// 塗り色。再生画面のアクション行 (ui::ActionKind) の赤/緑と揃える。
+    /// 塗り色。再生画面のアクション行 (screen::playing::ActionKind) の赤/緑と揃える。
     fn fill(self) -> [u8; 3] {
         match self {
             Badge::Live => [255, 70, 30],
@@ -32,7 +32,7 @@ impl Badge {
     }
 
     /// list 表示 (サムネイルを描かない) 向けの文字での印。記号は再生画面の
-    /// アクション行 (ui::ActionKind) と揃える。
+    /// アクション行 (screen::playing::ActionKind) と揃える。
     pub fn symbol(self) -> &'static str {
         match self {
             Badge::Live => "●LIVE",

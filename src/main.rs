@@ -196,7 +196,8 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
 /// 剥がす owe_clear は present_video でしか処理できないので、対象が無い間も
 /// 意味のある矩形を返し、present_video を毎フレーム呼び続けられるようにする。
 fn video_present_area(app: &App) -> Rect {
-    ui::video_target_area(app, app.screen).unwrap_or_else(|| ui::video_area(app.screen))
+    screen::playing::video_target_area(app, app.screen)
+        .unwrap_or_else(|| screen::playing::video_area(app.screen))
 }
 
 /// draw の直後に、保留中の画像削除と最新フレームを実端末へ書く。書き手はここだけ。
@@ -863,7 +864,10 @@ mod tests {
         };
         app.screen = Rect::new(0, 0, 80, 24);
         assert!(app.video.is_none());
-        assert_eq!(video_present_area(&app), ui::video_area(app.screen));
+        assert_eq!(
+            video_present_area(&app),
+            screen::playing::video_area(app.screen)
+        );
     }
 
     #[test]
@@ -875,7 +879,10 @@ mod tests {
             ..App::default()
         };
         app.screen = Rect::new(0, 0, 80, 24);
-        assert_eq!(video_present_area(&app), ui::video_area(app.screen));
+        assert_eq!(
+            video_present_area(&app),
+            screen::playing::video_area(app.screen)
+        );
     }
 
     #[test]

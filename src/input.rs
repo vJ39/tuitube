@@ -1,26 +1,21 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    CommentScroll, Oauth, SEEK_STEP_SECS, Session, change_speed, config_path_from_env,
-    copy_url_with, cycle_display_mode, enter_background, hide_current_channel, hide_selected,
-    leave_background, leave_channel, like_video, load_more, move_selection, open_channel,
-    reload_channel_tab, reload_tab, remember_playback_position, reset_speed, scroll_comments,
-    seek_absolute, seek_relative, select_channel_tab, select_tab, send_to_player, start_playback,
-    start_search, stop_playback, subscribe_channel, subscribe_playing_channel, switch_channel_tab,
-    switch_tab, toggle_comments, toggle_search_layout, toggle_subtitles,
+    Oauth, Session, config_path_from_env, hide_current_channel, hide_selected, leave_background,
+    leave_channel, load_more, move_selection, open_channel, reload_channel_tab, reload_tab,
+    remember_playback_position, select_channel_tab, select_tab, start_playback, start_search,
+    stop_playback, subscribe_channel, switch_channel_tab, switch_tab, toggle_search_layout,
 };
 use crate::app::{App, AppEvent, Mode};
-use crate::clipboard::{Clipboard, Pbcopy};
 use crate::geometry::cell_size;
 use crate::grid::Dir;
-use crate::mpv::{self, MpvCommand};
 use crate::oauth;
 use crate::screen::download::{self as download_screen, open_download};
+use crate::screen::playing as playing_screen;
 use crate::screen::playlists::{
     self as playlists_screen, is_playlists_key, leave_playlist, open_playlists, reload_playlist,
 };
 use crate::screen::settings::{self as settings_screen, is_settings_key, open_settings};
-use crate::seekbar::{MouseAction, MouseInput};
 use crate::ui;
 use crate::video::CellSize;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -65,7 +60,7 @@ pub async fn handle_key(
         Mode::Input => handle_key_input(app, key, tx, session).await,
         Mode::Results => handle_key_results(app, key, tx, session).await,
         Mode::Channel => handle_key_channel(app, key, tx, session).await,
-        Mode::Playing => handle_key_playing(app, key, tx, session).await,
+        Mode::Playing => playing_screen::handle_key_playing(app, key, tx, session).await,
         Mode::Settings => settings_screen::handle_key_settings(app, key),
         Mode::Download => download_screen::handle_key_download(app, key, tx, session).await,
         Mode::Playlists => playlists_screen::handle_key_playlists(app, key, tx, session).await,
@@ -275,82 +270,6 @@ fn is_select_all_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'a')
 }
 
-async fn handle_key_playing(
-    app: &mut App,
-    key: KeyEvent,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-) {
-    let config = config_path_from_env();
-    handle_key_playing_with(
-        app,
-        key,
-        tx,
-        session,
-        Pbcopy,
-        Oauth::real(),
-        config.as_deref(),
-    )
-    .await;
-}
-
-/// クリップボードの書き手と設定ファイルの置き場を差し替えられる形。テストはここに
-/// 偽物と一時ファイルを渡して pbcopy を起動させず、利用者の設定も書き換えない。
-async fn handle_key_playing_with<C: Clipboard, B: oauth::Backend + 'static>(
-    app: &mut App,
-    key: KeyEvent,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-    clipboard: C,
-    deps: Oauth<B>,
-    config: Option<&Path>,
-) {
-    // コメントを読んでいる間の ↑↓ は一覧送り。音量は閉じてから。
-    if app.comments.visible()
-        && let Some(step) = comment_scroll_step(key.code)
-    {
-        scroll_comments(app, step);
-        return;
-    }
-    if let Some(delta) = seek_step(key.code) {
-        seek_relative(app, session, delta, std::time::Instant::now()).await;
-    }
-    if let Some(steps) = speed_step(key.code) {
-        change_speed(app, session, steps).await;
-    }
-    if key.code == KeyCode::Backspace {
-        reset_speed(app, session).await;
-    }
-    if let Some(command) = playing_command(key.code) {
-        send_to_player(app, session, &command).await;
-    }
-    // 複数コマンドと App の状態更新を伴うので playing_command には入れない。
-    if key.code == KeyCode::Char('w') {
-        cycle_display_mode(app, session, config, std::time::Instant::now()).await;
-    }
-    if key.code == KeyCode::Char('c') {
-        copy_url_with(app, clipboard, std::time::Instant::now()).await;
-    }
-    if key.code == KeyCode::Char('s') {
-        toggle_subtitles(app, session, std::time::Instant::now()).await;
-    }
-    if key.code == KeyCode::Char('o') {
-        toggle_comments(app, session);
-    }
-    // deps は一度しか渡せないので、OAuth を使う操作は 1 つの match にまとめる。
-    match key.code {
-        KeyCode::Char('l') => like_video(app, tx, session, deps),
-        KeyCode::Char('u') => subscribe_playing_channel(app, tx, session, deps),
-        _ => {}
-    }
-    if key.code == KeyCode::Char('d') {
-        open_download(app, session);
-    }
-    if key.code == KeyCode::Char('b') {
-        enter_background(app, session).await;
-    }
-}
-
 /// マウス。再生中はシーク、入力欄はタブと検索欄のカーソル移動、
 /// 結果一覧はタブと格子のクリックを見る。
 pub async fn handle_mouse(
@@ -364,7 +283,7 @@ pub async fn handle_mouse(
         return;
     }
     match app.mode {
-        Mode::Playing => handle_mouse_playing(app, mouse, tx, session).await,
+        Mode::Playing => playing_screen::handle_mouse_playing(app, mouse, tx, session).await,
         Mode::Results => handle_mouse_results(app, mouse, tx, session).await,
         Mode::Channel => handle_mouse_channel(app, mouse, tx, session).await,
         Mode::Input => handle_mouse_input(app, mouse, tx, session),
@@ -460,119 +379,13 @@ async fn handle_mouse_channel(
     }
 }
 
-async fn handle_mouse_playing(
-    app: &mut App,
-    mouse: MouseEvent,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-) {
-    handle_mouse_playing_with(app, mouse, tx, session, Oauth::real()).await;
-}
-
-async fn handle_mouse_playing_with<B: oauth::Backend + 'static>(
-    app: &mut App,
-    mouse: MouseEvent,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-    deps: Oauth<B>,
-) {
-    // アイコンの上での押し込みはシークにしない。外れたら下のシーク処理へ渡す。
-    if let Some(kind) = playing_action_click(app, mouse) {
-        match kind {
-            ui::ActionKind::Like => like_video(app, tx, session, deps),
-            ui::ActionKind::Subscribe => subscribe_playing_channel(app, tx, session, deps),
-        }
-        return;
-    }
-    let Some(input) = mouse_input(mouse.kind) else {
-        return;
-    };
-    // 描画とヒットテストが同じ割り付けを通るので、印とクリック位置が食い違わない。
-    let layout = ui::seek_bar_layout(app);
-    let action = app
-        .seek_bar
-        .on_mouse(input, mouse.column, mouse.row, &layout);
-    let Some(MouseAction::Seek { column }) = action else {
-        return;
-    };
-    // duration が取れない動画 (ライブ等) では列を秒に直せない。
-    let Some(duration) = app.playback.duration else {
-        return;
-    };
-    let target = layout.seconds_at(column, duration);
-    seek_absolute(app, session, target, std::time::Instant::now()).await;
-}
-
-/// アクション行を押し込んだときの操作。押し込み以外は None
-/// (移動はシークバーの hover に渡す必要がある)。
-fn playing_action_click(app: &App, mouse: MouseEvent) -> Option<ui::ActionKind> {
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return None;
-    }
-    ui::action_at_point(app, mouse.column, mouse.row)
-}
-
-/// 左ボタンと移動だけ。それ以外は None。
-fn mouse_input(kind: MouseEventKind) -> Option<MouseInput> {
-    match kind {
-        MouseEventKind::Moved => Some(MouseInput::Move),
-        MouseEventKind::Down(MouseButton::Left) => Some(MouseInput::Press),
-        MouseEventKind::Drag(MouseButton::Left) => Some(MouseInput::Drag),
-        // 種別を報告しない端末の Up も crossterm は Left として返すので、Left だけで足りる。
-        // 全種別を受けると、ドラッグ中の右クリックがその場でシークを確定させてしまう。
-        MouseEventKind::Up(MouseButton::Left) => Some(MouseInput::Release),
-        _ => None,
-    }
-}
-
-/// ←→ のシーク幅。シークは先行更新を伴うので playing_command とは別経路。
-fn seek_step(code: KeyCode) -> Option<f64> {
-    match code {
-        KeyCode::Left => Some(-SEEK_STEP_SECS),
-        KeyCode::Right => Some(SEEK_STEP_SECS),
-        _ => None,
-    }
-}
-
-/// コメント表示中の送り幅。上限 50 件は 1 画面に入らないので、行送りと画面送りを用意する。
-fn comment_scroll_step(code: KeyCode) -> Option<CommentScroll> {
-    match code {
-        KeyCode::Up => Some(CommentScroll::Line(-1)),
-        KeyCode::Down => Some(CommentScroll::Line(1)),
-        KeyCode::PageUp => Some(CommentScroll::Page(-1)),
-        KeyCode::PageDown => Some(CommentScroll::Page(1)),
-        _ => None,
-    }
-}
-
-/// 速度の刻み。mpv 既定の `[` `]` と同じ位置に置く (mpv は × 0.9 / × 1.1 で刻みだけ違う)。
-fn speed_step(code: KeyCode) -> Option<i8> {
-    match code {
-        KeyCode::Char('[') => Some(-1),
-        KeyCode::Char(']') => Some(1),
-        _ => None,
-    }
-}
-
-/// 再生中のキーと mpv コマンドの対応表。
-fn playing_command(code: KeyCode) -> Option<MpvCommand> {
-    match code {
-        KeyCode::Char(' ') => Some(mpv::cycle_pause()),
-        KeyCode::Up => Some(mpv::add_volume(5)),
-        KeyCode::Down => Some(mpv::add_volume(-5)),
-        KeyCode::Char('q') | KeyCode::Esc => Some(mpv::quit()),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{ChannelView, Playback, PlaylistView};
     use crate::category::{Category, Tabs};
-    use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
-    use crate::display::DisplayMode;
     use crate::grid::LayoutMode;
+    use crate::mpv::{self, MpvCommand};
     use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
     use crate::screen::playlists::PlaylistsView;
@@ -684,73 +497,6 @@ mod tests {
         // 本番では set_results の後に必ず draw が挟まる。
         app.mark_drawn();
         app
-    }
-
-    #[tokio::test]
-    async fn o_toggles_the_comment_list_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = playing_app();
-
-        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
-        assert!(app.comments.visible());
-        assert!(session.owe_clear, "貼ってある映像を剥がす");
-
-        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
-        assert!(!app.comments.visible());
-    }
-
-    /// 上限まで取れた再生画面。1 件 2 行なので 80x24 の枠 (内側 18 行) には収まらない。
-    fn commented_app() -> App {
-        let mut app = playing_app();
-        app.comments.begin("abc".to_string());
-        let list = (0..crate::comments::COMMENT_LIMIT)
-            .map(|i| crate::comments::Comment {
-                author: format!("author{i}"),
-                text: format!("本文{i}"),
-                like_count: None,
-            })
-            .collect();
-        app.comments.apply("abc", Ok(list));
-        app
-    }
-
-    #[tokio::test]
-    async fn the_arrows_scroll_the_comment_list_while_it_is_open() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = commented_app();
-        // 50 件 = 100 行を 18 行の枠で見る。
-        let lines = 2 * crate::comments::COMMENT_LIMIT;
-        let height = 18;
-
-        // 閉じている間の ↑↓ は音量のままで、一覧は動かない。
-        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
-        assert_eq!(app.comments.scroll(lines, height), 0);
-
-        app.comments.toggle();
-        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
-        assert_eq!(app.comments.scroll(lines, height), 1);
-        handle_key(&mut app, key(KeyCode::PageDown), &tx, &mut session).await;
-        assert_eq!(app.comments.scroll(lines, height), 1 + height);
-        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
-        assert_eq!(app.comments.scroll(lines, height), height);
-        handle_key(&mut app, key(KeyCode::PageUp), &tx, &mut session).await;
-        assert_eq!(app.comments.scroll(lines, height), 0);
-    }
-
-    #[tokio::test]
-    async fn scrolling_does_not_take_over_the_other_playback_keys() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = commented_app();
-        app.comments.toggle();
-
-        // ←→ のシークも o の開閉もそのまま効く。
-        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
-        assert_eq!(app.playback.time_pos, Some(SEEK_STEP_SECS));
-        handle_key(&mut app, key(KeyCode::Char('o')), &tx, &mut session).await;
-        assert!(!app.comments.visible());
     }
 
     #[tokio::test]
@@ -902,21 +648,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn b_key_backgrounds_playback_and_returns_to_the_result_list() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App {
-            results: vec![result("a")],
-            ..playing_app()
-        };
-
-        handle_key_playing(&mut app, key(KeyCode::Char('b')), &tx, &mut session).await;
-
-        assert!(app.background);
-        assert_eq!(app.mode, Mode::Results);
-    }
-
-    #[tokio::test]
     async fn b_key_returns_to_playing_only_while_backgrounded() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
@@ -1019,44 +750,6 @@ mod tests {
         assert_eq!(app.resume.lookup("v1"), Some(120.0));
     }
 
-    #[test]
-    fn playing_keys_map_to_mpv_commands() {
-        assert_eq!(
-            playing_command(KeyCode::Char(' ')),
-            Some(mpv::cycle_pause())
-        );
-        // シークは先行更新を伴うので playing_command からは外れている。
-        assert_eq!(playing_command(KeyCode::Left), None);
-        assert_eq!(playing_command(KeyCode::Right), None);
-        assert_eq!(seek_step(KeyCode::Left), Some(-5.0));
-        assert_eq!(seek_step(KeyCode::Right), Some(5.0));
-        assert_eq!(seek_step(KeyCode::Char('x')), None);
-        assert_eq!(playing_command(KeyCode::Up), Some(mpv::add_volume(5)));
-        assert_eq!(playing_command(KeyCode::Down), Some(mpv::add_volume(-5)));
-        assert_eq!(playing_command(KeyCode::Esc), Some(mpv::quit()));
-        assert_eq!(playing_command(KeyCode::Char('q')), Some(mpv::quit()));
-        assert_eq!(playing_command(KeyCode::Char('x')), None);
-        assert_eq!(playing_command(KeyCode::Enter), None);
-    }
-
-    #[test]
-    fn w_is_not_a_plain_mpv_command() {
-        // 表示モードの切替は複数コマンドなので、シークと同じく別経路。
-        assert_eq!(playing_command(KeyCode::Char('w')), None);
-    }
-
-    #[test]
-    fn bracket_keys_step_the_speed_and_are_not_plain_mpv_commands() {
-        assert_eq!(speed_step(KeyCode::Char('[')), Some(-1));
-        assert_eq!(speed_step(KeyCode::Char(']')), Some(1));
-        assert_eq!(speed_step(KeyCode::Char('x')), None);
-        assert_eq!(speed_step(KeyCode::Backspace), None);
-        // 送信の要否を tuitube 側で決めるので、対応表には載せない。
-        assert_eq!(playing_command(KeyCode::Char('[')), None);
-        assert_eq!(playing_command(KeyCode::Char(']')), None);
-        assert_eq!(playing_command(KeyCode::Backspace), None);
-    }
-
     #[tokio::test]
     async fn speed_keys_change_only_while_playing() {
         let (tx, _rx) = channel();
@@ -1097,48 +790,6 @@ mod tests {
             nonce: 1,
         });
         sent
-    }
-
-    #[tokio::test]
-    async fn bracket_keys_send_the_speed_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let sent = record(&mut session);
-        let mut app = playing_app();
-
-        handle_key_playing(&mut app, key(KeyCode::Char(']')), &tx, &mut session).await;
-        assert_eq!(
-            app.speed,
-            crate::speed::Speed::from_tenths(11).expect("1.1x")
-        );
-        handle_key_playing(&mut app, key(KeyCode::Char('[')), &tx, &mut session).await;
-        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
-
-        assert_eq!(
-            *sent.lock().expect("溜め込み先"),
-            [
-                "{\"command\":[\"set_property\",\"speed\",1.1]}\n",
-                "{\"command\":[\"set_property\",\"speed\",1.0]}\n",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn backspace_resets_the_speed_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let sent = record(&mut session);
-        let mut app = App {
-            speed: crate::speed::Speed::from_tenths(15).expect("1.5x"),
-            ..playing_app()
-        };
-        handle_key_playing(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
-
-        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
-        assert_eq!(
-            *sent.lock().expect("溜め込み先"),
-            ["{\"command\":[\"set_property\",\"speed\",1.0]}\n"]
-        );
     }
 
     #[tokio::test]
@@ -1219,150 +870,6 @@ mod tests {
         .await;
 
         assert_eq!(app.settings.search.layout, LayoutMode::List);
-    }
-
-    const URL: &str = "https://www.youtube.com/watch?v=abc";
-
-    fn playing_url_app() -> App {
-        App {
-            playback: Playback {
-                url: URL.to_string(),
-                time_pos: Some(0.0),
-                duration: Some(650.0),
-                ..Playback::default()
-            },
-            ..playing_app()
-        }
-    }
-
-    #[tokio::test]
-    async fn c_copies_the_url_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = playing_url_app();
-        let clipboard = FakeClipboard::new(CopyResult::Ok);
-        handle_key_playing_with(
-            &mut app,
-            key(KeyCode::Char('c')),
-            &tx,
-            &mut session,
-            clipboard.clone(),
-            fake_oauth(),
-            Some(&temp_config("scratch")),
-        )
-        .await;
-
-        assert_eq!(clipboard.copied(), [URL]);
-        assert_eq!(
-            app.notice.as_deref(),
-            Some(crate::actions::COPIED_NOTICE),
-            "コピーできたことを伝える"
-        );
-    }
-
-    const SID_AUTO: &str = "{\"command\":[\"set_property\",\"sid\",\"auto\"]}\n";
-    const SID_NO: &str = "{\"command\":[\"set_property\",\"sid\",\"no\"]}\n";
-
-    #[tokio::test]
-    async fn s_toggles_the_subtitle_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let sent = record(&mut session);
-        let mut app = playing_app();
-        assert!(app.subtitles.wanted(), "[subtitles] enabled の既定は true");
-
-        handle_key_playing(&mut app, key(KeyCode::Char('s')), &tx, &mut session).await;
-        assert!(!app.subtitles.wanted());
-        handle_key_playing(&mut app, key(KeyCode::Char('s')), &tx, &mut session).await;
-        assert!(app.subtitles.wanted());
-
-        assert_eq!(*sent.lock().expect("溜め込み先"), [SID_NO, SID_AUTO]);
-    }
-
-    #[tokio::test]
-    async fn s_does_nothing_else_while_playing() {
-        let (tx, _rx) = channel();
-        // s は既存のキーと重なっていない。
-        assert_eq!(playing_command(KeyCode::Char('s')), None);
-        assert_eq!(seek_step(KeyCode::Char('s')), None);
-        assert_eq!(speed_step(KeyCode::Char('s')), None);
-
-        let mut session = Session::default();
-        let sent = record(&mut session);
-        let mut app = playing_app();
-        let clipboard = FakeClipboard::new(CopyResult::Ok);
-        handle_key_playing_with(
-            &mut app,
-            key(KeyCode::Char('s')),
-            &tx,
-            &mut session,
-            clipboard.clone(),
-            fake_oauth(),
-            Some(&temp_config("scratch")),
-        )
-        .await;
-
-        assert_eq!(*sent.lock().expect("溜め込み先"), [SID_NO]);
-        assert_eq!(app.speed, crate::speed::Speed::NORMAL);
-        assert_eq!(app.display, DisplayMode::Embedded);
-        assert!(clipboard.copied().is_empty());
-        assert!(!app.should_quit);
-        assert_eq!(app.mode, Mode::Playing);
-    }
-
-    #[tokio::test]
-    async fn the_other_playing_keys_do_not_toggle_the_subtitle() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let _sent = record(&mut session);
-        let mut app = playing_app();
-        for code in [
-            KeyCode::Char(' '),
-            KeyCode::Char('w'),
-            KeyCode::Char('['),
-            KeyCode::Char(']'),
-            KeyCode::Backspace,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::Up,
-            KeyCode::Down,
-        ] {
-            handle_key_playing_with(
-                &mut app,
-                key(code),
-                &tx,
-                &mut session,
-                FakeClipboard::new(CopyResult::Ok),
-                fake_oauth(),
-                Some(&temp_config("scratch")),
-            )
-            .await;
-            assert!(app.subtitles.wanted(), "{code:?} で字幕が動いた");
-        }
-    }
-
-    #[tokio::test]
-    async fn w_writes_the_new_display_mode_to_the_config_file() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let _sent = record(&mut session);
-        let mut app = playing_app();
-        let path = temp_config("w-autosave");
-
-        handle_key_playing_with(
-            &mut app,
-            key(KeyCode::Char('w')),
-            &tx,
-            &mut session,
-            FakeClipboard::new(CopyResult::Ok),
-            fake_oauth(),
-            Some(&path),
-        )
-        .await;
-
-        assert_eq!(app.display, DisplayMode::Text);
-        let written = std::fs::read_to_string(&path).expect("読める");
-        assert!(written.contains("mode = \"text\""), "{written}");
     }
 
     /// チャンネル一覧を見ている状態。
@@ -1446,208 +953,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn l_while_playing_starts_the_like() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = playing_url_app();
-        let clipboard = FakeClipboard::new(CopyResult::Ok);
-
-        handle_key_playing_with(
-            &mut app,
-            key(KeyCode::Char('l')),
-            &tx,
-            &mut session,
-            clipboard,
-            fake_oauth(),
-            Some(&temp_config("scratch")),
-        )
-        .await;
-
-        assert_eq!(app.notice.as_deref(), Some(crate::oauth::LIKE_NOTICE));
-        assert!(session.oauth_task.is_some(), "送信が積まれている");
-    }
-
-    #[tokio::test]
-    async fn l_does_nothing_without_a_video_url() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        // playing_app は URL を持たない。
-        let mut app = playing_app();
-        let clipboard = FakeClipboard::new(CopyResult::Ok);
-
-        handle_key_playing_with(
-            &mut app,
-            key(KeyCode::Char('l')),
-            &tx,
-            &mut session,
-            clipboard,
-            fake_oauth(),
-            Some(&temp_config("scratch")),
-        )
-        .await;
-
-        assert!(session.oauth_task.is_none());
-        assert!(app.notice.is_none());
-    }
-
-    #[tokio::test]
-    async fn the_other_playing_keys_do_not_like() {
-        let (tx, _rx) = channel();
-        for code in [
-            KeyCode::Char(' '),
-            KeyCode::Char('c'),
-            KeyCode::Char('s'),
-            KeyCode::Char('o'),
-            KeyCode::Char('w'),
-        ] {
-            let mut session = Session::default();
-            let mut app = playing_url_app();
-            handle_key_playing_with(
-                &mut app,
-                key(code),
-                &tx,
-                &mut session,
-                FakeClipboard::new(CopyResult::Ok),
-                fake_oauth(),
-                Some(&temp_config("scratch")),
-            )
-            .await;
-            assert!(session.oauth_task.is_none(), "{code:?} でいいねが走った");
-        }
-    }
-
-    /// チャンネル ID を引き継いだ再生。アクション行に登録ラベルが出る状態。
-    fn playing_channel_app() -> App {
-        let mut app = playing_url_app();
-        app.playback.channel_id = Some("UC1".to_string());
-        app
-    }
-
-    async fn press_while_playing(app: &mut App, code: KeyCode, session: &mut Session) {
-        let (tx, _rx) = channel();
-        handle_key_playing_with(
-            app,
-            key(code),
-            &tx,
-            session,
-            FakeClipboard::new(CopyResult::Ok),
-            fake_oauth(),
-            Some(&temp_config("scratch")),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn u_while_playing_subscribes_to_the_channel_of_the_video() {
-        let mut session = Session::default();
-        let mut app = playing_channel_app();
-
-        press_while_playing(&mut app, KeyCode::Char('u'), &mut session).await;
-
-        assert_eq!(app.notice.as_deref(), Some(crate::oauth::SUBSCRIBE_NOTICE));
-        assert_eq!(
-            session.oauth_action,
-            Some(crate::oauth::Action::Subscribe("UC1".to_string()))
-        );
-    }
-
-    #[tokio::test]
-    async fn u_does_nothing_without_a_channel_id() {
-        let mut session = Session::default();
-        // playing_url_app はチャンネル ID を持たない。
-        let mut app = playing_url_app();
-
-        press_while_playing(&mut app, KeyCode::Char('u'), &mut session).await;
-
-        assert!(session.oauth_task.is_none());
-        assert!(app.notice.is_none());
-    }
-
-    #[tokio::test]
-    async fn l_and_u_ask_for_different_actions() {
-        let mut session = Session::default();
-        let mut app = playing_channel_app();
-
-        press_while_playing(&mut app, KeyCode::Char('l'), &mut session).await;
-        assert_eq!(
-            session.oauth_action,
-            Some(crate::oauth::Action::Like("abc".to_string()))
-        );
-
-        press_while_playing(&mut app, KeyCode::Char('u'), &mut session).await;
-        assert_eq!(
-            session.oauth_action,
-            Some(crate::oauth::Action::Subscribe("UC1".to_string()))
-        );
-    }
-
-    /// アクション行 (80x24 の端末では y=21) の押し込み。
-    fn action_click(column: u16) -> MouseEvent {
-        mouse(MouseEventKind::Down(MouseButton::Left), column, 21)
-    }
-
-    async fn click_while_playing(app: &mut App, event: MouseEvent, session: &mut Session) {
-        let (tx, _rx) = channel();
-        handle_mouse_playing_with(app, event, &tx, session, fake_oauth()).await;
-    }
-
-    #[tokio::test]
-    async fn clicking_the_like_icon_likes_instead_of_seeking() {
-        let mut session = Session::default();
-        let mut app = playing_channel_app();
-
-        click_while_playing(&mut app, action_click(0), &mut session).await;
-
-        assert_eq!(
-            session.oauth_action,
-            Some(crate::oauth::Action::Like("abc".to_string()))
-        );
-        assert_eq!(app.playback.time_pos, Some(0.0), "シークは走らない");
-        assert_eq!(app.seek_bar.drag, None);
-    }
-
-    #[tokio::test]
-    async fn clicking_the_subscribe_icon_subscribes() {
-        let mut session = Session::default();
-        let mut app = playing_channel_app();
-        // いいねラベルと区切りの右。
-        let column = crate::grid::display_width(ui::ActionKind::Like.label()) as u16 + 2;
-
-        click_while_playing(&mut app, action_click(column), &mut session).await;
-
-        assert_eq!(
-            session.oauth_action,
-            Some(crate::oauth::Action::Subscribe("UC1".to_string()))
-        );
-        assert_eq!(app.playback.time_pos, Some(0.0), "シークは走らない");
-    }
-
-    #[tokio::test]
-    async fn a_click_next_to_the_icons_does_nothing() {
-        let mut session = Session::default();
-        let mut app = playing_channel_app();
-
-        click_while_playing(&mut app, action_click(70), &mut session).await;
-
-        assert!(session.oauth_action.is_none());
-        assert_eq!(app.playback.time_pos, Some(0.0));
-    }
-
-    #[tokio::test]
-    async fn the_seek_bar_still_answers_clicks_with_the_action_row_in_place() {
-        let mut session = Session::default();
-        let mut app = playing_channel_app();
-
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
-        click_while_playing(&mut app, down, &mut session).await;
-        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
-        click_while_playing(&mut app, up, &mut session).await;
-
-        assert_eq!(app.playback.time_pos, Some(130.0));
-        assert!(session.oauth_action.is_none(), "いいねは走らない");
-    }
-
-    #[tokio::test]
     async fn l_is_a_plain_character_outside_of_playback() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
@@ -1682,44 +987,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_other_playing_keys_do_not_copy() {
-        let (tx, _rx) = channel();
-        // c は既存のキーと重なっていない。
-        assert_eq!(playing_command(KeyCode::Char('c')), None);
-        assert_eq!(seek_step(KeyCode::Char('c')), None);
-        assert_eq!(speed_step(KeyCode::Char('c')), None);
-
-        let mut session = Session::default();
-        let mut app = playing_url_app();
-        let clipboard = FakeClipboard::new(CopyResult::Ok);
-        for code in [
-            KeyCode::Char(' '),
-            KeyCode::Char('w'),
-            KeyCode::Char('['),
-            KeyCode::Char(']'),
-            KeyCode::Backspace,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Esc,
-        ] {
-            handle_key_playing_with(
-                &mut app,
-                key(code),
-                &tx,
-                &mut session,
-                clipboard.clone(),
-                fake_oauth(),
-                Some(&temp_config("scratch")),
-            )
-            .await;
-        }
-        assert!(clipboard.copied().is_empty());
-        assert!(app.notice.is_none());
-    }
-
-    #[tokio::test]
     async fn c_is_typed_into_the_query_in_the_input_mode() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
@@ -1728,64 +995,6 @@ mod tests {
 
         assert_eq!(app.query.text(), "c");
         assert!(app.notice.is_none());
-    }
-
-    #[tokio::test]
-    async fn q_stops_playback_without_quitting_the_app() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App {
-            mode: Mode::Playing,
-            ..App::default()
-        };
-
-        // player が無い間もキー処理は進み、送信だけが飛ばされる。
-        // q は Esc と同じく再生を止めるだけ。アプリごと終了しない。
-        handle_key_playing(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
-        assert!(!app.should_quit);
-        assert!(app.error.is_none());
-
-        handle_key_playing(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
-        assert!(!app.should_quit);
-        assert!(app.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn mouse_release_on_the_bar_records_an_optimistic_seek() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = playing_app();
-
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
-        handle_mouse(&mut app, down, &tx, &mut session).await;
-        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
-        handle_mouse(&mut app, up, &tx, &mut session).await;
-
-        assert_eq!(app.playback.time_pos, Some(130.0));
-        assert!(app.playback.pending_seek.is_some());
-        // player が無い間は送信だけが飛ばされる。
-        assert!(app.error.is_none());
-        assert_eq!(app.seek_bar.drag, None);
-    }
-
-    #[tokio::test]
-    async fn a_release_from_another_button_does_not_end_the_drag() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = playing_app();
-
-        let down = mouse(MouseEventKind::Down(MouseButton::Left), 0, 20);
-        handle_mouse(&mut app, down, &tx, &mut session).await;
-        // ドラッグ中の右クリックでシークが飛ばない。左ドラッグはそのまま続く。
-        let other = mouse(MouseEventKind::Up(MouseButton::Right), 40, 20);
-        handle_mouse(&mut app, other, &tx, &mut session).await;
-        assert_eq!(app.playback.time_pos, Some(0.0));
-        assert_eq!(app.seek_bar.drag, Some(0));
-
-        let up = mouse(MouseEventKind::Up(MouseButton::Left), 13, 20);
-        handle_mouse(&mut app, up, &tx, &mut session).await;
-        assert_eq!(app.playback.time_pos, Some(130.0));
-        assert_eq!(app.seek_bar.drag, None);
     }
 
     #[tokio::test]
@@ -2814,59 +2023,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_a_cell_while_playing_does_not_start_another_playback() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = grid_app(10);
-        let at = cell_click(&app, 1);
-        app.mode = Mode::Playing;
-        app.selected = 3;
-
-        handle_mouse(&mut app, at, &tx, &mut session).await;
-
-        assert_eq!(app.selected, 3);
-        assert_eq!(session.player_nonce, 0);
-    }
-
-    #[tokio::test]
-    async fn clicking_the_tab_row_while_playing_does_not_switch_tabs() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = playing_app();
-
-        handle_mouse(&mut app, tab_click(9), &tx, &mut session).await;
-        assert_eq!(app.tabs.selected(), 0, "再生中はシークだけ");
-        assert!(!take_search(&mut session));
-        assert_eq!(app.seek_bar, SeekBarState::default());
-    }
-
-    #[tokio::test]
-    async fn arrow_keys_seek_relative_to_the_pending_target_and_clear_hover() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App {
-            playback: Playback {
-                time_pos: Some(10.0),
-                duration: Some(650.0),
-                ..Playback::default()
-            },
-            seek_bar: SeekBarState {
-                hover: Some(3),
-                drag: None,
-            },
-            ..playing_app()
-        };
-
-        handle_key_playing(&mut app, key(KeyCode::Right), &tx, &mut session).await;
-        assert_eq!(app.playback.time_pos, Some(15.0));
-        handle_key_playing(&mut app, key(KeyCode::Right), &tx, &mut session).await;
-        assert_eq!(app.playback.time_pos, Some(20.0));
-        handle_key_playing(&mut app, key(KeyCode::Left), &tx, &mut session).await;
-        assert_eq!(app.playback.time_pos, Some(15.0));
-        assert_eq!(app.seek_bar.hover, None);
-    }
-
-    #[tokio::test]
     async fn ctrl_c_quits_while_playing() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
@@ -3173,20 +2329,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capital_s_is_ignored_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let sent = record(&mut session);
-        let mut app = playing_app();
-
-        handle_key_playing(&mut app, key(KeyCode::Char('S')), &tx, &mut session).await;
-
-        assert_eq!(app.mode, Mode::Playing);
-        assert!(sent.lock().expect("溜め込み先").is_empty());
-        assert!(app.subtitles.wanted(), "小文字 s の字幕とは別のキー");
-    }
-
-    #[tokio::test]
     async fn ctrl_c_still_quits_from_the_settings() {
         let (tx, _rx) = channel();
         let mut session = Session::default();
@@ -3311,35 +2453,6 @@ mod tests {
         assert!(session.oauth_task.is_none(), "登録 (s) とは別の操作");
     }
 
-    #[tokio::test]
-    async fn h_is_not_taken_by_the_other_screens() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        // 再生中の h は今までどおり何もしない。
-        let mut app = playing_app();
-        handle_key_playing(&mut app, key(KeyCode::Char('h')), &tx, &mut session).await;
-
-        assert_eq!(app.mode, Mode::Playing);
-        assert!(app.notice.is_none());
-        assert!(app.hidden.videos.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tab_is_ignored_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App {
-            mode: Mode::Playing,
-            ..playing_app()
-        };
-        for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('r')] {
-            handle_key_playing(&mut app, key(code), &tx, &mut session).await;
-        }
-        assert_eq!(app.tabs.selected(), 0);
-        assert!(session.search_task.is_none());
-        assert!(!app.should_quit);
-    }
-
     // ---- ダウンロード画面 ----
 
     #[tokio::test]
@@ -3366,26 +2479,5 @@ mod tests {
 
         assert_eq!(app.mode, Mode::Download);
         assert_eq!(app.download.return_mode, Mode::Channel);
-    }
-
-    #[tokio::test]
-    async fn d_opens_the_download_screen_while_playing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App {
-            playback: Playback {
-                title: "曲".to_string(),
-                url: "https://www.youtube.com/watch?v=song1".to_string(),
-                ..Playback::default()
-            },
-            ..playing_app()
-        };
-
-        handle_key(&mut app, key(KeyCode::Char('d')), &tx, &mut session).await;
-
-        assert_eq!(app.mode, Mode::Download);
-        assert_eq!(app.download.return_mode, Mode::Playing);
-        assert_eq!(app.download.url, "https://www.youtube.com/watch?v=song1");
-        assert_eq!(app.download.filename.text(), "曲");
     }
 }

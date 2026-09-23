@@ -1,6 +1,6 @@
 //! 端末への寸法問い合わせと、その答えから映像の寸法を決める計算。
 
-use crate::ui;
+use crate::screen::playing;
 use crate::video::{self, CellSize, Geometry};
 use ratatui::layout::Rect;
 
@@ -21,7 +21,7 @@ pub fn cell_size() -> CellSize {
 /// mpv に渡す寸法は ratatui の映像領域と一致していなければならない。
 pub fn geometry_for(cols: u16, rows: u16, cell: CellSize, max_pixels: u32) -> Geometry {
     Geometry::new(
-        ui::video_area(Rect::new(0, 0, cols, rows)),
+        playing::video_area(Rect::new(0, 0, cols, rows)),
         cell,
         max_pixels,
     )
@@ -39,7 +39,7 @@ mod tests {
     #[test]
     fn geometry_matches_the_video_area_of_the_same_terminal_size() {
         let geometry = geometry_for(80, 24, CELL, video::MAX_FRAME_PIXELS);
-        assert_eq!(geometry.area, ui::video_area(Rect::new(0, 0, 80, 24)));
+        assert_eq!(geometry.area, playing::video_area(Rect::new(0, 0, 80, 24)));
         assert_eq!(geometry.cell, CELL);
         // 映像領域 80x20 セル × 8x16 px。予算 640*360 に収まるので縮まない。
         assert_eq!(geometry.frame_px, (640, 320));
@@ -51,7 +51,7 @@ mod tests {
         let pixels = u64::from(geometry.frame_px.0) * u64::from(geometry.frame_px.1);
         assert!(pixels <= u64::from(video::MAX_FRAME_PIXELS), "{pixels} px");
         // セル領域は縮めない。縮めるのはフレームのピクセル数だけ。
-        assert_eq!(geometry.area, ui::video_area(Rect::new(0, 0, 200, 60)));
+        assert_eq!(geometry.area, playing::video_area(Rect::new(0, 0, 200, 60)));
     }
 
     #[test]
@@ -63,7 +63,7 @@ mod tests {
             "{pixels} px"
         );
         // セル領域は予算で変わらない。
-        assert_eq!(low.area, ui::video_area(Rect::new(0, 0, 80, 24)));
+        assert_eq!(low.area, playing::video_area(Rect::new(0, 0, 80, 24)));
     }
 
     #[test]

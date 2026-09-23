@@ -22,7 +22,7 @@ pub struct SeekBarLayout {
 }
 
 impl SeekBarLayout {
-    /// row は ui::seek_bar_area() の 1 行。label_width は label_width(duration)。
+    /// row は screen::playing::seek_bar_area() の 1 行。label_width は label_width(duration)。
     pub fn new(row: Rect, label_width: u16) -> Self {
         let reserved = label_width.saturating_add(LABEL_GAP);
         if row.width <= reserved {
