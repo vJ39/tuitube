@@ -9,6 +9,7 @@ use crate::query::QueryEditor;
 use crate::resume::Resume;
 use crate::rgb::RgbImage;
 use crate::screen::download::{self as download_screen, DownloadForm};
+use crate::screen::playlists::{self as playlists_screen, PlaylistsView};
 use crate::screen::settings::{self as settings_screen, SettingsScreen};
 use crate::search::{ChannelRef, PlaylistEntry, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
@@ -191,32 +192,6 @@ impl ChannelView {
             id: self.channel_id.clone(),
             tab: self.tab,
         }
-    }
-}
-
-/// プレイリストの一覧を開いている間の状態。行はタイトルだけでサムネイルを持たないので、
-/// 動画一覧の TabState とは別の入れ物にする。
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct PlaylistsView {
-    pub entries: Vec<PlaylistEntry>,
-    pub selected: usize,
-    pub loaded: bool,
-}
-
-impl PlaylistsView {
-    pub fn select_next(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        self.selected = (self.selected + 1) % self.entries.len();
-    }
-
-    pub fn select_prev(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let len = self.entries.len();
-        self.selected = (self.selected + len - 1) % len;
     }
 }
 
@@ -800,7 +775,7 @@ impl App {
             Mode::Input => self.search_status("検索したい語句を入力して Enter".to_string()),
             Mode::Results => self.search_status(self.results_status()),
             Mode::Channel => self.search_status(self.channel_status()),
-            Mode::Playlists => self.search_status(self.playlists_status()),
+            Mode::Playlists => self.search_status(playlists_screen::playlists_status(self)),
             Mode::Playlist => self.search_status(self.playlist_status()),
             Mode::Settings => settings_screen::settings_status(self),
             Mode::Download => download_screen::download_status(self),
@@ -822,7 +797,7 @@ impl App {
     }
 
     /// バックグラウンド中に状態行の先頭へ足す、再生中のタイトルの目印。
-    fn background_marker(&self) -> String {
+    pub(crate) fn background_marker(&self) -> String {
         if self.background {
             format!("▶ {}  |  ", self.playback.title)
         } else {
@@ -843,7 +818,7 @@ impl App {
     }
 
     /// 格子のタイトルは 18 桁ほどで切れるので、選択中の完全なタイトルはここに出す。
-    fn results_status(&self) -> String {
+    pub(crate) fn results_status(&self) -> String {
         format!("{}{}", self.background_marker(), self.results_body())
     }
 
@@ -859,19 +834,6 @@ impl App {
             channel.tab.label(),
             self.results_body()
         )
-    }
-
-    /// プレイリストの一覧は動画一覧と別の入れ物なので、件数も選択も別に数える。
-    fn playlists_status(&self) -> String {
-        let Some(playlists) = &self.playlists else {
-            return self.results_status();
-        };
-        let count = format!("{} 件", playlists.entries.len());
-        let body = match playlists.entries.get(playlists.selected) {
-            Some(entry) => format!("{count}  |  {}", entry.title),
-            None => count,
-        };
-        format!("{}{body}", self.background_marker())
     }
 
     /// プレイリスト名は検索欄に出ないので、チャンネルと同じく状態行の先頭に出す。
@@ -1567,30 +1529,6 @@ mod tests {
     }
 
     #[test]
-    fn the_playlists_selection_wraps_around_like_the_results() {
-        let mut list = PlaylistsView {
-            entries: vec![entry("PL1", "作業用BGM"), entry("PL2", "あとで見る")],
-            selected: 0,
-            loaded: true,
-        };
-
-        list.select_next();
-        assert_eq!(list.selected, 1);
-        list.select_next();
-        assert_eq!(list.selected, 0, "末尾から下は先頭へ");
-        list.select_prev();
-        assert_eq!(list.selected, 1, "先頭から上は末尾へ");
-    }
-
-    #[test]
-    fn an_empty_playlists_list_has_nothing_to_select() {
-        let mut list = PlaylistsView::default();
-        list.select_next();
-        list.select_prev();
-        assert_eq!(list.selected, 0);
-    }
-
-    #[test]
     fn the_view_follows_the_open_playlist_and_leaves_the_search_results_alone() {
         let mut app = playlist_app();
         app.playlist.as_mut().expect("playlist").state.results =
@@ -1710,19 +1648,6 @@ mod tests {
         let line = app.status_line();
         assert!(line.contains("作業用BGM"), "{line}");
         assert!(line.contains("1 件"), "{line}");
-    }
-
-    #[test]
-    fn the_status_line_counts_the_playlists_on_the_list_screen() {
-        // 一覧画面が数えるのは動画ではなくプレイリストの件数。
-        let mut app = playlist_app();
-        app.playlist = None;
-        app.mode = Mode::Playlists;
-        app.playlists.as_mut().expect("playlists").selected = 1;
-
-        let line = app.status_line();
-        assert!(line.contains("2 件"), "{line}");
-        assert!(line.contains("あとで見る"), "{line}");
     }
 
     #[test]

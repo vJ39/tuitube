@@ -1,6 +1,6 @@
 //! Session を動かすアクション。キー入力もイベント処理もここを通して player を触る。
 
-use crate::app::{App, AppEvent, ChannelView, Mode, Playback, PlaylistView, PlaylistsView};
+use crate::app::{App, AppEvent, ChannelView, Mode, Playback};
 use crate::clipboard::{Clipboard, MISSING_PBCOPY};
 use crate::comments;
 use crate::cookies::Target;
@@ -10,7 +10,7 @@ use crate::geometry::{cell_size, geometry_for, video_geometry};
 use crate::grid::{self, Dir};
 use crate::mpv::{self, MpvCommand, MpvController};
 use crate::oauth;
-use crate::search::{self, PlaylistEntry, RealYtDlp, SearchResult, YtDlp};
+use crate::search::{self, RealYtDlp, SearchResult, YtDlp};
 use crate::seekbar::{SeekBarState, clamp_target};
 use crate::settings;
 use crate::settings::MAX_SEARCH_LIMIT;
@@ -42,9 +42,6 @@ pub const COPIED_NOTICE: &str = "URL をコピーしました";
 pub const CHANNEL_LOOKUP_NOTICE: &str = "チャンネル情報を取得中…";
 /// 引いても channel_id が無かったときの文言。
 pub const NO_CHANNEL_NOTICE: &str = "このチャンネルへは移動できません";
-/// プレイリスト一覧が 0 件だったときの文言。cookie 無しでも失敗せず空で返るので理由を添える。
-pub const NO_PLAYLISTS_NOTICE: &str =
-    "プレイリストがありません (cookie が YouTube にログイン済みか確認してください)";
 /// 非表示にしたことを伝える文言。
 pub const HIDDEN_VIDEO_NOTICE: &str = "この動画を非表示にしました";
 pub const HIDDEN_CHANNEL_NOTICE: &str = "このチャンネルを非表示にしました";
@@ -270,7 +267,7 @@ pub async fn end_playback(app: &mut App, session: &mut Session, error: Option<St
 
 /// 検索側のどのモードへ戻すかの共通基準。再生の終了・バックグラウンド化と、
 /// 一段深い画面から抜ける操作が同じ基準を使う。深い方から順に見る。
-fn search_return_mode(app: &App) -> Mode {
+pub(crate) fn search_return_mode(app: &App) -> Mode {
     if app.channel.is_some() {
         Mode::Channel
     } else if app.playlist.is_some() {
@@ -348,7 +345,7 @@ fn start_tab_search_with_limit<R>(
     spawn_search(app, tx, session, target, limit, runner);
 }
 
-fn spawn_search<R>(
+pub(crate) fn spawn_search<R>(
     app: &mut App,
     tx: &UnboundedSender<AppEvent>,
     session: &mut Session,
@@ -781,162 +778,6 @@ pub fn leave_channel(app: &mut App, session: &mut Session) {
     app.mode = search_return_mode(app);
 }
 
-/// プレイリスト一覧を取りに行って一覧画面へ移る。
-pub fn open_playlists(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
-    open_playlists_with(app, tx, session, RealYtDlp);
-}
-
-pub fn open_playlists_with<R>(
-    app: &mut App,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-    runner: R,
-) where
-    R: YtDlp + Send + Sync + 'static,
-{
-    // 走っている検索の結果は、戻ってくるまでに行き先が変わっている。
-    cancel_search(app, session);
-    // 戻ったときに同じ位置から続けられるよう、検索側の選択を控える。
-    app.store_to_tab();
-    app.playlists = Some(PlaylistsView::default());
-    app.mode = Mode::Playlists;
-    app.set_error(None);
-    // 一覧は結果集合の外にある入れ物なので sync_from_view は通さない。通すと
-    // 貼ってある検索結果のサムネイルを捨て、戻ったときに貼り直す合図も出ない。
-    // 画像はそのままだと一覧の行に重なるので、剥がすだけ頼む。
-    session.owe_clear = true;
-    app.searching = true;
-    let nonce = session.search_nonce;
-    let timeout = app.settings.search.timeout;
-    let cookies = app.cookies.for_search().cloned();
-    let tx = tx.clone();
-    session.search_task = Some(tokio::spawn(async move {
-        let entries = search::fetch_playlists(&runner, cookies.as_ref(), timeout).await;
-        let _ = tx.send(AppEvent::PlaylistsReady { nonce, entries });
-    }));
-}
-
-/// 届いた一覧を取り込む。一覧を閉じた後に届いた分は捨てる。
-pub fn apply_playlists_ready(
-    app: &mut App,
-    session: &mut Session,
-    nonce: u64,
-    entries: Result<Vec<PlaylistEntry>, String>,
-) {
-    if nonce != session.search_nonce {
-        return;
-    }
-    session.search_task = None;
-    app.searching = false;
-    let Some(playlists) = app.playlists.as_mut() else {
-        return;
-    };
-    match entries {
-        Ok(entries) => {
-            playlists.entries = entries;
-            playlists.selected = 0;
-            playlists.loaded = true;
-            // cookie が無くても yt-dlp は失敗せず空で返るので、0 件はここで理由を出す。
-            if playlists.entries.is_empty() {
-                app.set_notice(Some(NO_PLAYLISTS_NOTICE.to_string()));
-            }
-        }
-        Err(reason) => app.set_error(Some(reason)),
-    }
-}
-
-/// 選択中のプレイリストの中身を取りに行って動画一覧へ移る。
-pub fn open_playlist(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
-    open_playlist_with(app, tx, session, RealYtDlp);
-}
-
-pub fn open_playlist_with<R>(
-    app: &mut App,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-    runner: R,
-) where
-    R: YtDlp + Send + Sync + 'static,
-{
-    let Some(entry) = app
-        .playlists
-        .as_ref()
-        .and_then(|playlists| playlists.entries.get(playlists.selected))
-    else {
-        return;
-    };
-    // 取り込み先が要るので、検索を積む前に開いておく。
-    app.playlist = Some(PlaylistView::new(entry.id.clone(), entry.title.clone()));
-    app.mode = Mode::Playlist;
-    app.set_error(None);
-    app.sync_from_view();
-    start_playlist_search_with(app, tx, session, runner);
-}
-
-/// 開いているプレイリストの中身を取りに行く。
-fn start_playlist_search_with<R>(
-    app: &mut App,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-    runner: R,
-) where
-    R: YtDlp + Send + Sync + 'static,
-{
-    let Some(target) = app.playlist.as_ref().map(PlaylistView::target) else {
-        return;
-    };
-    // 件数は Target::Playlist 側が PLAYLIST_LIMIT を渡す。ここの値は控えの鍵にしか効かない。
-    spawn_search(app, tx, session, target, app.settings.search.limit, runner);
-}
-
-/// プレイリストの中身から一覧へ戻る。一覧は持っているので取り直さない。
-pub fn leave_playlist(app: &mut App, session: &mut Session) {
-    if app.playlist.is_none() {
-        return;
-    }
-    // 結果が検索側のタブへ流れ込まないよう、先に打ち切る。
-    cancel_search(app, session);
-    app.playlist = None;
-    app.set_error(None);
-    app.sync_from_view();
-    app.mode = Mode::Playlists;
-}
-
-/// プレイリスト一覧を畳んで元の検索画面へ戻る。
-pub fn leave_playlists(app: &mut App, session: &mut Session) {
-    if app.playlists.is_none() {
-        return;
-    }
-    // 一覧だけ畳むと、戻る先を失ったプレイリストが開いたまま残る。
-    leave_playlist(app, session);
-    cancel_search(app, session);
-    app.playlists = None;
-    app.set_error(None);
-    // 一覧を出すときに剥がしただけで、控えは残っている。貼り直しを頼む。
-    app.thumbs.mark_dirty();
-    app.mode = search_return_mode(app);
-}
-
-pub fn reload_playlist(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
-    reload_playlist_with(app, tx, session, RealYtDlp);
-}
-
-/// 開いているプレイリストを取り直す。骨格は reload_channel_tab_with と同じ。
-pub fn reload_playlist_with<R>(
-    app: &mut App,
-    tx: &UnboundedSender<AppEvent>,
-    session: &mut Session,
-    runner: R,
-) where
-    R: YtDlp + Send + Sync + 'static,
-{
-    if app.playlist.is_none() {
-        return;
-    }
-    request_reload(app);
-    start_playlist_search_with(app, tx, session, runner);
-}
-
 pub fn switch_channel_tab(
     app: &mut App,
     tx: &UnboundedSender<AppEvent>,
@@ -1059,7 +900,7 @@ pub fn reload_channel_tab_with<R>(
 }
 
 /// 取り直しを頼む。打ち切られても印は残るので、次の入口も控えを出さずに取りに行く。
-fn request_reload(app: &mut App) {
+pub(crate) fn request_reload(app: &mut App) {
     let state = app.view_state_mut();
     state.loaded = false;
     state.reload = true;
@@ -1307,7 +1148,7 @@ pub enum CommentScroll {
 
 /// 先行の検索を打ち切る。nonce を進めるので、届いてしまった結果は捨てられる
 /// (kill_on_drop で子プロセスも落ちる)。
-fn cancel_search(app: &mut App, session: &mut Session) {
+pub(crate) fn cancel_search(app: &mut App, session: &mut Session) {
     if let Some(task) = session.search_task.take() {
         task.abort();
     }
@@ -1694,6 +1535,7 @@ pub async fn stop_playback(session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::PlaylistView;
     use crate::clipboard::fixtures::{CopyResult, FakeClipboard};
     use crate::comments::CommentState;
     use crate::cookies::{ChannelTab, CookieSource, CookieState, Feed};
@@ -1703,6 +1545,9 @@ mod tests {
     use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
     use crate::rgb::RgbImage;
+    use crate::screen::playlists::{
+        PlaylistsView, apply_playlists_ready, open_playlist_with, open_playlists_with,
+    };
     use crate::screen::settings::{close_settings, open_settings, save_settings_to};
     use crate::search::fixtures::{FakeYtDlp, Step, done};
     use crate::search::{ChannelRef, PlaylistEntry, SearchResult};
@@ -4209,257 +4054,6 @@ mod tests {
     /// 開いているプレイリストの target。set_results へ渡す。
     fn playlist_target(app: &App) -> Target {
         app.playlist.as_ref().expect("playlist").target()
-    }
-
-    #[tokio::test]
-    async fn open_playlists_reads_the_playlists_feed_and_shows_the_list() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = grid_app(2);
-        app.selected = 1;
-        let runner = FakeYtDlp::new([done(0, PLAYLIST_LINES, "")]);
-
-        open_playlists_with(&mut app, &tx, &mut session, runner.clone());
-
-        assert_eq!(app.mode, Mode::Playlists);
-        assert!(app.searching, "取りに行っている間はそう見せる");
-        assert!(!app.playlists.as_ref().expect("一覧へ移る").loaded);
-        assert_eq!(app.result_ids(), ["id0", "id1"], "検索結果は残す");
-        assert_eq!(app.tabs.state().selected, 1, "戻る位置を控える");
-
-        finish_playlists(&mut app, &mut rx, &mut session).await;
-
-        assert_eq!(runner.calls(), [search::playlists_args(None)]);
-        let playlists = app.playlists.as_ref().expect("一覧が入る");
-        assert_eq!(
-            playlists.entries,
-            [entry("PL1", "作業用BGM"), entry("PL2", "あとで見る")]
-        );
-        assert_eq!(playlists.selected, 0);
-        assert!(playlists.loaded);
-        assert!(!app.searching);
-    }
-
-    #[tokio::test]
-    async fn an_empty_playlists_list_is_told_as_a_notice_not_an_error() {
-        // cookie が無くても yt-dlp は失敗せず空で返るので、件数でなく理由を出す。
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = grid_app(2);
-
-        open_playlists_with(
-            &mut app,
-            &tx,
-            &mut session,
-            FakeYtDlp::new([done(0, "", "")]),
-        );
-        finish_playlists(&mut app, &mut rx, &mut session).await;
-
-        assert_eq!(app.notice.as_deref(), Some(NO_PLAYLISTS_NOTICE));
-        assert_eq!(app.error, None);
-        assert_eq!(app.mode, Mode::Playlists);
-        assert!(app.playlists.as_ref().expect("一覧は開いたまま").loaded);
-    }
-
-    #[tokio::test]
-    async fn a_failed_playlists_list_shows_the_reason() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = grid_app(2);
-
-        open_playlists_with(
-            &mut app,
-            &tx,
-            &mut session,
-            FakeYtDlp::new([done(1, "", "ERROR: Sign in to confirm\n")]),
-        );
-        finish_playlists(&mut app, &mut rx, &mut session).await;
-
-        let error = app.error.as_deref().expect("理由を出す");
-        assert!(error.contains("Sign in to confirm"), "{error}");
-        assert!(!app.playlists.as_ref().expect("一覧は開いたまま").loaded);
-        assert!(!app.searching);
-    }
-
-    #[tokio::test]
-    async fn a_playlists_list_that_arrives_after_leaving_is_dropped() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = grid_app(2);
-        open_playlists_with(
-            &mut app,
-            &tx,
-            &mut session,
-            FakeYtDlp::new([done(0, PLAYLIST_LINES, "")]),
-        );
-        finish_search(&mut session).await;
-        let Ok(AppEvent::PlaylistsReady { nonce, entries }) = rx.try_recv() else {
-            panic!("PlaylistsReady のはず");
-        };
-        leave_playlists(&mut app, &mut session);
-
-        apply_playlists_ready(&mut app, &mut session, nonce, entries);
-
-        assert!(app.playlists.is_none(), "閉じた一覧へは書き戻さない");
-        assert_eq!(app.mode, Mode::Results);
-    }
-
-    #[tokio::test]
-    async fn open_playlist_searches_the_videos_of_the_selected_playlist() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = playlists_app(&tx, &mut rx, &mut session).await;
-        app.playlists.as_mut().expect("一覧").selected = 1;
-        let runner = FakeYtDlp::new([done(0, "", "")]);
-
-        open_playlist_with(&mut app, &tx, &mut session, runner.clone());
-
-        assert_eq!(app.mode, Mode::Playlist);
-        let playlist = app.playlist.as_ref().expect("中身へ移る");
-        assert_eq!(playlist.playlist_id, "PL2");
-        assert_eq!(playlist.playlist_title, "あとで見る");
-        assert!(app.playlists.is_some(), "一覧は残す");
-        assert!(app.searching);
-
-        finish_search(&mut session).await;
-        let args = runner.calls();
-        assert_eq!(args[0][0], "https://www.youtube.com/playlist?list=PL2");
-        assert!(args[0].iter().any(|a| a == "--playlist-end"), "{args:?}");
-    }
-
-    #[tokio::test]
-    async fn open_playlist_does_nothing_without_a_row_to_open() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = grid_app(2);
-        open_playlists_with(&mut app, &tx, &mut session, StubYtDlp);
-
-        // まだ 1 件も届いていない一覧で Enter を押しても、中身は開かない。
-        open_playlist_with(&mut app, &tx, &mut session, StubYtDlp);
-
-        assert!(app.playlist.is_none());
-        assert_eq!(app.mode, Mode::Playlists);
-    }
-
-    #[tokio::test]
-    async fn leaving_a_playlist_returns_to_the_list_without_reading_it_again() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = playlists_app(&tx, &mut rx, &mut session).await;
-        open_playlist_with(&mut app, &tx, &mut session, StubYtDlp);
-        let running = session.search_nonce;
-        app.set_results(vec![result("v0")], &playlist_target(&app));
-
-        leave_playlist(&mut app, &mut session);
-
-        assert!(app.playlist.is_none());
-        assert_eq!(app.mode, Mode::Playlists);
-        assert_eq!(
-            app.playlists.as_ref().expect("一覧は残す").entries,
-            [entry("PL1", "作業用BGM"), entry("PL2", "あとで見る")]
-        );
-        assert!(session.search_task.is_none(), "一覧を取り直さない");
-        assert_ne!(session.search_nonce, running, "走らせたままにしない");
-        assert!(!app.searching);
-    }
-
-    #[tokio::test]
-    async fn leaving_the_playlists_list_returns_to_the_search_results() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = playlists_app(&tx, &mut rx, &mut session).await;
-
-        leave_playlists(&mut app, &mut session);
-
-        assert!(app.playlists.is_none());
-        assert_eq!(app.mode, Mode::Results);
-        assert_eq!(app.view_result_ids(), ["id0", "id1"]);
-        assert_eq!(app.view_selected(), 1, "元の選択へ戻る");
-        assert!(!app.searching);
-    }
-
-    #[tokio::test]
-    async fn leaving_the_playlists_list_folds_an_open_playlist_too() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = playlists_app(&tx, &mut rx, &mut session).await;
-        open_playlist_with(&mut app, &tx, &mut session, StubYtDlp);
-
-        leave_playlists(&mut app, &mut session);
-
-        assert!(app.playlist.is_none(), "中身も閉じる");
-        assert!(app.playlists.is_none());
-        assert_eq!(app.mode, Mode::Results);
-    }
-
-    #[tokio::test]
-    async fn leaving_the_playlists_list_without_results_returns_to_input() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = App::default();
-        open_playlists_with(&mut app, &tx, &mut session, StubYtDlp);
-
-        leave_playlists(&mut app, &mut session);
-        assert_eq!(app.mode, Mode::Input, "検索結果が無ければ入力へ戻る");
-    }
-
-    #[tokio::test]
-    async fn the_search_thumbnails_survive_a_trip_into_the_playlists_list() {
-        // 一覧は検索結果とは別の入れ物なので、行き帰りで貼ってある画像を捨てない。
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = grid_app(2);
-        let image = RgbImage::new(2, 2, vec![0; 12]).expect("長さは合っている");
-        app.thumbs
-            .apply(vec![("id0".to_string(), Ok(image))], (144, 80));
-
-        open_playlists_with(
-            &mut app,
-            &tx,
-            &mut session,
-            FakeYtDlp::new([done(0, PLAYLIST_LINES, "")]),
-        );
-        finish_playlists(&mut app, &mut rx, &mut session).await;
-        assert!(app.thumbs.get("id0").is_some(), "一覧へ移っても捨てない");
-        assert!(session.owe_clear, "一覧の行に画像が重なったままにしない");
-
-        leave_playlists(&mut app, &mut session);
-        assert!(app.thumbs.get("id0").is_some(), "取り直しは要らない");
-        assert!(app.thumbs.take_dirty(), "剥がした画像は戻ったら貼り直す");
-    }
-
-    #[tokio::test]
-    async fn reloading_a_playlist_searches_it_again() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = playlists_app(&tx, &mut rx, &mut session).await;
-        open_playlist_with(&mut app, &tx, &mut session, StubYtDlp);
-        session.search_task.take().expect("タスク").abort();
-        // 取れなかったプレイリストも読み込み済みで残ることがある。そこからでも取り直せる。
-        app.set_results(Vec::new(), &playlist_target(&app));
-        assert!(app.playlist.as_ref().expect("playlist").state.loaded);
-
-        reload_playlist_with(&mut app, &tx, &mut session, StubYtDlp);
-
-        assert!(
-            session.search_task.is_some(),
-            "同じプレイリストを取りに行く"
-        );
-        assert!(!app.playlist.as_ref().expect("playlist").state.loaded);
-        assert!(app.searching);
-        assert_eq!(app.mode, Mode::Playlist);
-    }
-
-    #[tokio::test]
-    async fn reloading_does_nothing_outside_a_playlist() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut session = Session::default();
-        let mut app = playlists_app(&tx, &mut rx, &mut session).await;
-
-        reload_playlist_with(&mut app, &tx, &mut session, StubYtDlp);
-
-        assert!(session.search_task.is_none());
-        assert!(!app.searching);
     }
 
     #[tokio::test]

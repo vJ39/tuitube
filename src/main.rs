@@ -421,7 +421,7 @@ async fn handle_event(
             actions::start_engagement(app, tx, session);
         }
         AppEvent::PlaylistsReady { nonce, entries } => {
-            actions::apply_playlists_ready(app, session, nonce, entries);
+            screen::playlists::apply_playlists_ready(app, session, nonce, entries);
         }
         AppEvent::MpvProperty { nonce, id, data } => {
             if session.player.as_ref().is_some_and(|p| p.nonce == nonce) {
