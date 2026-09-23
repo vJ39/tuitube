@@ -1,16 +1,15 @@
 //! キー・マウス入力の振り分け。Session を触る操作は actions.rs のアクションへ渡す。
 
 use crate::actions::{
-    CommentScroll, Oauth, SEEK_STEP_SECS, Session, adjust_settings_value, change_speed,
-    close_download, close_settings, config_path_from_env, copy_url_with, cycle_display_mode,
-    enter_background, hide_current_channel, hide_selected, leave_background, leave_channel,
-    leave_playlist, leave_playlists, like_video, load_more, move_download_focus, move_selection,
-    move_settings_selection, open_channel, open_download, open_playlist, open_playlists,
-    open_settings, reload_channel_tab, reload_playlist, reload_tab, remember_playback_position,
-    reset_speed, save_settings, scroll_comments, seek_absolute, seek_relative, select_channel_tab,
-    select_tab, send_to_player, start_download, start_playback, start_search, stop_playback,
-    subscribe_channel, subscribe_playing_channel, switch_channel_tab, switch_tab, toggle_comments,
-    toggle_search_layout, toggle_subtitles,
+    CommentScroll, Oauth, SEEK_STEP_SECS, Session, change_speed, close_download,
+    config_path_from_env, copy_url_with, cycle_display_mode, enter_background,
+    hide_current_channel, hide_selected, leave_background, leave_channel, leave_playlist,
+    leave_playlists, like_video, load_more, move_download_focus, move_selection, open_channel,
+    open_download, open_playlist, open_playlists, reload_channel_tab, reload_playlist, reload_tab,
+    remember_playback_position, reset_speed, scroll_comments, seek_absolute, seek_relative,
+    select_channel_tab, select_tab, send_to_player, start_download, start_playback, start_search,
+    stop_playback, subscribe_channel, subscribe_playing_channel, switch_channel_tab, switch_tab,
+    toggle_comments, toggle_search_layout, toggle_subtitles,
 };
 use crate::app::{App, AppEvent, DownloadField, Mode};
 use crate::clipboard::{Clipboard, Pbcopy};
@@ -20,6 +19,7 @@ use crate::grid::Dir;
 use crate::mpv::{self, MpvCommand};
 use crate::oauth;
 use crate::query::QueryEditor;
+use crate::screen::settings::{self as settings_screen, is_settings_key, open_settings};
 use crate::seekbar::{MouseAction, MouseInput};
 use crate::ui;
 use crate::video::CellSize;
@@ -66,7 +66,7 @@ pub async fn handle_key(
         Mode::Results => handle_key_results(app, key, tx, session).await,
         Mode::Channel => handle_key_channel(app, key, tx, session).await,
         Mode::Playing => handle_key_playing(app, key, tx, session).await,
-        Mode::Settings => handle_key_settings(app, key),
+        Mode::Settings => settings_screen::handle_key_settings(app, key),
         Mode::Download => handle_key_download(app, key, tx, session).await,
         Mode::Playlists => handle_key_playlists(app, key, tx, session).await,
         Mode::Playlist => handle_key_playlist(app, key, tx, session).await,
@@ -295,11 +295,6 @@ async fn handle_key_playlist_with(
     }
 }
 
-/// 設定画面を開くキー。Ctrl+S はどちらの検索画面でも使える。
-fn is_settings_key(c: char, modifiers: KeyModifiers) -> bool {
-    modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'s')
-}
-
 /// バックグラウンド中に前面へ戻すキー。入力欄では b も検索語なので Ctrl 付きだけを見る。
 fn is_leave_background_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'b')
@@ -313,112 +308,6 @@ fn is_playlists_key(c: char, modifiers: KeyModifiers) -> bool {
 /// 検索語を全選択するキー。
 fn is_select_all_key(c: char, modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'a')
-}
-
-/// 設定画面の操作。保存以外は app.settings をその場で書き換えるだけ。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettingsAction {
-    Move(i32),
-    Adjust(i32),
-    Save,
-    Close,
-}
-
-/// 設定画面のキーと操作の対応表。
-fn settings_action(code: KeyCode) -> Option<SettingsAction> {
-    match code {
-        KeyCode::Up => Some(SettingsAction::Move(-1)),
-        KeyCode::Down => Some(SettingsAction::Move(1)),
-        KeyCode::Left => Some(SettingsAction::Adjust(-1)),
-        // Enter / Space は bool の切替に要る。選択肢や数値では → と同じ扱い。
-        KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => Some(SettingsAction::Adjust(1)),
-        KeyCode::Char('s') => Some(SettingsAction::Save),
-        KeyCode::Esc | KeyCode::Char('q') => Some(SettingsAction::Close),
-        _ => None,
-    }
-}
-
-/// 数値項目へ数字を打ち込んでいる間の操作。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditAction {
-    Push(char),
-    Backspace,
-    Commit,
-    Cancel,
-}
-
-/// 修飾キーの付かない数字キー。Ctrl+3 や Alt+3 は設定画面では何もしないままにする。
-fn plain_digit(key: KeyEvent) -> Option<char> {
-    let modified = key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-    match key.code {
-        KeyCode::Char(c) if c.is_ascii_digit() && !modified => Some(c),
-        _ => None,
-    }
-}
-
-/// 打ち込み中のキーと操作の対応表。ここに無いキーは打ち込みを邪魔しないよう捨てる。
-fn settings_edit_action(key: KeyEvent) -> Option<EditAction> {
-    if let Some(c) = plain_digit(key) {
-        return Some(EditAction::Push(c));
-    }
-    match key.code {
-        KeyCode::Backspace => Some(EditAction::Backspace),
-        KeyCode::Enter => Some(EditAction::Commit),
-        KeyCode::Esc => Some(EditAction::Cancel),
-        _ => None,
-    }
-}
-
-fn handle_key_settings(app: &mut App, key: KeyEvent) {
-    // 打ち込んでいる間は他のキーを通さない。抜けるのは Enter か Esc だけ。
-    if app.settings_edit.is_some() {
-        if let Some(action) = settings_edit_action(key) {
-            apply_settings_edit(app, action);
-        }
-        return;
-    }
-    // 数値項目での数字キーは打ち込みの始まり。選択肢の行では今までどおり効かない。
-    if let Some(c) = plain_digit(key)
-        && app.settings_item().is_numeric()
-    {
-        app.settings_edit = Some(c.to_string());
-        return;
-    }
-    match settings_action(key.code) {
-        Some(SettingsAction::Move(delta)) => move_settings_selection(app, delta),
-        Some(SettingsAction::Adjust(delta)) => adjust_settings_value(app, delta),
-        Some(SettingsAction::Save) => save_settings(app, std::time::Instant::now()),
-        Some(SettingsAction::Close) => close_settings(app),
-        None => {}
-    }
-}
-
-fn apply_settings_edit(app: &mut App, action: EditAction) {
-    match action {
-        // 上限の桁数で止める。それ以上はパースできず、Enter が効かないように見える。
-        EditAction::Push(c) => {
-            let digits = app.settings_item().max_digits();
-            if let Some(buffer) = app.settings_edit.as_mut()
-                && buffer.len() < digits
-            {
-                buffer.push(c);
-            }
-        }
-        EditAction::Backspace => {
-            if let Some(buffer) = app.settings_edit.as_mut() {
-                buffer.pop();
-            }
-        }
-        // 読めない入力は黙って捨てる。設定画面には知らせを消す機会が少ない。
-        EditAction::Commit => {
-            if let Some(raw) = app.settings_edit.take() {
-                app.settings_item().apply_numeric(&mut app.settings, &raw);
-            }
-        }
-        EditAction::Cancel => app.settings_edit = None,
-    }
 }
 
 /// ダウンロード画面の操作。yt-dlp を実際に起動させないよう Downloader を差し替えられる形。
@@ -3459,351 +3348,6 @@ mod tests {
         assert_eq!(app.mode, Mode::Playing);
         assert!(sent.lock().expect("溜め込み先").is_empty());
         assert!(app.subtitles.wanted(), "小文字 s の字幕とは別のキー");
-    }
-
-    #[test]
-    fn the_settings_keys_map_to_their_actions() {
-        assert_eq!(settings_action(KeyCode::Up), Some(SettingsAction::Move(-1)));
-        assert_eq!(
-            settings_action(KeyCode::Down),
-            Some(SettingsAction::Move(1))
-        );
-        assert_eq!(
-            settings_action(KeyCode::Left),
-            Some(SettingsAction::Adjust(-1))
-        );
-        assert_eq!(
-            settings_action(KeyCode::Right),
-            Some(SettingsAction::Adjust(1))
-        );
-        assert_eq!(
-            settings_action(KeyCode::Enter),
-            Some(SettingsAction::Adjust(1))
-        );
-        assert_eq!(
-            settings_action(KeyCode::Char(' ')),
-            Some(SettingsAction::Adjust(1))
-        );
-        assert_eq!(
-            settings_action(KeyCode::Char('s')),
-            Some(SettingsAction::Save)
-        );
-        assert_eq!(settings_action(KeyCode::Esc), Some(SettingsAction::Close));
-        assert_eq!(
-            settings_action(KeyCode::Char('q')),
-            Some(SettingsAction::Close)
-        );
-        // 開くのに使う S では保存しない。
-        assert_eq!(settings_action(KeyCode::Char('S')), None);
-        assert_eq!(settings_action(KeyCode::Tab), None);
-        assert_eq!(settings_action(KeyCode::Char('x')), None);
-    }
-
-    #[tokio::test]
-    async fn the_settings_keys_move_the_selection_and_change_the_value() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App::default();
-        handle_key(&mut app, ctrl(KeyCode::Char('s')), &tx, &mut session).await;
-
-        handle_key(&mut app, key(KeyCode::Down), &tx, &mut session).await;
-        assert_eq!(app.settings_selected, 1);
-        handle_key(&mut app, key(KeyCode::Right), &tx, &mut session).await;
-        assert_eq!(
-            app.settings.display.quality,
-            crate::display::Quality::default().next()
-        );
-        // ← は前の値へ戻す。
-        handle_key(&mut app, key(KeyCode::Left), &tx, &mut session).await;
-        assert_eq!(
-            app.settings.display.quality,
-            crate::display::Quality::default()
-        );
-
-        handle_key(&mut app, key(KeyCode::Up), &tx, &mut session).await;
-        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
-        assert_eq!(app.settings.display.mode, DisplayMode::default().next());
-
-        // 設定画面では文字は検索語にならない。
-        handle_key(&mut app, key(KeyCode::Char('x')), &tx, &mut session).await;
-        assert!(app.query.text().is_empty());
-
-        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
-        assert_eq!(app.mode, Mode::Input, "保存せず閉じる");
-        assert_eq!(
-            app.settings,
-            crate::settings::Settings::default(),
-            "閉じたら編集前へ戻す"
-        );
-    }
-
-    #[test]
-    fn the_typing_keys_map_to_their_actions() {
-        for c in ['0', '5', '9'] {
-            assert_eq!(
-                settings_edit_action(key(KeyCode::Char(c))),
-                Some(EditAction::Push(c))
-            );
-        }
-        assert_eq!(
-            settings_edit_action(key(KeyCode::Backspace)),
-            Some(EditAction::Backspace)
-        );
-        assert_eq!(
-            settings_edit_action(key(KeyCode::Enter)),
-            Some(EditAction::Commit)
-        );
-        assert_eq!(
-            settings_edit_action(key(KeyCode::Esc)),
-            Some(EditAction::Cancel)
-        );
-        // 打ち込んでいる間は移動も保存も終了も効かない。抜けるのは Enter か Esc。
-        for code in [
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::Char(' '),
-            KeyCode::Char('s'),
-            KeyCode::Char('q'),
-            KeyCode::Tab,
-        ] {
-            assert_eq!(settings_edit_action(key(code)), None, "{code:?}");
-        }
-        // 修飾キー付きの数字は数字として扱わない。
-        for modifiers in [
-            KeyModifiers::CONTROL,
-            KeyModifiers::ALT,
-            KeyModifiers::SUPER,
-        ] {
-            let event = KeyEvent::new(KeyCode::Char('3'), modifiers);
-            assert_eq!(settings_edit_action(event), None, "{modifiers:?}");
-        }
-    }
-
-    /// 設定画面を開き、上から index 番目の行を選んだところまで進める。
-    async fn settings_at(
-        index: usize,
-        tx: &UnboundedSender<AppEvent>,
-        session: &mut Session,
-    ) -> App {
-        let mut app = App::default();
-        handle_key(&mut app, ctrl(KeyCode::Char('s')), tx, session).await;
-        for _ in 0..index {
-            handle_key(&mut app, key(KeyCode::Down), tx, session).await;
-        }
-        assert_eq!(app.settings_selected, index);
-        app
-    }
-
-    /// 数字を順に打ち込む。
-    async fn type_digits(
-        app: &mut App,
-        digits: &str,
-        tx: &UnboundedSender<AppEvent>,
-        session: &mut Session,
-    ) {
-        for c in digits.chars() {
-            handle_key(app, key(KeyCode::Char(c)), tx, session).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn a_digit_on_a_number_row_types_the_value_and_enter_writes_it() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(2, &tx, &mut session).await;
-        assert_eq!(app.settings_item().label(), "fps_cap");
-
-        type_digits(&mut app, "30", &tx, &mut session).await;
-        assert_eq!(app.settings_edit.as_deref(), Some("30"));
-        assert_eq!(
-            app.settings.fps_cap,
-            crate::settings::Settings::default().fps_cap,
-            "確定するまで設定は変えない"
-        );
-
-        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
-        assert_eq!(app.settings.fps_cap, crate::display::FpsCap::new(30));
-        assert_eq!(app.settings_edit, None);
-        assert_eq!(app.mode, Mode::Settings, "確定しても画面は閉じない");
-    }
-
-    #[tokio::test]
-    async fn a_digit_on_a_choice_row_is_ignored() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(0, &tx, &mut session).await;
-        assert_eq!(app.settings_item().label(), "display.mode");
-
-        type_digits(&mut app, "3", &tx, &mut session).await;
-
-        assert_eq!(app.settings_edit, None);
-        assert_eq!(app.settings, crate::settings::Settings::default());
-    }
-
-    #[tokio::test]
-    async fn backspace_takes_back_a_digit_and_an_empty_enter_changes_nothing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(6, &tx, &mut session).await;
-        assert_eq!(app.settings_item().label(), "search.limit");
-
-        type_digits(&mut app, "12", &tx, &mut session).await;
-        handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
-        assert_eq!(app.settings_edit.as_deref(), Some("1"));
-
-        // 空になっても打ち込み中のまま。消しすぎても画面は変わらない。
-        for _ in 0..2 {
-            handle_key(&mut app, key(KeyCode::Backspace), &tx, &mut session).await;
-            assert_eq!(app.settings_edit.as_deref(), Some(""));
-        }
-
-        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
-        assert_eq!(app.settings_edit, None);
-        assert_eq!(
-            app.settings.search.limit,
-            crate::settings::Settings::default().search.limit
-        );
-    }
-
-    #[tokio::test]
-    async fn a_number_beyond_the_range_is_pulled_back_to_the_edge() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(6, &tx, &mut session).await;
-
-        type_digits(&mut app, "9999", &tx, &mut session).await;
-        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
-
-        assert_eq!(app.settings.search.limit, crate::settings::MAX_SEARCH_LIMIT);
-    }
-
-    #[tokio::test]
-    async fn escape_while_typing_only_drops_what_was_typed() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(2, &tx, &mut session).await;
-        type_digits(&mut app, "90", &tx, &mut session).await;
-
-        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
-        assert_eq!(app.settings_edit, None);
-        assert_eq!(app.mode, Mode::Settings, "1 回目は画面を閉じない");
-        assert_eq!(app.settings, crate::settings::Settings::default());
-
-        // 打ち込みを抜けた後の Esc は今までどおり設定画面を閉じる。
-        handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
-        assert_eq!(app.mode, Mode::Input);
-    }
-
-    #[tokio::test]
-    async fn the_other_keys_do_nothing_while_a_number_is_being_typed() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(6, &tx, &mut session).await;
-        type_digits(&mut app, "1", &tx, &mut session).await;
-
-        for code in [
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::Char(' '),
-            KeyCode::Char('q'),
-            KeyCode::Tab,
-        ] {
-            handle_key(&mut app, key(code), &tx, &mut session).await;
-        }
-
-        assert_eq!(app.settings_selected, 6, "行は動かさない");
-        assert_eq!(app.settings_edit.as_deref(), Some("1"));
-        assert_eq!(app.settings, crate::settings::Settings::default());
-        assert_eq!(app.mode, Mode::Settings);
-        assert!(!app.should_quit);
-    }
-
-    #[tokio::test]
-    async fn a_digit_with_a_modifier_does_not_start_or_feed_the_typing() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(6, &tx, &mut session).await;
-
-        for modifiers in [KeyModifiers::ALT, KeyModifiers::SUPER] {
-            let event = KeyEvent::new(KeyCode::Char('3'), modifiers);
-            handle_key(&mut app, event, &tx, &mut session).await;
-            assert_eq!(
-                app.settings_edit, None,
-                "{modifiers:?} で打ち込みが始まった"
-            );
-        }
-        // Ctrl+3 も同じ。Ctrl+C だけが最上位で終了に割り当ててある。
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
-            &tx,
-            &mut session,
-        )
-        .await;
-        assert_eq!(app.settings_edit, None);
-
-        // 打ち込み中に来ても桁は増えない。
-        type_digits(&mut app, "1", &tx, &mut session).await;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
-            &tx,
-            &mut session,
-        )
-        .await;
-        assert_eq!(app.settings_edit.as_deref(), Some("1"));
-    }
-
-    #[tokio::test]
-    async fn the_typing_stops_at_the_digits_the_value_can_take() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(6, &tx, &mut session).await;
-        assert_eq!(app.settings_item().label(), "search.limit");
-
-        // 上限 1000 の 4 桁まで。キーリピートで伸び続けると Enter が効かなくなる。
-        type_digits(&mut app, "999999", &tx, &mut session).await;
-        assert_eq!(app.settings_edit.as_deref(), Some("9999"));
-
-        handle_key(&mut app, key(KeyCode::Enter), &tx, &mut session).await;
-        assert_eq!(app.settings.search.limit, crate::settings::MAX_SEARCH_LIMIT);
-    }
-
-    #[tokio::test]
-    async fn opening_and_closing_the_settings_drops_a_half_typed_number() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = settings_at(6, &tx, &mut session).await;
-        type_digits(&mut app, "12", &tx, &mut session).await;
-
-        // 打ち込み中のまま画面を離れても、次に開いたときは通常の操作から始める。
-        close_settings(&mut app);
-        assert_eq!(app.settings_edit, None);
-
-        app.settings_edit = Some("34".to_string());
-        open_settings(&mut app, &mut session);
-        assert_eq!(app.settings_edit, None);
-        assert_eq!(app.settings, crate::settings::Settings::default());
-    }
-
-    #[tokio::test]
-    async fn q_closes_the_settings_instead_of_quitting_the_app() {
-        let (tx, _rx) = channel();
-        let mut session = Session::default();
-        let mut app = App {
-            mode: Mode::Results,
-            results: vec![result("a")],
-            ..App::default()
-        };
-        handle_key(&mut app, key(KeyCode::Char('S')), &tx, &mut session).await;
-        handle_key(&mut app, key(KeyCode::Char('q')), &tx, &mut session).await;
-
-        assert!(!app.should_quit);
-        assert_eq!(app.mode, Mode::Results);
     }
 
     #[tokio::test]

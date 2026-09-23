@@ -2,7 +2,6 @@
 
 use crate::app::{
     App, AppEvent, ChannelView, DownloadField, Mode, Playback, PlaylistView, PlaylistsView,
-    SETTINGS_ITEMS,
 };
 use crate::clipboard::{Clipboard, MISSING_PBCOPY};
 use crate::comments;
@@ -1638,30 +1637,6 @@ pub async fn apply_resize_with<F>(
     }
 }
 
-/// 設定画面へ入る。開いた元のモードは close_settings が戻り先に使う。
-pub fn open_settings(app: &mut App, session: &mut Session) {
-    app.settings_return = app.mode;
-    app.mode = Mode::Settings;
-    app.settings_selected = app.settings_selected.min(SETTINGS_ITEMS.len() - 1);
-    // 打ち込みかけの数字を持ち越さない。残ると開いた直後から打ち込み中になる。
-    app.settings_edit = None;
-    // Esc の戻り先。保存していない編集は、この値で捨てる。
-    app.settings_backup = app.settings.clone();
-    // 貼ってあるサムネイルは ratatui の差分描画では消えないので、設定の行に重ならないよう剥がす。
-    session.owe_clear = true;
-}
-
-/// 保存せず閉じる。編集した値は開いた時点 (保存していればその時点) の値へ戻す。
-/// search.limit や search.layout はセッション中に読み直されるので、残すと
-/// 「保存しなければ何も変わらない」と食い違う。
-pub fn close_settings(app: &mut App) {
-    app.settings = app.settings_backup.clone();
-    app.settings_edit = None;
-    app.mode = app.settings_return;
-    // 開くときに剥がしたサムネイルを貼り直す。
-    app.thumbs.mark_dirty();
-}
-
 /// ダウンロード画面へ入る。Results/Channel は選択中の行、Playing は再生中の動画が対象。
 /// 対象を選べない (一覧が空) ときは何もしない。
 pub fn open_download(app: &mut App, session: &mut Session) {
@@ -1769,57 +1744,11 @@ fn cancel_download(session: &mut Session) {
     session.download_nonce += 1;
 }
 
-/// ↑↓ の選択移動。行数が少ないので端では巻き戻す。
-pub fn move_settings_selection(app: &mut App, delta: i32) {
-    let count = SETTINGS_ITEMS.len();
-    let current = app.settings_selected.min(count - 1);
-    app.settings_selected = if delta < 0 {
-        (current + count - 1) % count
-    } else {
-        (current + 1) % count
-    };
-}
-
-/// ←→ (と Enter / Space) の値変更。変えるのは選択中の行だけ。
-pub fn adjust_settings_value(app: &mut App, delta: i32) {
-    app.settings_item().adjust(&mut app.settings, delta);
-}
-
-/// s での保存。設定ファイルの場所は起動時と同じ規則で決める。
-pub fn save_settings(app: &mut App, now: std::time::Instant) {
-    save_settings_to(app, config_path_from_env().as_deref(), now);
-}
-
 /// 設定ファイルの置き場。起動時と同じ規則で決める。
 pub fn config_path_from_env() -> Option<std::path::PathBuf> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
     let home = std::env::var_os("HOME");
     settings::config_path(xdg.as_deref(), home.as_deref())
-}
-
-/// 保存先を差し替えられる形。テストはここに一時ファイルを渡して利用者の設定を書き換えない。
-/// 成否どちらも期限つきで出す。設定画面にはポーリングが無く、素の error は消す機会が無い。
-pub fn save_settings_to(app: &mut App, path: Option<&Path>, now: std::time::Instant) {
-    let Some(path) = path else {
-        app.set_temporary_error(NO_CONFIG_PATH.to_string(), now);
-        return;
-    };
-    // 環境変数が効いている項目はファイル側の値のまま書く。一時的な指定を焼き付けない。
-    let to_write = app.env_overridden.restore(&app.settings);
-    // display.mode は app.display (今の実行中の値) と別物で、次回起動でしか動かない。
-    // 設定画面での編集だけでは今の画面に何も起きないので、保存の知らせに添えて伝える。
-    let display_mode_deferred = app.settings.display.mode != app.display;
-    match settings::save_to(path, &to_write) {
-        Ok(()) => {
-            // 保存した内容が Esc の戻り先になる。
-            app.settings_backup = app.settings.clone();
-            app.set_temporary_notice(
-                saved_notice(path, &app.env_overridden, display_mode_deferred),
-                now,
-            );
-        }
-        Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
-    }
 }
 
 /// w での自動保存。設定画面の s と違い保存を意図した操作ではないので、
@@ -1839,7 +1768,7 @@ fn save_display_mode(
         Ok(()) => {
             app.settings.display.mode = mode;
             // 保存した値が Esc の戻り先になる。他の項目は開いた時点の値のまま残す。
-            app.settings_backup.display.mode = mode;
+            app.settings_screen.backup.display.mode = mode;
         }
         Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
     }
@@ -1857,36 +1786,12 @@ pub fn toggle_search_layout(app: &mut App, config: Option<&Path>, now: std::time
         Ok(()) => {
             app.settings.search.layout = layout;
             // 保存した値が Esc の戻り先になる。他の項目は開いた時点の値のまま残す。
-            app.settings_backup.search.layout = layout;
+            app.settings_screen.backup.search.layout = layout;
             // 画像は ratatui の Buffer と別レイヤーなので、テキスト側を描き直すだけでは
             // 古いサムネイルが残る。grid → list, list → grid のどちらでも貼り直させる。
             app.thumbs.mark_dirty();
         }
         Err(e) => app.set_temporary_error(format!("設定を保存できません: {e}"), now),
-    }
-}
-
-/// 保存できた旨。書き換えなかった項目があれば、その名前も出す。
-fn saved_notice(
-    path: &Path,
-    overridden: &settings::EnvOverridden,
-    display_mode_deferred: bool,
-) -> String {
-    let saved = format!("{} に保存しました", path.display());
-    let mut notes = Vec::new();
-    if !overridden.is_empty() {
-        notes.push(format!(
-            "{} は環境変数の指定中で書き換えません",
-            overridden.keys().join("、")
-        ));
-    }
-    if display_mode_deferred {
-        notes.push("display.mode は次回起動から反映されます".to_string());
-    }
-    if notes.is_empty() {
-        saved
-    } else {
-        format!("{saved} ({})", notes.join("。"))
     }
 }
 
@@ -1909,6 +1814,7 @@ mod tests {
     use crate::oauth::fixtures::FakeBackend;
     use crate::query::QueryEditor;
     use crate::rgb::RgbImage;
+    use crate::screen::settings::{close_settings, open_settings, save_settings_to};
     use crate::search::fixtures::{FakeYtDlp, Step, done};
     use crate::search::{ChannelRef, PlaylistEntry, SearchResult};
     use crate::settings::{DisplaySettings, Settings};
@@ -2770,7 +2676,7 @@ mod tests {
         let _sent = record(&mut session, Ok(()));
         cycle_to(&mut app, &mut session, &path).await;
         assert_eq!(
-            app.settings_backup.display.mode,
+            app.settings_screen.backup.display.mode,
             DisplayMode::Text,
             "保存した内容が Esc の戻り先になる"
         );
@@ -2797,7 +2703,10 @@ mod tests {
         assert!(error.contains("保存できません"), "{error}");
         // 保存できていないので、次の保存で焼き付く値も Esc の戻り先も切り替える前のまま。
         assert_eq!(app.settings.display.mode, DisplayMode::Embedded);
-        assert_eq!(app.settings_backup.display.mode, DisplayMode::Embedded);
+        assert_eq!(
+            app.settings_screen.backup.display.mode,
+            DisplayMode::Embedded
+        );
     }
 
     #[tokio::test]
@@ -2911,7 +2820,7 @@ mod tests {
         let mut session = Session::default();
         toggle_search_layout(&mut app, Some(&path), std::time::Instant::now());
         assert_eq!(
-            app.settings_backup.search.layout,
+            app.settings_screen.backup.search.layout,
             LayoutMode::List,
             "保存した内容が Esc の戻り先になる"
         );
@@ -2938,7 +2847,7 @@ mod tests {
         assert!(error.contains("保存できません"), "{error}");
         // 保存できていないので、settings も Esc の戻り先も切り替える前のまま。
         assert_eq!(app.settings.search.layout, LayoutMode::Grid);
-        assert_eq!(app.settings_backup.search.layout, LayoutMode::Grid);
+        assert_eq!(app.settings_screen.backup.search.layout, LayoutMode::Grid);
     }
 
     #[test]
@@ -6116,253 +6025,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
-    }
-
-    #[test]
-    fn the_settings_screen_returns_to_the_mode_it_was_opened_from() {
-        for origin in [Mode::Input, Mode::Results, Mode::Channel] {
-            let mut session = Session::default();
-            let mut app = App {
-                mode: origin,
-                ..App::default()
-            };
-            open_settings(&mut app, &mut session);
-            assert_eq!(app.mode, Mode::Settings);
-
-            close_settings(&mut app);
-            assert_eq!(app.mode, origin, "{origin:?} から開いた");
-        }
-    }
-
-    #[test]
-    fn opening_the_settings_takes_the_thumbnails_off_the_screen() {
-        let mut session = Session::default();
-        let mut app = grid_app(4);
-        app.thumbs.take_dirty();
-
-        open_settings(&mut app, &mut session);
-        assert!(session.owe_clear, "貼ってある画像を剥がす");
-
-        close_settings(&mut app);
-        assert!(app.thumbs.take_dirty(), "戻ったら貼り直す");
-    }
-
-    #[test]
-    fn the_settings_selection_wraps_at_both_ends() {
-        let mut app = App::default();
-        move_settings_selection(&mut app, -1);
-        assert_eq!(app.settings_selected, SETTINGS_ITEMS.len() - 1);
-        move_settings_selection(&mut app, 1);
-        assert_eq!(app.settings_selected, 0);
-        move_settings_selection(&mut app, 1);
-        assert_eq!(app.settings_selected, 1);
-
-        // 壊れた値で入ってきても一覧の中に戻す。
-        app.settings_selected = 99;
-        move_settings_selection(&mut app, 1);
-        assert!(app.settings_selected < SETTINGS_ITEMS.len());
-    }
-
-    #[test]
-    fn adjusting_changes_only_the_selected_row() {
-        let mut app = App {
-            settings_selected: 2,
-            ..App::default()
-        };
-        adjust_settings_value(&mut app, 1);
-
-        assert_eq!(
-            app.settings.fps_cap.map(crate::display::FpsCap::get),
-            Some(20)
-        );
-        let untouched = Settings::default();
-        assert_eq!(app.settings.display, untouched.display);
-        assert_eq!(app.settings.search, untouched.search);
-        assert_eq!(app.settings.thumbnails, untouched.thumbnails);
-    }
-
-    #[test]
-    fn closing_without_saving_throws_the_edits_away() {
-        // search.limit や layout はセッション中に読み直されるので、残すと
-        // 「保存しなければ変わらない」という案内と食い違う。
-        let mut session = Session::default();
-        let mut app = App {
-            mode: Mode::Results,
-            ..App::default()
-        };
-        open_settings(&mut app, &mut session);
-        app.settings.search.limit = 25;
-        app.settings.search.layout = crate::grid::LayoutMode::List;
-        app.settings.thumbnails.enabled = false;
-
-        close_settings(&mut app);
-        assert_eq!(app.settings, Settings::default(), "開いた時点へ戻す");
-        assert_eq!(app.mode, Mode::Results);
-    }
-
-    #[test]
-    fn what_was_saved_survives_a_later_escape() {
-        let dir = settings_temp_dir("save-then-close");
-        let path = dir.join("config.toml");
-        let mut session = Session::default();
-        let mut app = App::default();
-
-        open_settings(&mut app, &mut session);
-        app.settings.search.limit = 25;
-        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
-        // 保存した後の編集だけを捨てる。
-        app.settings.search.limit = 40;
-        close_settings(&mut app);
-
-        assert_eq!(app.settings.search.limit, 25);
-    }
-
-    #[test]
-    fn saving_a_changed_display_mode_notes_it_takes_effect_on_next_launch() {
-        // 設定画面での編集は app.settings.display.mode だけを進める。
-        // app.display (今の実行中の値) は次回起動まで動かないので、その旨を保存の知らせに添える。
-        let dir = settings_temp_dir("save-display-mode-deferred");
-        let path = dir.join("config.toml");
-        let mut app = App::default();
-        assert_eq!(app.display, crate::display::DisplayMode::Embedded);
-        app.settings.display.mode = crate::display::DisplayMode::Window;
-
-        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
-
-        assert!(
-            app.notice
-                .as_deref()
-                .is_some_and(|n| n.contains("次回起動")),
-            "{:?}",
-            app.notice
-        );
-    }
-
-    #[test]
-    fn saving_an_unchanged_display_mode_does_not_mention_next_launch() {
-        let dir = settings_temp_dir("save-display-mode-unchanged");
-        let path = dir.join("config.toml");
-        let mut app = App::default();
-        app.settings.search.limit = 25;
-
-        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
-
-        assert!(
-            app.notice
-                .as_deref()
-                .is_some_and(|n| !n.contains("次回起動")),
-            "{:?}",
-            app.notice
-        );
-    }
-
-    #[test]
-    fn saving_leaves_the_values_the_environment_is_holding_alone() {
-        let dir = settings_temp_dir("save-env");
-        let path = dir.join("config.toml");
-        let mut app = App {
-            mode: Mode::Settings,
-            // 環境変数が 60 を指している。ファイルには 15 が書いてある。
-            env_overridden: crate::settings::EnvOverridden {
-                fps_cap: Some(crate::display::FpsCap::new(15)),
-                ..crate::settings::EnvOverridden::default()
-            },
-            ..App::default()
-        };
-        app.settings.fps_cap = crate::display::FpsCap::new(60);
-        app.settings.search.limit = 25;
-        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
-
-        let written = std::fs::read_to_string(&path).expect("読める");
-        assert!(written.contains("fps_cap = 15"), "ファイルの値のまま");
-        assert!(!written.contains("fps_cap = 60"), "{written}");
-        assert!(written.contains("limit = 25"), "他の行の編集は保存する");
-
-        let notice = app.notice.clone().expect("保存した旨を出す");
-        assert!(notice.contains("fps_cap"), "{notice}");
-        assert!(app.error.is_none());
-    }
-
-    #[test]
-    fn a_browser_the_environment_switched_off_is_not_written_back() {
-        // TUITUBE_COOKIES=none で開いた状態。s を押しても browser 行を消さない。
-        let dir = settings_temp_dir("save-cookies");
-        let path = dir.join("config.toml");
-        let browser = CookieSource::from_spec(Some("chrome"));
-        let mut app = App {
-            env_overridden: crate::settings::EnvOverridden {
-                cookies: Some(browser.clone()),
-                ..crate::settings::EnvOverridden::default()
-            },
-            ..App::default()
-        };
-        assert_eq!(app.settings.cookies, None, "実行中は連携なし");
-        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
-
-        let written = std::fs::read_to_string(&path).expect("読める");
-        // 指定なしのときは `# browser = "chrome"` という例がコメントで出るので、
-        // 生きている行かどうかまで見ないと消えたことに気づけない。
-        assert!(
-            written
-                .lines()
-                .any(|line| line.trim() == "browser = \"chrome\""),
-            "{written}"
-        );
-        let notice = app.notice.clone().expect("保存した旨を出す");
-        assert!(notice.contains("cookies.browser"), "{notice}");
-    }
-
-    #[test]
-    fn saving_writes_the_edited_settings_to_the_file() {
-        let dir = settings_temp_dir("save");
-        let path = dir.join("config.toml");
-        let mut app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        app.settings.search.limit = 25;
-        save_settings_to(&mut app, Some(&path), std::time::Instant::now());
-
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("読める"),
-            crate::settings::render(&app.settings)
-        );
-        let notice = app.notice.clone().expect("保存した旨を出す");
-        assert!(notice.contains("config.toml"), "{notice}");
-        assert!(app.error.is_none());
-        assert_eq!(app.mode, Mode::Settings, "保存しても閉じない");
-    }
-
-    #[test]
-    fn a_save_that_cannot_write_reports_the_reason() {
-        let dir = settings_temp_dir("save-blocked");
-        let blocker = dir.join("blocked");
-        std::fs::write(&blocker, "ファイルなので中に書けない").expect("書ける");
-
-        let mut app = App::default();
-        save_settings_to(
-            &mut app,
-            Some(&blocker.join("config.toml")),
-            std::time::Instant::now(),
-        );
-        let error = app.error.clone().expect("理由を出す");
-        assert!(error.contains("保存できません"), "{error}");
-        assert!(app.notice.is_none());
-
-        // 置き場が分からないときも黙って失敗しない。
-        let mut app = App::default();
-        save_settings_to(&mut app, None, std::time::Instant::now());
-        assert_eq!(app.error.as_deref(), Some(NO_CONFIG_PATH));
-    }
-
-    #[test]
-    fn a_save_error_disappears_on_its_own() {
-        // ポーリングの無い画面なので、期限つきで出さないと消す機会が無い。
-        let t0 = std::time::Instant::now();
-        let mut app = App::default();
-        save_settings_to(&mut app, None, t0);
-        app.expire_error(t0 + crate::app::NOTICE_TTL);
-        assert!(app.error.is_none());
     }
 
     const COMMENTS_JSON: &str = r#"{"id":"abc","comments":[{"author":"alice","text":"first"}]}"#;

@@ -6,6 +6,7 @@ use crate::display::DisplayMode;
 use crate::geometry::cell_size;
 use crate::grid::{self, LayoutMode};
 use crate::query::QueryEditor;
+use crate::screen::settings as settings_screen;
 use crate::seekbar::{SeekBar, SeekBarLayout, label_text, label_width};
 use crate::video::CellSize;
 use ratatui::Frame;
@@ -107,7 +108,7 @@ fn layout_for(screen: Rect, duration: Option<f64>) -> SeekBarLayout {
 pub fn draw(frame: &mut Frame, app: &App) {
     match app.mode {
         Mode::Playing => draw_playing(frame, app),
-        Mode::Settings => draw_settings(frame, app),
+        Mode::Settings => settings_screen::draw_settings(frame, app),
         Mode::Download => draw_download(frame, app),
         // チャンネルもプレイリストも同じ 5 段の画面。
         // 中身の参照先だけが app.channel / app.playlist へ移る。
@@ -115,82 +116,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
             draw_search(frame, app)
         }
     }
-}
-
-/// 設定画面は [タイトル, 項目, ステータス, ヘルプ] の4段。項目に残り全体を渡す。
-pub fn settings_areas(area: Rect) -> [Rect; 4] {
-    Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .areas(area)
-}
-
-const SETTINGS_TITLE: &str = "設定 (s で保存。Esc は編集を捨てて戻る)";
-/// 打ち込み中は s が効かず、Esc も打ち込みを捨てるだけで画面は閉じない。
-const SETTINGS_TYPING_TITLE: &str = "設定 (数値を打ち込み中)";
-/// 選択中の行の目印。カーソルの桁を数えるときも同じ幅を足す。
-const SETTINGS_MARKER: &str = "> ";
-
-/// タイトルもヘルプ行と同じ条件で切り替える。片方だけ残すと案内が食い違う。
-fn settings_title(app: &App) -> &'static str {
-    if app.settings_edit.is_some() {
-        SETTINGS_TYPING_TITLE
-    } else {
-        SETTINGS_TITLE
-    }
-}
-
-fn draw_settings(frame: &mut Frame, app: &App) {
-    let areas = settings_areas(frame.area());
-    frame.render_widget(
-        Paragraph::new(settings_title(app)).style(Style::default().add_modifier(Modifier::BOLD)),
-        areas[0],
-    );
-
-    let mut rows = app.settings_rows();
-    let selected = app.settings_selected.min(rows.len().saturating_sub(1));
-    // 打ち込み中の行は値だけを差し替える。行末に足してある断りはそのまま残す。
-    if let Some(raw) = &app.settings_edit
-        && let Some(row) = rows.get_mut(selected)
-    {
-        let item = app.settings_item();
-        let note = row
-            .strip_prefix(&item.row(&app.settings))
-            .unwrap_or_default()
-            .to_string();
-        *row = format!("{}: {}{note}", item.label(), raw);
-    }
-    let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
-    let list = List::new(items)
-        .highlight_symbol(SETTINGS_MARKER)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    frame.render_stateful_widget(list, areas[1], &mut state);
-
-    draw_footer(frame, app, areas[2], areas[3]);
-
-    if let Some(raw) = &app.settings_edit {
-        let at = settings_cursor(frame.area(), selected, app.settings_item().label(), raw);
-        frame.set_cursor_position(at);
-    }
-}
-
-/// 打ち込み中の行のカーソル位置 (0 始まり)。
-/// 行数が入り切らない端末では一覧が送られて選択行が末尾に来るので、そこへ置く。
-pub fn settings_cursor(screen: Rect, index: usize, label: &str, raw: &str) -> (u16, u16) {
-    let area = settings_areas(screen)[1];
-    let text = format!("{SETTINGS_MARKER}{label}: {raw}");
-    let width = Span::raw(text.as_str()).width().min(u16::MAX as usize) as u16;
-    let x = area
-        .x
-        .saturating_add(width)
-        .min(area.right().saturating_sub(1));
-    let last = area.height.saturating_sub(1) as usize;
-    (x, area.y.saturating_add(index.min(last) as u16))
 }
 
 /// ダウンロード画面は設定画面と同じ [タイトル, 項目, ステータス, ヘルプ] の4段。
@@ -993,7 +918,7 @@ fn confirm_quit_hints() -> Vec<String> {
     vec!["y/Enter:終了".to_string(), "n/Esc:キャンセル".to_string()]
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
+pub(crate) fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
     // 終了確認中は、モード別の通知・エラー・ヒントより優先してこちらを出す。
     if app.confirm_quit {
         frame.render_widget(
@@ -1025,8 +950,8 @@ fn draw_footer(frame: &mut Frame, app: &App, status: Rect, help: Rect) {
 
 /// 今の画面の案内。設定画面で数値を打ち込んでいる間だけ、その操作へ差し替える。
 fn help_line(app: &App, width: u16) -> String {
-    if app.mode == Mode::Settings && app.settings_edit.is_some() {
-        return fit_hints(&settings_typing_hints(), width as usize);
+    if app.mode == Mode::Settings {
+        return settings_screen::settings_help(app, width as usize);
     }
     help_text(
         app.mode,
@@ -1071,7 +996,7 @@ fn help_text(
         Mode::Playlists => playlists_hints(background),
         Mode::Playlist => playlist_hints(background),
         Mode::Playing => playing_hints(display, comments_open, can_subscribe),
-        Mode::Settings => settings_hints(),
+        Mode::Settings => settings_screen::settings_hints(),
         Mode::Download => download_hints(),
     };
     fit_hints(&hints, width as usize)
@@ -1185,19 +1110,6 @@ fn playlist_hints(background: bool) -> Vec<String> {
     hints
 }
 
-/// 設定画面の案内。全部で 71 桁ほどで 80 桁端末に収まる。
-/// 幅が足りないと後ろから落ちるので、←→ でも代用できる直接入力は保存と終了の後ろに置く。
-fn settings_hints() -> Vec<String> {
-    vec![
-        "↑↓:選択".to_string(),
-        "←→:値変更".to_string(),
-        "Enter/Space:切替".to_string(),
-        "s:保存".to_string(),
-        "Esc:破棄して戻る".to_string(),
-        "0-9:直接入力".to_string(),
-    ]
-}
-
 /// ダウンロード画面の案内。全部で 40 桁ほど。
 fn download_hints() -> Vec<String> {
     vec![
@@ -1205,16 +1117,6 @@ fn download_hints() -> Vec<String> {
         "←→:カーソル/形式切替".to_string(),
         "Enter:開始".to_string(),
         "Esc:戻る".to_string(),
-    ]
-}
-
-/// 数値を打ち込んでいる間の案内。この間は他のキーが効かないので、抜け方を先に出す。
-fn settings_typing_hints() -> Vec<String> {
-    vec![
-        "Enter:確定".to_string(),
-        "Esc:取消".to_string(),
-        "0-9:入力".to_string(),
-        "BS:1字削除".to_string(),
     ]
 }
 
@@ -1254,7 +1156,7 @@ fn playing_hints(display: DisplayMode, comments_open: bool, can_subscribe: bool)
 
 /// 幅に入るところまでを空白 1 つでつなぐ。help は折り返さないので、
 /// 途中で切れた案内を出すより落とす。
-fn fit_hints(hints: &[String], width: usize) -> String {
+pub(crate) fn fit_hints(hints: &[String], width: usize) -> String {
     let mut line = String::new();
     for hint in hints {
         let next = if line.is_empty() {
@@ -3106,211 +3008,6 @@ mod tests {
         assert!(list.contains("title 1"), "{list}");
     }
 
-    #[test]
-    fn settings_rows_do_not_overlap_and_cover_the_screen() {
-        let area = Rect::new(0, 0, 80, 24);
-        let areas = settings_areas(area);
-        assert_eq!(areas[0], Rect::new(0, 0, 80, 1), "タイトルは 1 行");
-        assert_eq!(areas[1], Rect::new(0, 1, 80, 21), "項目に残り全部");
-        assert_eq!(areas[2], Rect::new(0, 22, 80, 1));
-        assert_eq!(areas[3], Rect::new(0, 23, 80, 1));
-        for pair in areas.windows(2) {
-            assert_eq!(pair[0].bottom(), pair[1].y, "{pair:?}");
-            assert_eq!(pair[0].width, area.width);
-        }
-    }
-
-    #[test]
-    fn settings_areas_survive_a_terminal_too_short_for_every_row() {
-        for height in 0..6 {
-            let area = Rect::new(0, 0, 40, height);
-            for rect in settings_areas(area) {
-                assert!(rect.bottom() <= area.bottom(), "{rect:?} / {area:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn settings_help_lists_the_keys_inside_80_columns() {
-        let help = help_80(Mode::Settings, DisplayMode::Embedded);
-        for key in [
-            "↑↓:選択",
-            "←→:値変更",
-            "Enter/Space:切替",
-            "s:保存",
-            // 閉じるだけでなく編集を捨てることが分かる文言にする。
-            "Esc:破棄して戻る",
-        ] {
-            assert!(help.contains(key), "{key} が落ちた: {help}");
-        }
-        assert!(grid::display_width(&help) <= 80, "{help}");
-        // 狭い端末では途中で切らず丸ごと落とす。
-        assert_eq!(
-            help_text(
-                Mode::Settings,
-                DisplayMode::Embedded,
-                false,
-                false,
-                false,
-                false,
-                0
-            ),
-            ""
-        );
-    }
-
-    #[test]
-    fn a_narrow_settings_help_drops_the_direct_input_before_the_way_out() {
-        // 直接入力を足す前の 5 つは 58 桁に収まる。足りないぶんは末尾から落とす。
-        let narrow = help_text(
-            Mode::Settings,
-            DisplayMode::Embedded,
-            false,
-            false,
-            false,
-            false,
-            58,
-        );
-        for key in ["↑↓:選択", "←→:値変更", "Enter/Space:切替", "s:保存"] {
-            assert!(narrow.contains(key), "{key} が落ちた: {narrow}");
-        }
-        assert!(narrow.contains("Esc:破棄して戻る"), "{narrow}");
-        assert!(!narrow.contains("0-9"), "{narrow}");
-        assert!(grid::display_width(&narrow) <= 58, "{narrow}");
-    }
-
-    #[test]
-    fn the_settings_screen_draws_every_row_and_marks_the_selection() {
-        let mut app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        app.settings_selected = 2;
-        let screen = rendered(&app, 80, 24);
-
-        for row in app.settings_rows() {
-            assert!(screen.contains(&row), "{row} がない:\n{screen}");
-        }
-        assert!(
-            screen.contains("> fps_cap"),
-            "選択中の行に印が出る:\n{screen}"
-        );
-        assert!(screen.contains("設定"), "タイトルが出る:\n{screen}");
-        assert!(screen.contains("s:保存"), "ヘルプが出る:\n{screen}");
-    }
-
-    /// search.limit の行を打ち込み中にした設定画面。
-    fn typing_app(raw: &str) -> App {
-        let mut app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        app.settings_selected = 6;
-        app.settings_edit = Some(raw.to_string());
-        app
-    }
-
-    #[test]
-    fn the_row_being_typed_shows_the_digits_instead_of_the_stored_value() {
-        let app = typing_app("12");
-        let screen = rendered(&app, 80, 24);
-
-        assert!(screen.contains("search.limit: 12"), "{screen}");
-        assert!(!screen.contains("search.limit: 10"), "{screen}");
-        // 打ち込んでいない行はそのまま。
-        assert!(screen.contains("fps_cap: 15"), "{screen}");
-        assert!(screen.contains("Enter:確定"), "案内も切り替わる:\n{screen}");
-    }
-
-    #[test]
-    fn the_row_being_typed_keeps_the_note_about_the_environment() {
-        // 環境変数が効いている断りは、値を打ち込んでいる間も消さない。
-        let mut app = App {
-            mode: Mode::Settings,
-            env_overridden: crate::settings::EnvOverridden {
-                fps_cap: Some(crate::display::FpsCap::new(30)),
-                ..crate::settings::EnvOverridden::default()
-            },
-            ..App::default()
-        };
-        app.settings_selected = 2;
-        app.settings_edit = Some("24".to_string());
-        let screen = rendered(&app, 120, 24);
-
-        assert!(screen.contains("fps_cap: 24"), "{screen}");
-        assert!(screen.contains(crate::settings::FPS_LIMIT_VAR), "{screen}");
-        assert!(screen.contains("保存しません"), "{screen}");
-    }
-
-    #[test]
-    fn the_title_stops_promising_the_save_and_close_keys_while_typing() {
-        // 打ち込み中は s も Esc も画面を閉じないので、タイトルにも出さない。
-        let app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        assert!(rendered(&app, 80, 24).contains("Esc は編集を捨てて戻る"));
-
-        let typing = rendered(&typing_app("12"), 80, 24);
-        assert!(!typing.contains("Esc は編集を捨てて戻る"), "{typing}");
-        assert!(typing.contains("打ち込み中"), "{typing}");
-    }
-
-    #[test]
-    fn an_emptied_row_shows_no_value_while_it_is_being_typed() {
-        let app = typing_app("");
-        let screen = rendered(&app, 80, 24);
-
-        assert!(screen.contains("search.limit:"), "{screen}");
-        assert!(!screen.contains("search.limit: 10"), "{screen}");
-    }
-
-    #[test]
-    fn the_cursor_follows_the_digits_on_the_row_being_typed() {
-        // "> search.limit: 12" の後ろ。行は項目欄の 6 行目。
-        assert_eq!(
-            settings_cursor(Rect::new(0, 0, 80, 24), 5, "search.limit", "12"),
-            (18, 6)
-        );
-        // 幅も高さも足りない端末でも画面の中に収める。
-        let screen = Rect::new(0, 0, 20, 5);
-        let (x, y) = settings_cursor(screen, 8, "thumbnails.max_cached", "123");
-        assert!(x < screen.width, "{x}");
-        assert!(y < screen.height, "{y}");
-    }
-
-    #[test]
-    fn the_settings_help_changes_while_a_number_is_typed() {
-        let app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        let normal = help_line(&app, 80);
-        assert!(normal.contains("0-9:直接入力"), "{normal}");
-        assert!(normal.contains("s:保存"), "{normal}");
-        assert!(grid::display_width(&normal) <= 80, "{normal}");
-
-        let typing = help_line(&typing_app("12"), 80);
-        for hint in ["0-9:入力", "BS:1字削除", "Enter:確定", "Esc:取消"] {
-            assert!(typing.contains(hint), "{hint} がない: {typing}");
-        }
-        assert!(!typing.contains("s:保存"), "保存は効かない: {typing}");
-        assert!(grid::display_width(&typing) <= 80, "{typing}");
-    }
-
-    #[test]
-    fn the_settings_screen_does_not_draw_the_search_boxes() {
-        // 検索画面の上に重ねず、設定だけの画面にする。
-        let app = App {
-            mode: Mode::Settings,
-            query: QueryEditor::from("ラーメン"),
-            ..App::default()
-        };
-        let screen = rendered(&app, 80, 24);
-        assert!(!screen.contains("ラーメン"), "{screen}");
-        assert!(!screen.contains("結果"), "{screen}");
-    }
-
     /// コメントを取り終えた再生画面。
     fn commented_app(list: Vec<crate::comments::Comment>) -> App {
         let mut app = App {
@@ -3472,7 +3169,7 @@ mod tests {
     #[test]
     fn download_areas_match_the_settings_screen_layout() {
         let area = Rect::new(0, 0, 80, 24);
-        assert_eq!(download_areas(area), settings_areas(area));
+        assert_eq!(download_areas(area), settings_screen::settings_areas(area));
     }
 
     #[test]

@@ -1,20 +1,17 @@
 use crate::category::{TabState, Tabs};
 use crate::comments::{Comment, Comments};
 use crate::cookies::{ChannelTab, CookieState, Target};
-use crate::display::{DisplayMode, FpsCap};
+use crate::display::DisplayMode;
 use crate::engagement::EngagementCache;
 use crate::hidden::Hidden;
 use crate::mpv::MpvCommand;
 use crate::query::QueryEditor;
 use crate::resume::Resume;
 use crate::rgb::RgbImage;
+use crate::screen::settings::{self as settings_screen, SettingsScreen};
 use crate::search::{ChannelRef, PlaylistEntry, SearchReport, SearchResult};
 use crate::seekbar::SeekBarState;
-use crate::settings::{
-    EnvOverridden, FPS_LIMIT_VAR, MAX_FPS_CAP, MAX_SEARCH_CACHE_TTL_SECS, MAX_SEARCH_LIMIT,
-    MAX_SEARCH_TIMEOUT_SECS, MAX_THUMB_TIMEOUT_SECS, MIN_SEARCH_CACHE_TTL_SECS, MIN_SEARCH_LIMIT,
-    MIN_SEARCH_TIMEOUT_SECS, Settings,
-};
+use crate::settings::{EnvOverridden, MAX_SEARCH_LIMIT, Settings};
 use crate::speed::{Polled, Speed};
 use crate::subtitles::SubtitleState;
 use crate::thumbs::Thumbs;
@@ -281,286 +278,6 @@ impl PlaylistView {
     }
 }
 
-/// 設定画面で編集できる項目。画面の並びはこの順。
-/// ここに無い値 (window.ontop 以外の window.* / cookies.* / mpv.extra_args /
-/// subtitles.lang / categories) は config.toml を直接編集する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsItem {
-    DisplayMode,
-    DisplayQuality,
-    FpsCap,
-    SubtitlesEnabled,
-    WindowOntop,
-    SearchLayout,
-    SearchLimit,
-    SearchTimeoutSecs,
-    SearchCacheEnabled,
-    SearchCacheTtlSecs,
-    ThumbnailsEnabled,
-    ThumbnailsMaxCached,
-    ThumbnailsTimeoutSecs,
-    DownloadDebug,
-}
-
-pub const SETTINGS_ITEMS: [SettingsItem; 14] = [
-    SettingsItem::DisplayMode,
-    SettingsItem::DisplayQuality,
-    SettingsItem::FpsCap,
-    SettingsItem::SubtitlesEnabled,
-    SettingsItem::WindowOntop,
-    SettingsItem::SearchLayout,
-    SettingsItem::SearchLimit,
-    SettingsItem::SearchTimeoutSecs,
-    SettingsItem::SearchCacheEnabled,
-    SettingsItem::SearchCacheTtlSecs,
-    SettingsItem::ThumbnailsEnabled,
-    SettingsItem::ThumbnailsMaxCached,
-    SettingsItem::ThumbnailsTimeoutSecs,
-    SettingsItem::DownloadDebug,
-];
-
-/// 数値項目の 1 回ぶんの刻み。
-const FPS_CAP_STEP: u64 = 5;
-const SEARCH_LIMIT_STEP: u64 = 1;
-const SEARCH_TIMEOUT_STEP: u64 = 5;
-const SEARCH_CACHE_TTL_STEP: u64 = 5;
-const MAX_CACHED_STEP: u64 = 50;
-const THUMB_TIMEOUT_STEP: u64 = 5;
-/// 0 秒では 1 枚も取れないので、秒数はここまでしか下げない。
-const MIN_THUMB_TIMEOUT_SECS: u64 = 1;
-/// max_cached に上限は無い。刻みの計算にだけ使う。
-const NO_MAX: u64 = u64::MAX;
-
-/// 刻みの次の目盛り。上限では止まる。
-fn step_up(current: u64, step: u64, max: u64) -> u64 {
-    (current / step * step).saturating_add(step).min(max)
-}
-
-/// 刻みの 1 つ前の目盛り。下限が刻みに乗っていなくても、目盛りの基準はずらさない。
-/// (例: 刻み 5 / 下限 1 で 5 → 1 → 5 と戻る)
-fn step_down(current: u64, step: u64, min: u64) -> u64 {
-    (current.saturating_sub(1) / step * step).max(min)
-}
-
-impl SettingsItem {
-    /// 設定ファイルのキーをそのまま出す。画面で見た項目を config.toml で探せるため。
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::DisplayMode => "display.mode",
-            Self::DisplayQuality => "display.quality",
-            Self::FpsCap => "fps_cap",
-            Self::SubtitlesEnabled => "subtitles.enabled",
-            Self::WindowOntop => "window.ontop",
-            Self::SearchLayout => "search.layout",
-            Self::SearchLimit => "search.limit",
-            Self::SearchTimeoutSecs => "search.timeout_secs",
-            Self::SearchCacheEnabled => "search.cache_enabled",
-            Self::SearchCacheTtlSecs => "search.cache_ttl_secs",
-            Self::ThumbnailsEnabled => "thumbnails.enabled",
-            Self::ThumbnailsMaxCached => "thumbnails.max_cached",
-            Self::ThumbnailsTimeoutSecs => "thumbnails.timeout_secs",
-            Self::DownloadDebug => "download.debug",
-        }
-    }
-
-    /// 値も設定ファイルの表記に合わせる。
-    pub fn value(self, settings: &Settings) -> String {
-        match self {
-            Self::DisplayMode => settings.display.mode.key().to_string(),
-            Self::DisplayQuality => settings.display.quality.label().to_string(),
-            Self::FpsCap => match settings.fps_cap {
-                Some(cap) => cap.get().to_string(),
-                None => "0 (無制限)".to_string(),
-            },
-            Self::SubtitlesEnabled => settings.subtitles.enabled.to_string(),
-            Self::WindowOntop => settings.window.ontop.to_string(),
-            Self::SearchLayout => settings.search.layout.key().to_string(),
-            Self::SearchLimit => settings.search.limit.to_string(),
-            Self::SearchTimeoutSecs => settings.search.timeout.as_secs().to_string(),
-            Self::SearchCacheEnabled => settings.search.cache_enabled.to_string(),
-            Self::SearchCacheTtlSecs => settings.search.cache_ttl.as_secs().to_string(),
-            Self::ThumbnailsEnabled => settings.thumbnails.enabled.to_string(),
-            Self::ThumbnailsMaxCached => settings.thumbnails.max_cached.to_string(),
-            Self::ThumbnailsTimeoutSecs => settings.thumbnails.timeout.as_secs().to_string(),
-            Self::DownloadDebug => settings.download.debug.to_string(),
-        }
-    }
-
-    pub fn row(self, settings: &Settings) -> String {
-        format!("{}: {}", self.label(), self.value(settings))
-    }
-
-    /// 環境変数が上書きしている項目なら、その変数名。保存では書き換えないので画面にも出す。
-    pub fn env_var(self, overridden: &EnvOverridden) -> Option<&'static str> {
-        match self {
-            Self::FpsCap => overridden.fps_cap.is_some().then_some(FPS_LIMIT_VAR),
-            _ => None,
-        }
-    }
-
-    /// 数字キーで値を直接打ち込める項目。選択肢と bool は ←→ だけで動かす。
-    pub fn is_numeric(self) -> bool {
-        matches!(
-            self,
-            Self::FpsCap
-                | Self::SearchLimit
-                | Self::SearchTimeoutSecs
-                | Self::SearchCacheTtlSecs
-                | Self::ThumbnailsMaxCached
-                | Self::ThumbnailsTimeoutSecs
-        )
-    }
-
-    /// 上限の桁数。これを超えた入力はパースできず捨てられるので、打ち込みはここで止める。
-    /// 数値でない項目は 0 桁 = 打ち込みを受けない。
-    pub fn max_digits(self) -> usize {
-        let max: u64 = match self {
-            Self::FpsCap => u64::from(MAX_FPS_CAP),
-            Self::SearchLimit => MAX_SEARCH_LIMIT as u64,
-            Self::SearchTimeoutSecs => MAX_SEARCH_TIMEOUT_SECS,
-            Self::SearchCacheTtlSecs => MAX_SEARCH_CACHE_TTL_SECS,
-            // max_cached に上限は無いので、apply_numeric が受け取れる最大値で数える。
-            Self::ThumbnailsMaxCached => u64::try_from(usize::MAX).unwrap_or(u64::MAX),
-            Self::ThumbnailsTimeoutSecs => MAX_THUMB_TIMEOUT_SECS,
-            Self::DisplayMode
-            | Self::DisplayQuality
-            | Self::SubtitlesEnabled
-            | Self::WindowOntop
-            | Self::SearchLayout
-            | Self::SearchCacheEnabled
-            | Self::ThumbnailsEnabled
-            | Self::DownloadDebug => return 0,
-        };
-        max.to_string().len()
-    }
-
-    /// 打ち込んだ値の確定。範囲は ←→ と同じで、外れていれば端へ寄せる。
-    /// 数として読めない入力と数値でない項目は何もせず false を返す。
-    pub fn apply_numeric(self, settings: &mut Settings, raw: &str) -> bool {
-        let Ok(value) = raw.parse::<u64>() else {
-            return false;
-        };
-        match self {
-            Self::FpsCap => {
-                // 0 は「制限なし」。FpsCap は 1 以上しか作れない。
-                settings.fps_cap = FpsCap::new(value.min(u64::from(MAX_FPS_CAP)) as u32);
-            }
-            Self::SearchLimit => {
-                let min = MIN_SEARCH_LIMIT as u64;
-                let max = MAX_SEARCH_LIMIT as u64;
-                settings.search.limit = value.clamp(min, max) as usize;
-            }
-            Self::SearchTimeoutSecs => {
-                let secs = value.clamp(MIN_SEARCH_TIMEOUT_SECS, MAX_SEARCH_TIMEOUT_SECS);
-                settings.search.timeout = Duration::from_secs(secs);
-            }
-            Self::SearchCacheTtlSecs => {
-                let secs = value.clamp(MIN_SEARCH_CACHE_TTL_SECS, MAX_SEARCH_CACHE_TTL_SECS);
-                settings.search.cache_ttl = Duration::from_secs(secs);
-            }
-            Self::ThumbnailsMaxCached => {
-                settings.thumbnails.max_cached = usize::try_from(value).unwrap_or(usize::MAX);
-            }
-            Self::ThumbnailsTimeoutSecs => {
-                let secs = value.clamp(MIN_THUMB_TIMEOUT_SECS, MAX_THUMB_TIMEOUT_SECS);
-                settings.thumbnails.timeout = Duration::from_secs(secs);
-            }
-            // 選択肢と bool は打ち込みを受けない。is_numeric() と対で書き分ける。
-            Self::DisplayMode
-            | Self::DisplayQuality
-            | Self::SubtitlesEnabled
-            | Self::WindowOntop
-            | Self::SearchLayout
-            | Self::SearchCacheEnabled
-            | Self::ThumbnailsEnabled
-            | Self::DownloadDebug => return false,
-        }
-        true
-    }
-
-    /// ←→ 1 回ぶんの変化。→ は次の値、← は前の値。bool はどちらでも反転する。
-    /// 数値は刻みの目盛りを動き、範囲の端で止まる (ラップしない)。
-    pub fn adjust(self, settings: &mut Settings, delta: i32) {
-        let up = delta >= 0;
-        match self {
-            Self::DisplayMode => {
-                let mode = settings.display.mode;
-                settings.display.mode = if up { mode.next() } else { mode.prev() };
-            }
-            Self::DisplayQuality => {
-                let quality = settings.display.quality;
-                settings.display.quality = if up { quality.next() } else { quality.prev() };
-            }
-            Self::FpsCap => {
-                let current = u64::from(settings.fps_cap.map(FpsCap::get).unwrap_or(0));
-                // 0 は「制限なし」。FpsCap は 1 以上しか作れない。
-                let next = step(current, FPS_CAP_STEP, 0, u64::from(MAX_FPS_CAP), up);
-                settings.fps_cap = FpsCap::new(next as u32);
-            }
-            Self::SubtitlesEnabled => settings.subtitles.enabled = !settings.subtitles.enabled,
-            Self::WindowOntop => settings.window.ontop = !settings.window.ontop,
-            Self::SearchLayout => {
-                let layout = settings.search.layout;
-                settings.search.layout = if up { layout.next() } else { layout.prev() };
-            }
-            Self::SearchLimit => {
-                let current = settings.search.limit as u64;
-                let min = MIN_SEARCH_LIMIT as u64;
-                let max = MAX_SEARCH_LIMIT as u64;
-                settings.search.limit = step(current, SEARCH_LIMIT_STEP, min, max, up) as usize;
-            }
-            Self::SearchTimeoutSecs => {
-                let current = settings.search.timeout.as_secs();
-                let min = MIN_SEARCH_TIMEOUT_SECS;
-                let secs = step(
-                    current,
-                    SEARCH_TIMEOUT_STEP,
-                    min,
-                    MAX_SEARCH_TIMEOUT_SECS,
-                    up,
-                );
-                settings.search.timeout = Duration::from_secs(secs);
-            }
-            Self::SearchCacheEnabled => {
-                settings.search.cache_enabled = !settings.search.cache_enabled;
-            }
-            Self::SearchCacheTtlSecs => {
-                let current = settings.search.cache_ttl.as_secs();
-                let secs = step(
-                    current,
-                    SEARCH_CACHE_TTL_STEP,
-                    MIN_SEARCH_CACHE_TTL_SECS,
-                    MAX_SEARCH_CACHE_TTL_SECS,
-                    up,
-                );
-                settings.search.cache_ttl = Duration::from_secs(secs);
-            }
-            Self::ThumbnailsEnabled => settings.thumbnails.enabled = !settings.thumbnails.enabled,
-            Self::ThumbnailsMaxCached => {
-                let current = settings.thumbnails.max_cached as u64;
-                settings.thumbnails.max_cached =
-                    step(current, MAX_CACHED_STEP, 0, NO_MAX, up) as usize;
-            }
-            Self::ThumbnailsTimeoutSecs => {
-                let current = settings.thumbnails.timeout.as_secs();
-                let min = MIN_THUMB_TIMEOUT_SECS;
-                let secs = step(current, THUMB_TIMEOUT_STEP, min, MAX_THUMB_TIMEOUT_SECS, up);
-                settings.thumbnails.timeout = Duration::from_secs(secs);
-            }
-            Self::DownloadDebug => settings.download.debug = !settings.download.debug,
-        }
-    }
-}
-
-/// 数値項目を 1 目盛りぶん動かす。
-fn step(current: u64, width: u64, min: u64, max: u64, up: bool) -> u64 {
-    if up {
-        step_up(current, width, max).max(min)
-    } else {
-        step_down(current, width, min).min(max)
-    }
-}
-
 /// シーク送信から確定までの先行表示。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PendingSeek {
@@ -671,15 +388,8 @@ pub struct App {
     pub comments: Comments,
     /// 格子の先頭表示位置 (項目インデックス)。描画のたびに列数で丸める。
     pub scroll: usize,
-    /// 設定画面で選んでいる行。SETTINGS_ITEMS の範囲へ丸めて使う。
-    pub settings_selected: usize,
-    /// 設定画面を開いた元のモード。閉じたらここへ戻る。
-    pub settings_return: Mode,
-    /// 設定画面を開いた時点 (または最後に保存した時点) の設定。Esc はここへ戻す。
-    pub settings_backup: Settings,
-    /// 数値項目へ打ち込んでいる途中の文字列。None なら通常表示。
-    /// settings へ書くのは確定したときだけなので、settings_backup とは別に持つ。
-    pub settings_edit: Option<String>,
+    /// 設定画面の状態。
+    pub settings_screen: SettingsScreen,
     /// 環境変数が上書きしている項目。画面の断りと、保存時の書き戻しに使う。
     pub env_overridden: EnvOverridden,
     /// ローカル非表示リスト。一覧へ入れる前にここで外す。
@@ -720,7 +430,10 @@ impl Default for App {
             speed: Speed::NORMAL,
             speed_sent_at: None,
             subtitles: SubtitleState::from_settings(&settings.subtitles),
-            settings_backup: settings.clone(),
+            settings_screen: SettingsScreen {
+                backup: settings.clone(),
+                ..SettingsScreen::default()
+            },
             settings,
             video: None,
             background: false,
@@ -737,9 +450,6 @@ impl Default for App {
             thumbs: Thumbs::default(),
             comments: Comments::default(),
             scroll: 0,
-            settings_selected: 0,
-            settings_return: Mode::Input,
-            settings_edit: None,
             env_overridden: EnvOverridden::default(),
             hidden: Hidden::default(),
             resume: Resume::default(),
@@ -989,7 +699,7 @@ impl App {
     /// 間は戻り先だけ書き換える。裏で終わった検索が、編集中の画面を閉じてしまわないため。
     pub fn enter_search_mode(&mut self, mode: Mode) {
         if self.mode == Mode::Settings {
-            self.settings_return = mode;
+            self.settings_screen.return_mode = mode;
         } else if self.mode == Mode::Download {
             self.download_return = mode;
         } else {
@@ -1132,26 +842,6 @@ impl App {
         None
     }
 
-    /// 選択中の設定項目。壊れた添字でも必ず 1 つ返す。
-    pub fn settings_item(&self) -> SettingsItem {
-        SETTINGS_ITEMS[self.settings_selected.min(SETTINGS_ITEMS.len() - 1)]
-    }
-
-    /// 設定画面に並べる `ラベル: 現在値` の行。
-    /// 環境変数が効いている行には、保存しても書き換わらない旨を添える。
-    pub fn settings_rows(&self) -> Vec<String> {
-        SETTINGS_ITEMS
-            .iter()
-            .map(|item| {
-                let row = item.row(&self.settings);
-                match item.env_var(&self.env_overridden) {
-                    Some(var) => format!("{row}  ({var} が指定中。保存しません)"),
-                    None => row,
-                }
-            })
-            .collect()
-    }
-
     /// 分岐は網羅する。モードを増やしたときの書き分け漏れをコンパイラに拾わせる。
     pub fn status_line(&self) -> String {
         let line = match self.mode {
@@ -1161,7 +851,7 @@ impl App {
             Mode::Channel => self.search_status(self.channel_status()),
             Mode::Playlists => self.search_status(self.playlists_status()),
             Mode::Playlist => self.search_status(self.playlist_status()),
-            Mode::Settings => self.settings_status(),
+            Mode::Settings => settings_screen::settings_status(self),
             Mode::Download => self.download_status(),
         };
         // エラーが出ている行に足すと読みにくいので、そのときは譲る。
@@ -1243,19 +933,6 @@ impl App {
             self.background_marker(),
             playlist.playlist_title,
             self.results_body()
-        )
-    }
-
-    /// 設定画面は保存の成否をここで返す。ポーリングが上書きしない画面なので、
-    /// エラーが出ていればそれだけを出す。
-    fn settings_status(&self) -> String {
-        if let Some(error) = &self.error {
-            return format!("エラー: {error}");
-        }
-        format!(
-            "設定 {}/{}",
-            self.settings_selected.min(SETTINGS_ITEMS.len() - 1) + 1,
-            SETTINGS_ITEMS.len()
         )
     }
 
@@ -1349,8 +1026,6 @@ pub fn format_time(seconds: Option<f64>) -> String {
 mod tests {
     use super::*;
     use crate::cookies::{ChannelTab, CookieSource, Feed};
-    use crate::display::{Quality, WindowOptions};
-    use crate::grid::LayoutMode;
     use crate::speed::Speed;
     use crate::subtitles::{SELECT_GRACE, SubtitleStatus};
     use serde_json::json;
@@ -2569,406 +2244,24 @@ mod tests {
         assert!(app.status_line().starts_with("状態不明"));
     }
 
-    /// 1 項目だけ動かした結果。他の行に触れていないことも見られるよう丸ごと返す。
-    fn adjusted(item: SettingsItem, delta: i32, settings: &Settings) -> Settings {
-        let mut next = settings.clone();
-        item.adjust(&mut next, delta);
-        next
-    }
-
-    #[test]
-    fn the_settings_screen_lists_every_editable_item_in_order() {
-        let labels: Vec<&str> = SETTINGS_ITEMS.iter().map(|item| item.label()).collect();
-        assert_eq!(
-            labels,
-            [
-                "display.mode",
-                "display.quality",
-                "fps_cap",
-                "subtitles.enabled",
-                "window.ontop",
-                "search.layout",
-                "search.limit",
-                "search.timeout_secs",
-                "search.cache_enabled",
-                "search.cache_ttl_secs",
-                "thumbnails.enabled",
-                "thumbnails.max_cached",
-                "thumbnails.timeout_secs",
-                "download.debug",
-            ]
-        );
-    }
-
-    #[test]
-    fn each_settings_row_shows_the_value_the_config_file_holds() {
-        // 行の値は設定ファイルの表記と揃える。画面で見た値をそのまま探せるため。
-        assert_eq!(
-            App::default().settings_rows(),
-            [
-                "display.mode: embedded",
-                "display.quality: medium",
-                "fps_cap: 15",
-                "subtitles.enabled: true",
-                "window.ontop: false",
-                "search.layout: grid",
-                "search.limit: 10",
-                "search.timeout_secs: 30",
-                "search.cache_enabled: false",
-                "search.cache_ttl_secs: 300",
-                "thumbnails.enabled: true",
-                "thumbnails.max_cached: 500",
-                "thumbnails.timeout_secs: 10",
-                "download.debug: false",
-            ]
-        );
-    }
-
-    #[test]
-    fn the_download_debug_toggle_flips_either_way() {
-        let mut settings = Settings::default();
-        for delta in [-1, 1] {
-            SettingsItem::DownloadDebug.adjust(&mut settings, delta);
-            assert!(settings.download.debug, "{delta}");
-            SettingsItem::DownloadDebug.adjust(&mut settings, delta);
-            assert!(!settings.download.debug, "{delta}");
-        }
-        assert!(!SettingsItem::DownloadDebug.is_numeric());
-        assert!(!SettingsItem::DownloadDebug.apply_numeric(&mut settings, "1"));
-    }
-
-    #[test]
-    fn an_unlimited_fps_cap_is_shown_as_zero() {
-        let mut app = App::default();
-        app.settings.fps_cap = None;
-        assert_eq!(app.settings_rows()[2], "fps_cap: 0 (無制限)");
-    }
-
-    #[test]
-    fn a_row_the_environment_holds_says_that_it_is_not_saved() {
-        // 環境変数が効いている間は保存でファイルへ書かないので、画面で断っておく。
-        let app = App {
-            env_overridden: EnvOverridden {
-                fps_cap: Some(FpsCap::new(30)),
-                ..EnvOverridden::default()
-            },
-            ..App::default()
-        };
-        let row = &app.settings_rows()[2];
-        assert!(row.starts_with("fps_cap: "), "{row}");
-        assert!(row.contains(FPS_LIMIT_VAR), "{row}");
-        assert!(row.contains("保存しません"), "{row}");
-
-        // 上書きされていない行には何も足さない。
-        assert_eq!(app.settings_rows()[6], "search.limit: 10");
-        assert_eq!(App::default().settings_rows()[2], "fps_cap: 15");
-    }
-
-    #[test]
-    fn the_choice_rows_send_forward_on_the_right_and_back_on_the_left() {
-        let settings = Settings::default();
-        assert_eq!(
-            adjusted(SettingsItem::DisplayMode, 1, &settings)
-                .display
-                .mode,
-            DisplayMode::default().next()
-        );
-        assert_eq!(
-            adjusted(SettingsItem::DisplayMode, -1, &settings)
-                .display
-                .mode,
-            DisplayMode::default().prev()
-        );
-        assert_eq!(
-            adjusted(SettingsItem::DisplayQuality, 1, &settings)
-                .display
-                .quality,
-            Quality::default().next()
-        );
-        assert_eq!(
-            adjusted(SettingsItem::DisplayQuality, -1, &settings)
-                .display
-                .quality,
-            Quality::default().prev()
-        );
-        assert_eq!(
-            adjusted(SettingsItem::SearchLayout, 1, &settings)
-                .search
-                .layout,
-            LayoutMode::default().next()
-        );
-        assert_eq!(
-            adjusted(SettingsItem::SearchLayout, -1, &settings)
-                .search
-                .layout,
-            LayoutMode::default().prev()
-        );
-    }
-
-    #[test]
-    fn a_choice_row_comes_back_to_where_it_started() {
-        // ← が「戻る」でないと、4 値ある quality は選び直しに 3 回かかる。
-        let settings = Settings::default();
-        let mut next = settings.clone();
-        SettingsItem::DisplayQuality.adjust(&mut next, 1);
-        SettingsItem::DisplayQuality.adjust(&mut next, -1);
-        assert_eq!(next.display.quality, settings.display.quality);
-
-        let mut back = settings.clone();
-        SettingsItem::DisplayQuality.adjust(&mut back, -1);
-        assert_eq!(back.display.quality, Quality::Low, "medium の 1 つ前");
-    }
-
-    #[test]
-    fn the_flag_rows_toggle_whichever_way_they_are_pushed() {
-        let mut settings = Settings::default();
-        for delta in [-1, 1] {
-            SettingsItem::SubtitlesEnabled.adjust(&mut settings, delta);
-            assert!(!settings.subtitles.enabled, "{delta}");
-            SettingsItem::SubtitlesEnabled.adjust(&mut settings, delta);
-            assert!(settings.subtitles.enabled, "{delta}");
-
-            SettingsItem::ThumbnailsEnabled.adjust(&mut settings, delta);
-            assert!(!settings.thumbnails.enabled, "{delta}");
-            SettingsItem::ThumbnailsEnabled.adjust(&mut settings, delta);
-            assert!(settings.thumbnails.enabled, "{delta}");
-
-            SettingsItem::WindowOntop.adjust(&mut settings, delta);
-            assert!(settings.window.ontop, "{delta}");
-            SettingsItem::WindowOntop.adjust(&mut settings, delta);
-            assert!(!settings.window.ontop, "{delta}");
-        }
-    }
-
-    #[test]
-    fn the_ontop_row_changes_only_the_window_section() {
-        let settings = Settings::default();
-        let next = adjusted(SettingsItem::WindowOntop, 1, &settings);
-        assert!(next.window.ontop);
-        assert_eq!(
-            next,
-            Settings {
-                window: WindowOptions {
-                    ontop: true,
-                    ..settings.window.clone()
-                },
-                ..settings
-            }
-        );
-    }
-
-    #[test]
-    fn the_fps_cap_steps_by_five_and_stops_at_both_ends() {
-        let mut settings = Settings::default();
-        SettingsItem::FpsCap.adjust(&mut settings, 1);
-        assert_eq!(settings.fps_cap.map(FpsCap::get), Some(20));
-        SettingsItem::FpsCap.adjust(&mut settings, -1);
-        assert_eq!(settings.fps_cap.map(FpsCap::get), Some(15));
-
-        // 0 まで下げると制限なし。そこから下は動かない (ラップしない)。
-        for _ in 0..10 {
-            SettingsItem::FpsCap.adjust(&mut settings, -1);
-        }
-        assert_eq!(settings.fps_cap, None);
-
-        for _ in 0..40 {
-            SettingsItem::FpsCap.adjust(&mut settings, 1);
-        }
-        assert_eq!(settings.fps_cap.map(FpsCap::get), Some(MAX_FPS_CAP));
-    }
-
-    #[test]
-    fn the_search_limit_steps_by_one_and_stays_inside_its_range() {
-        let mut settings = Settings::default();
-        SettingsItem::SearchLimit.adjust(&mut settings, 1);
-        assert_eq!(settings.search.limit, 11);
-
-        for _ in 0..20 {
-            SettingsItem::SearchLimit.adjust(&mut settings, -1);
-        }
-        assert_eq!(settings.search.limit, MIN_SEARCH_LIMIT);
-
-        for _ in 0..(MAX_SEARCH_LIMIT + 10) {
-            SettingsItem::SearchLimit.adjust(&mut settings, 1);
-        }
-        assert_eq!(settings.search.limit, MAX_SEARCH_LIMIT);
-    }
-
-    #[test]
-    fn the_search_timeout_steps_by_five_and_stays_inside_its_range() {
-        let mut settings = Settings::default();
-        let secs = |settings: &Settings| settings.search.timeout.as_secs();
-        assert_eq!(secs(&settings), 30, "既定は 30 秒のまま");
-
-        SettingsItem::SearchTimeoutSecs.adjust(&mut settings, 1);
-        assert_eq!(secs(&settings), 35);
-        SettingsItem::SearchTimeoutSecs.adjust(&mut settings, -1);
-        assert_eq!(secs(&settings), 30);
-
-        for _ in 0..20 {
-            SettingsItem::SearchTimeoutSecs.adjust(&mut settings, -1);
-        }
-        assert_eq!(secs(&settings), MIN_SEARCH_TIMEOUT_SECS, "下限で止まる");
-
-        for _ in 0..100 {
-            SettingsItem::SearchTimeoutSecs.adjust(&mut settings, 1);
-        }
-        assert_eq!(secs(&settings), MAX_SEARCH_TIMEOUT_SECS, "上限で止まる");
-    }
-
-    #[test]
-    fn the_search_timeout_row_shows_the_seconds() {
-        let settings = Settings::default();
-        assert_eq!(
-            SettingsItem::SearchTimeoutSecs.row(&settings),
-            "search.timeout_secs: 30"
-        );
-    }
-
-    #[test]
-    fn the_search_cache_toggle_flips_either_way() {
-        let mut settings = Settings::default();
-        assert!(!settings.search.cache_enabled, "既定は off のまま");
-        for delta in [1, -1] {
-            SettingsItem::SearchCacheEnabled.adjust(&mut settings, delta);
-            assert!(settings.search.cache_enabled);
-            SettingsItem::SearchCacheEnabled.adjust(&mut settings, delta);
-            assert!(!settings.search.cache_enabled);
-        }
-    }
-
-    #[test]
-    fn the_search_cache_ttl_steps_by_five_and_stays_inside_its_range() {
-        let mut settings = Settings::default();
-        let secs = |settings: &Settings| settings.search.cache_ttl.as_secs();
-        assert_eq!(secs(&settings), 300, "既定は 300 秒のまま");
-
-        SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, 1);
-        assert_eq!(secs(&settings), 305);
-        SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, -1);
-        assert_eq!(secs(&settings), 300);
-
-        for _ in 0..200 {
-            SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, -1);
-        }
-        assert_eq!(secs(&settings), MIN_SEARCH_CACHE_TTL_SECS, "下限で止まる");
-
-        for _ in 0..1000 {
-            SettingsItem::SearchCacheTtlSecs.adjust(&mut settings, 1);
-        }
-        assert_eq!(secs(&settings), MAX_SEARCH_CACHE_TTL_SECS, "上限で止まる");
-    }
-
-    #[test]
-    fn the_search_cache_ttl_takes_typed_numbers_and_the_toggle_does_not() {
-        let mut settings = Settings::default();
-        assert!(SettingsItem::SearchCacheTtlSecs.is_numeric());
-        assert!(!SettingsItem::SearchCacheEnabled.is_numeric());
-        assert_eq!(
-            SettingsItem::SearchCacheTtlSecs.max_digits(),
-            MAX_SEARCH_CACHE_TTL_SECS.to_string().len()
-        );
-
-        assert!(SettingsItem::SearchCacheTtlSecs.apply_numeric(&mut settings, "45"));
-        assert_eq!(settings.search.cache_ttl, Duration::from_secs(45));
-        assert!(SettingsItem::SearchCacheTtlSecs.apply_numeric(&mut settings, "1"));
-        assert_eq!(
-            settings.search.cache_ttl,
-            Duration::from_secs(MIN_SEARCH_CACHE_TTL_SECS)
-        );
-        assert!(SettingsItem::SearchCacheTtlSecs.apply_numeric(&mut settings, "99999"));
-        assert_eq!(
-            settings.search.cache_ttl,
-            Duration::from_secs(MAX_SEARCH_CACHE_TTL_SECS)
-        );
-        assert!(!SettingsItem::SearchCacheEnabled.apply_numeric(&mut settings, "1"));
-    }
-
-    #[test]
-    fn the_search_cache_rows_show_the_config_keys() {
-        let settings = Settings::default();
-        assert_eq!(
-            SettingsItem::SearchCacheEnabled.row(&settings),
-            "search.cache_enabled: false"
-        );
-        assert_eq!(
-            SettingsItem::SearchCacheTtlSecs.row(&settings),
-            "search.cache_ttl_secs: 300"
-        );
-        assert!(SETTINGS_ITEMS.contains(&SettingsItem::SearchCacheEnabled));
-        assert!(SETTINGS_ITEMS.contains(&SettingsItem::SearchCacheTtlSecs));
-    }
-
-    #[test]
-    fn the_thumbnail_numbers_step_by_their_own_width() {
-        let mut settings = Settings::default();
-        SettingsItem::ThumbnailsMaxCached.adjust(&mut settings, 1);
-        assert_eq!(settings.thumbnails.max_cached, 550);
-        for _ in 0..20 {
-            SettingsItem::ThumbnailsMaxCached.adjust(&mut settings, -1);
-        }
-        assert_eq!(settings.thumbnails.max_cached, 0, "0 枚で止まる");
-
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
-        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(15));
-        for _ in 0..10 {
-            SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
-        }
-        assert_eq!(
-            settings.thumbnails.timeout,
-            Duration::from_secs(1),
-            "0 秒では 1 枚も取れない"
-        );
-        for _ in 0..40 {
-            SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
-        }
-        assert_eq!(
-            settings.thumbnails.timeout,
-            Duration::from_secs(MAX_THUMB_TIMEOUT_SECS)
-        );
-    }
-
-    #[test]
-    fn the_timeout_keeps_its_step_after_hitting_the_lower_bound() {
-        // 下限 1 は刻みに乗っていない。ここで基準がずれると既定の 10 へ戻せなくなる。
-        let mut settings = Settings::default();
-        let secs = |settings: &Settings| settings.thumbnails.timeout.as_secs();
-
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
-        assert_eq!(secs(&settings), 5);
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
-        assert_eq!(secs(&settings), 1, "0 秒では取れないので 1 で止まる");
-
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
-        assert_eq!(secs(&settings), 5, "刻みの目盛りへ戻る");
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
-        assert_eq!(secs(&settings), 10, "既定値に戻せる");
-    }
-
-    #[test]
-    fn a_value_off_the_step_is_pulled_back_onto_it() {
-        // 設定ファイルに手で書いた端数から始めても、目盛りの上を動く。
-        let mut settings = Settings::default();
-        settings.thumbnails.timeout = Duration::from_secs(12);
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, -1);
-        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(10));
-
-        settings.thumbnails.timeout = Duration::from_secs(12);
-        SettingsItem::ThumbnailsTimeoutSecs.adjust(&mut settings, 1);
-        assert_eq!(settings.thumbnails.timeout, Duration::from_secs(15));
-    }
-
     #[test]
     fn the_search_results_do_not_close_the_settings_screen() {
         // 検索中に設定を開いても、結果が届いたところで画面が消えない。
         let mut app = App {
             mode: Mode::Settings,
-            settings_return: Mode::Input,
+            settings_screen: SettingsScreen {
+                return_mode: Mode::Input,
+                ..SettingsScreen::default()
+            },
             ..App::default()
         };
         app.enter_search_mode(Mode::Results);
         assert_eq!(app.mode, Mode::Settings);
-        assert_eq!(app.settings_return, Mode::Results, "閉じたら結果へ戻す");
+        assert_eq!(
+            app.settings_screen.return_mode,
+            Mode::Results,
+            "閉じたら結果へ戻す"
+        );
 
         // 設定画面を開いていなければ、そのままモードを動かす。
         let mut app = App::default();
@@ -2987,181 +2280,6 @@ mod tests {
         app.enter_search_mode(Mode::Results);
         assert_eq!(app.mode, Mode::Download);
         assert_eq!(app.download_return, Mode::Results, "閉じたら結果へ戻す");
-    }
-
-    #[test]
-    fn an_out_of_range_selection_still_points_at_a_row() {
-        let mut app = App::default();
-        assert_eq!(app.settings_selected, 0);
-        assert_eq!(app.settings_item(), SETTINGS_ITEMS[0]);
-
-        app.settings_selected = 99;
-        assert_eq!(
-            app.settings_item(),
-            SETTINGS_ITEMS[SETTINGS_ITEMS.len() - 1]
-        );
-    }
-
-    #[test]
-    fn only_the_number_rows_take_a_typed_value() {
-        let numeric: Vec<&str> = SETTINGS_ITEMS
-            .iter()
-            .filter(|item| item.is_numeric())
-            .map(|item| item.label())
-            .collect();
-        assert_eq!(
-            numeric,
-            [
-                "fps_cap",
-                "search.limit",
-                "search.timeout_secs",
-                "search.cache_ttl_secs",
-                "thumbnails.max_cached",
-                "thumbnails.timeout_secs",
-            ]
-        );
-    }
-
-    #[test]
-    fn every_number_row_actually_takes_the_value_it_advertises() {
-        // is_numeric() に項目を足して apply_numeric() の腕を足し忘れると、
-        // 数字は打てるのに Enter が効かない行ができる。
-        let settings = Settings::default();
-        for item in SETTINGS_ITEMS {
-            let mut next = settings.clone();
-            assert_eq!(
-                item.apply_numeric(&mut next, "1"),
-                item.is_numeric(),
-                "{}",
-                item.label()
-            );
-            assert_eq!(item.max_digits() > 0, item.is_numeric(), "{}", item.label());
-        }
-    }
-
-    #[test]
-    fn the_digit_limit_still_lets_an_out_of_range_number_be_typed() {
-        // 端へ寄せる入力 (search.limit の 9999 等) は打てる長さに収める。
-        assert_eq!(SettingsItem::FpsCap.max_digits(), 3);
-        assert_eq!(SettingsItem::SearchLimit.max_digits(), 4);
-        assert_eq!(SettingsItem::SearchTimeoutSecs.max_digits(), 3);
-        assert_eq!(SettingsItem::ThumbnailsTimeoutSecs.max_digits(), 3);
-        assert_eq!(SettingsItem::ThumbnailsMaxCached.max_digits(), 20);
-    }
-
-    /// 打ち込んだ値を 1 項目だけ確定した結果。
-    fn typed(item: SettingsItem, raw: &str, settings: &Settings) -> Settings {
-        let mut next = settings.clone();
-        item.apply_numeric(&mut next, raw);
-        next
-    }
-
-    #[test]
-    fn a_typed_number_lands_inside_the_range_the_arrows_use() {
-        let settings = Settings::default();
-        let limit = |raw| {
-            typed(SettingsItem::SearchLimit, raw, &settings)
-                .search
-                .limit
-        };
-        assert_eq!(limit("250"), 250);
-        // 範囲の外は ←→ と同じ端で止める。
-        assert_eq!(limit("0"), MIN_SEARCH_LIMIT);
-        assert_eq!(limit("5000"), MAX_SEARCH_LIMIT);
-
-        let fps = |raw| typed(SettingsItem::FpsCap, raw, &settings).fps_cap;
-        assert_eq!(fps("24"), FpsCap::new(24));
-        assert_eq!(fps("999"), FpsCap::new(MAX_FPS_CAP));
-        // 0 は「制限なし」。
-        assert_eq!(fps("0"), None);
-
-        let search_timeout = |raw| {
-            typed(SettingsItem::SearchTimeoutSecs, raw, &settings)
-                .search
-                .timeout
-        };
-        assert_eq!(search_timeout("120"), Duration::from_secs(120));
-        assert_eq!(
-            search_timeout("0"),
-            Duration::from_secs(MIN_SEARCH_TIMEOUT_SECS)
-        );
-        assert_eq!(
-            search_timeout("9999"),
-            Duration::from_secs(MAX_SEARCH_TIMEOUT_SECS)
-        );
-
-        let cached = |raw| {
-            typed(SettingsItem::ThumbnailsMaxCached, raw, &settings)
-                .thumbnails
-                .max_cached
-        };
-        assert_eq!(cached("1200"), 1200);
-        assert_eq!(cached("0"), 0);
-
-        let timeout = |raw| {
-            typed(SettingsItem::ThumbnailsTimeoutSecs, raw, &settings)
-                .thumbnails
-                .timeout
-        };
-        assert_eq!(timeout("30"), Duration::from_secs(30));
-        assert_eq!(timeout("0"), Duration::from_secs(MIN_THUMB_TIMEOUT_SECS));
-        assert_eq!(timeout("999"), Duration::from_secs(MAX_THUMB_TIMEOUT_SECS));
-    }
-
-    #[test]
-    fn a_typed_value_that_is_not_a_number_leaves_the_setting_alone() {
-        let settings = Settings::default();
-        // 空入力・符号・小数・桁あふれは読めないので捨てる。
-        for raw in ["", " ", "abc", "-5", "1.5", "12 ", "99999999999999999999"] {
-            let mut next = settings.clone();
-            assert!(
-                !SettingsItem::SearchLimit.apply_numeric(&mut next, raw),
-                "{raw:?} は受け付けない"
-            );
-            assert_eq!(next, settings, "{raw:?}");
-        }
-    }
-
-    #[test]
-    fn typing_a_number_into_a_choice_row_changes_nothing() {
-        let settings = Settings::default();
-        for item in SETTINGS_ITEMS.iter().filter(|item| !item.is_numeric()) {
-            let mut next = settings.clone();
-            assert!(!item.apply_numeric(&mut next, "1"), "{}", item.label());
-            assert_eq!(next, settings, "{}", item.label());
-        }
-    }
-
-    #[test]
-    fn the_settings_screen_starts_without_a_typed_value() {
-        assert_eq!(App::default().settings_edit, None);
-    }
-
-    #[test]
-    fn the_settings_status_line_shows_the_position_and_keeps_the_notice() {
-        let t0 = Instant::now();
-        let mut app = App {
-            mode: Mode::Settings,
-            ..App::default()
-        };
-        assert_eq!(
-            app.status_line(),
-            format!("設定 1/{}", SETTINGS_ITEMS.len())
-        );
-
-        app.settings_selected = 2;
-        assert!(
-            app.status_line().starts_with("設定 3/"),
-            "{}",
-            app.status_line()
-        );
-
-        app.set_temporary_notice("保存しました".to_string(), t0);
-        assert!(app.status_line().ends_with("保存しました"));
-
-        // 保存に失敗した理由はエラーとして出す。
-        app.set_temporary_error("保存できません".to_string(), t0);
-        assert_eq!(app.status_line(), "エラー: 保存できません");
     }
 
     fn from_channel(id: &str, channel_id: &str) -> SearchResult {

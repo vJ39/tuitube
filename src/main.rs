@@ -20,6 +20,7 @@ mod oauth;
 mod query;
 mod resume;
 mod rgb;
+mod screen;
 mod search;
 mod seekbar;
 mod settings;
@@ -44,6 +45,7 @@ use geometry::cell_size;
 use input::{handle_key, handle_mouse};
 use ratatui::DefaultTerminal;
 use ratatui::layout::Rect;
+use screen::settings::SettingsScreen;
 use search::{ChannelRef, RealYtDlp, YtDlp};
 use std::io::Write;
 use std::time::Duration;
@@ -106,7 +108,10 @@ fn app_from(
         cookies: CookieState::from_source(loaded.settings.cookies.clone()),
         tabs: Tabs::with_categories(loaded.settings.categories.clone()),
         subtitles: SubtitleState::from_settings(&loaded.settings.subtitles),
-        settings_backup: loaded.settings.clone(),
+        settings_screen: SettingsScreen {
+            backup: loaded.settings.clone(),
+            ..SettingsScreen::default()
+        },
         settings: loaded.settings,
         // 環境変数の一時的な上書きは、設定画面から保存してもファイルへ書かない。
         env_overridden: loaded.overridden,
@@ -1337,7 +1342,7 @@ mod tests {
         );
         assert_eq!(app.settings.cookies, None, "実行中は連携を切る");
 
-        actions::save_settings_to(&mut app, Some(&path), std::time::Instant::now());
+        screen::settings::save_settings_to(&mut app, Some(&path), std::time::Instant::now());
         // 書いた中身を読み直して見る。指定なしだと同じ行がコメントで出るため。
         let written = std::fs::read_to_string(&path).expect("読める");
         let reread = settings::load_from(Some(&path), settings::EnvOverrides::default());
@@ -1402,7 +1407,10 @@ mod tests {
         };
         let mut app = App {
             mode: Mode::Settings,
-            settings_return: Mode::Input,
+            settings_screen: SettingsScreen {
+                return_mode: Mode::Input,
+                ..SettingsScreen::default()
+            },
             searching: true,
             ..App::default()
         };
@@ -1420,7 +1428,11 @@ mod tests {
     async fn a_search_landing_behind_the_settings_screen_does_not_close_it() {
         let app = settings_open_when_the_search_lands(Ok(vec![result("a")])).await;
         assert_eq!(app.mode, Mode::Settings, "編集中の画面を閉じない");
-        assert_eq!(app.settings_return, Mode::Results, "閉じたら結果へ戻す");
+        assert_eq!(
+            app.settings_screen.return_mode,
+            Mode::Results,
+            "閉じたら結果へ戻す"
+        );
         assert_eq!(app.results.len(), 1, "結果は受け取っておく");
         assert!(!app.searching);
     }
@@ -1429,7 +1441,7 @@ mod tests {
     async fn a_failed_search_behind_the_settings_screen_does_not_close_it_either() {
         let app = settings_open_when_the_search_lands(Err("yt-dlp が落ちた".to_string())).await;
         assert_eq!(app.mode, Mode::Settings);
-        assert_eq!(app.settings_return, Mode::Input);
+        assert_eq!(app.settings_screen.return_mode, Mode::Input);
         assert_eq!(app.error.as_deref(), Some("yt-dlp が落ちた"));
     }
 
