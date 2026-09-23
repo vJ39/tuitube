@@ -16,7 +16,7 @@ YouTube の「後で見る」には API から足せない(`playlistItems.insert
 
 1. `playlists.list?part=snippet&mine=true&maxResults=50` を `nextPageToken` で辿り、タイトルがちょうど「tuitube」のものを探す
 2. 無ければ `playlists.insert?part=snippet,status` で作る(タイトル「tuitube」、公開設定 `private`)
-3. `playlistItems.list?part=id&playlistId=…&videoId=…` で既に入っているかを見る。入っていれば足さずに「既に tuitube に保存しています」を出す
+3. `playlistItems.list?part=id&playlistId=…&videoId=…` で既に入っているかを見る。入っていれば足さずに「既に tuitube に保存しています」を出す。2 で作ったばかりのときは空なので見ない(作った直後に問い合わせると、プレイリストが見つからないと返る)
 4. `playlistItems.insert?part=snippet` で足し、「tuitube に保存しました」を出す
 
 API の割り当て(クォータ)は 1 回の保存で 52(作るときは 102)。1 日の既定の枠 10,000 に対して小さい。

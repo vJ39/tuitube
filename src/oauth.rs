@@ -881,19 +881,25 @@ async fn save_to_playlist<B: Backend>(
     access_token: &str,
     video_id: &str,
 ) -> Result<String, String> {
-    let playlist_id = match find_save_playlist(backend, access_token).await? {
-        Some(id) => id,
-        None => created_playlist_of(&backend.curl(create_playlist_request(access_token)).await?)?,
+    let (playlist_id, created) = match find_save_playlist(backend, access_token).await? {
+        Some(id) => (id, false),
+        None => (
+            created_playlist_of(&backend.curl(create_playlist_request(access_token)).await?)?,
+            true,
+        ),
     };
-    let found = backend
-        .curl(find_playlist_item_request(
-            access_token,
-            &playlist_id,
-            video_id,
-        ))
-        .await?;
-    if has_items(&found)? {
-        return Ok(ALREADY_SAVED_NOTICE.to_string());
+    // 作った直後のプレイリストは中身を聞くと見つからないと返る (実測)。空なので聞かずに足す。
+    if !created {
+        let found = backend
+            .curl(find_playlist_item_request(
+                access_token,
+                &playlist_id,
+                video_id,
+            ))
+            .await?;
+        if has_items(&found)? {
+            return Ok(ALREADY_SAVED_NOTICE.to_string());
+        }
     }
     let inserted = backend
         .curl(insert_playlist_item_request(
@@ -2597,7 +2603,6 @@ mod tests {
             // 名前が完全に同じものだけを使う。
             ok(&playlist_page(&[("PL0", "tuitube のメモ")], None)),
             ok(r#"{"id":"PLnew"}"#),
-            ok(NO_ITEMS),
             ok(r#"{"id":"item1"}"#),
         ]);
 
@@ -2611,8 +2616,14 @@ mod tests {
             url_of(&calls, 2),
             format!("{PLAYLISTS_ENDPOINT}?part=snippet,status")
         );
+        // 作った直後は中身を聞くと見つからないと返る (実測)。空なので聞かずに足す。
+        assert_eq!(calls.len(), 4, "トークン・一覧・作成・追加");
         assert_eq!(
-            json_body(&calls[4]).pointer("/snippet/playlistId"),
+            url_of(&calls, 3),
+            format!("{PLAYLIST_ITEMS_ENDPOINT}?part=snippet")
+        );
+        assert_eq!(
+            json_body(&calls[3]).pointer("/snippet/playlistId"),
             Some(&serde_json::json!("PLnew"))
         );
     }
