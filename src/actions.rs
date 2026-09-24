@@ -1019,7 +1019,7 @@ pub fn load_more_with<R>(
     if !matches!(target, Target::Search(_)) {
         return;
     }
-    let limit = (app.view_results().len() + app.settings.search.limit).min(MAX_SEARCH_LIMIT);
+    let limit = (app.view_state().fetched + app.settings.search.limit).min(MAX_SEARCH_LIMIT);
     spawn_search(app, tx, session, target, limit, runner);
 }
 
@@ -5171,6 +5171,24 @@ mod tests {
             panic!("SearchDone が届く");
         };
         assert_eq!(requested_limit, 20);
+    }
+
+    #[tokio::test]
+    async fn load_more_counts_the_hidden_rows_in_the_next_request() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = grid_app(10);
+        app.query.set("ラーメン");
+        app.tabs.state_mut().requested_limit = 10;
+        app.hidden.videos.insert("id0".to_string());
+        app.drop_hidden();
+        let runner = FakeYtDlp::new([done(0, "", "")]);
+
+        load_more_with(&mut app, &tx, &mut session, runner.clone());
+        finish_search(&mut session).await;
+
+        // 出しているのは 9 件でも、取れていたのは 10 件。10 + limit(10) を頼む。
+        assert_eq!(playlist_end(&runner.calls()[0]).as_deref(), Some("20"));
     }
 
     #[tokio::test]

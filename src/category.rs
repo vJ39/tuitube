@@ -48,6 +48,9 @@ pub struct TabState {
     /// このタブの一覧を取得したときに yt-dlp へ実際に要求した件数。既定 0 は未取得。
     /// Target::Feed / Target::Channel のタブは立てないまま (0 のまま) にする。
     pub requested_limit: usize,
+    /// yt-dlp が返した件数。隠した行を除く前に数えるので、「もっと見る」の判定と
+    /// 次に頼む件数は隠した分に左右されない。
+    pub fetched: usize,
 }
 
 #[derive(Debug)]

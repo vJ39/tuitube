@@ -540,7 +540,7 @@ impl App {
     pub fn can_load_more(&self) -> bool {
         let state = self.view_state();
         state.requested_limit > 0
-            && state.results.len() >= state.requested_limit
+            && state.fetched >= state.requested_limit
             && state.requested_limit < MAX_SEARCH_LIMIT
     }
 
@@ -584,6 +584,7 @@ impl App {
     }
 
     pub fn set_results(&mut self, results: Vec<SearchResult>, target: &Target) {
+        let fetched = results.len();
         let results: Vec<SearchResult> = results
             .into_iter()
             .filter(|result| !self.hidden.hides(result))
@@ -596,6 +597,7 @@ impl App {
             .get(state.selected)
             .map(|result| result.id.clone());
         state.results = results;
+        state.fetched = fetched;
         state.selected = selected_id
             .and_then(|id| state.results.iter().position(|result| result.id == id))
             .unwrap_or(0);
@@ -1057,6 +1059,29 @@ mod tests {
         app.set_results(vec![result("a")], &search_target());
         app.tabs.state_mut().requested_limit = 2;
         assert!(!app.can_load_more());
+    }
+
+    #[test]
+    fn can_load_more_counts_rows_that_were_hidden_before_showing() {
+        // 2 件要求して 2 件返った。1 件を隠して出していても、続きはまだある。
+        let mut app = App {
+            hidden: hiding(&["a"], &[]),
+            ..App::default()
+        };
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.tabs.state_mut().requested_limit = 2;
+        assert_eq!(app.result_ids(), ["b"]);
+        assert!(app.can_load_more());
+    }
+
+    #[test]
+    fn can_load_more_stays_true_after_hiding_a_shown_row() {
+        let mut app = App::default();
+        app.set_results(vec![result("a"), result("b")], &search_target());
+        app.tabs.state_mut().requested_limit = 2;
+        app.hidden = hiding(&["a"], &[]);
+        app.drop_hidden();
+        assert!(app.can_load_more());
     }
 
     #[test]
