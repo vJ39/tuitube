@@ -914,9 +914,7 @@ pub fn render(settings: &Settings) -> String {
     out.push_str(&format!("enabled = {}\n", settings.subtitles.enabled));
     out.push_str("# 取得する字幕の言語。カンマ区切りで複数書ける。\n");
     out.push_str("# 例: \"ja-orig\" (原語の文字起こし) / \"ja\" (自動翻訳) / \"ja-orig,ja\"\n");
-    out.push_str(
-        "# 複数書いたときにどれを出すかは mpv が決める。先頭が選ばれるとは限らない (実測)。\n",
-    );
+    out.push_str("# 複数書いたときにどれを出すかは mpv が決める。先頭が選ばれるとは限らない。\n");
     out.push_str("# yt-dlp の sub-langs と mpv の --slang に同じ値を渡すので、言語コード以外 (\"all\" や正規表現) は書けない。\n");
     out.push_str(&format!(
         "lang = \"{}\"\n",
@@ -1067,7 +1065,7 @@ pub fn render(settings: &Settings) -> String {
 
     let download = &settings.download;
     out.push_str("\n[download]\n");
-    out.push_str("# ダウンロード画面 (D) の保存先。空欄のまま使うと $HOME/Downloads (無ければ空欄) から始まる。\n");
+    out.push_str("# ダウンロード画面 (d) の保存先。空欄のまま使うと $HOME/Downloads (無ければ空欄) から始まる。\n");
     out.push_str(&string_line(
         "dir",
         download.dir.as_deref().and_then(Path::to_str),
@@ -2143,6 +2141,18 @@ mod tests {
         let text = render(&Settings::default());
         assert!(text.starts_with('#'), "{text}");
         assert!(text.contains("自分で書いたコメントは残らない"), "{text}");
+    }
+
+    #[test]
+    fn the_readme_shows_the_template_tuitube_writes() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+        let readme = fs::read_to_string(&path).expect("README.md を読める");
+        let template = render(&Settings::default());
+
+        assert!(
+            readme.contains(&format!("```toml\n{template}```")),
+            "README.md の設定ファイルの例を render の出力に合わせる"
+        );
     }
 
     #[test]

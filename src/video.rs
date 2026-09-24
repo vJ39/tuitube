@@ -214,7 +214,7 @@ fn push_scaled(frame: &VideoFrame, cols: u16, rows: u16, out: &mut Vec<u8>) {
     }
 }
 
-/// q=2 が無いと端末の応答が tuitube の stdin に入りキーイベントとして誤読される (§1-2)。
+/// q=2 が無いと端末の応答が tuitube の stdin に入りキーイベントとして誤読される。
 pub fn encode_clear(out: &mut Vec<u8>) {
     out.extend_from_slice(b"\x1b_Ga=d,q=2;\x1b\\");
 }

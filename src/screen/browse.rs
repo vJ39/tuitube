@@ -402,7 +402,7 @@ fn input_width(area: Rect) -> usize {
 
 /// 1 文字の表示幅。入力欄の桁計算はすべてこれを積む。
 /// ratatui は書記素クラスタ単位で桁を進めるため、ZWJ 絵文字のように
-/// 複数コードポイントで 1 つの書記素になる文字は対象外 (docs/query-editor-design.md)。
+/// 複数コードポイントで 1 つの書記素になる文字は対象外。
 fn char_width(ch: char) -> usize {
     grid::display_width(&ch.to_string())
 }
