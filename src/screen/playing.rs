@@ -572,8 +572,8 @@ pub fn playing_hints(
         },
         "c:URLコピー".to_string(),
         format!("w:{}", display.next().label()),
-        "Esc:停止".to_string(),
-        "q:終了".to_string(),
+        // q も Esc と同じく再生を止めるだけで、アプリは終えない。
+        "Esc/q:停止".to_string(),
         "♥l:いいね".to_string(),
     ];
     // チャンネル ID の無い再生では押しても何も起きないので、案内も出さない。
@@ -2163,11 +2163,12 @@ mod tests {
                     "space:一時停止",
                     "c:URLコピー",
                     &format!("w:{}", display.next().label()),
-                    "Esc:停止",
-                    "q:終了",
+                    "Esc/q:停止",
                 ] {
                     assert!(help.contains(key), "{key} が落ちた: {help}");
                 }
+                // q はアプリを終えず、Esc と同じく再生を止めて一覧へ戻る。
+                assert!(!help.contains("q:終了"), "{help}");
             }
         }
 
