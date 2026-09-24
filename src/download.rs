@@ -51,7 +51,10 @@ pub fn sanitize_filename(title: &str) -> String {
 
 /// yt-dlp の引数。dir は展開済みの保存先、filename は拡張子を含まない。
 pub fn download_args(url: &str, dir: &Path, filename: &str, audio_only: bool) -> Vec<String> {
-    let template = dir
+    // -o は yt-dlp の書式として読まれるので、保存先とファイル名の % は %% にする。
+    let dir = dir.to_string_lossy().replace('%', "%%");
+    let filename = filename.replace('%', "%%");
+    let template = Path::new(&dir)
         .join(format!("{filename}.%(ext)s"))
         .to_string_lossy()
         .into_owned();
@@ -309,6 +312,18 @@ mod tests {
                 "https://x/watch?v=1",
             ]
         );
+    }
+
+    #[test]
+    fn download_args_keep_percent_signs_as_they_are() {
+        // yt-dlp は -o の %(...)s を展開するので、打った % はそのまま残るよう %% にする。
+        let args = download_args(
+            "https://x/watch?v=1",
+            Path::new("/tmp/100%"),
+            "50% off %(id)s",
+            false,
+        );
+        assert_eq!(args[3], "/tmp/100%%/50%% off %%(id)s.%(ext)s");
     }
 
     #[test]
