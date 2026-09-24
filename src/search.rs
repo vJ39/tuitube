@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(
             yt_dlp_args(&Target::Search("q".to_string()), None, 10),
             [
-                "https://www.youtube.com/results?search_query=q",
+                "ytsearch1000:q",
                 "--flat-playlist",
                 "--dump-json",
                 "--extractor-args",
@@ -919,9 +919,9 @@ mod tests {
 
     #[test]
     fn yt_dlp_args_take_the_result_count_from_the_setting() {
-        // 検索も件数は URL でなく --playlist-end で渡す。
+        // URL の ytsearchN の N は固定の上限で、実際の件数は --playlist-end で絞る。
         let args = yt_dlp_args(&Target::Search("q".to_string()), None, 25);
-        assert_eq!(args[0], "https://www.youtube.com/results?search_query=q");
+        assert_eq!(args[0], "ytsearch1000:q");
         assert_eq!(playlist_end(&args), Some("25".to_string()));
     }
 

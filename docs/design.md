@@ -19,7 +19,7 @@ tuitube に手を入れる人向けの説明。使い方は [README](../README.m
 
 ## 検索と一覧
 
-- 検索は `yt-dlp --flat-playlist --dump-json` で検索結果のページ(`youtube.com/results?search_query=`)を読む。このページの行のおよそ 3 分の 1 はチャンネルなので、`ie_key` が `Youtube` の行だけを残す。この絞り込みは検索だけで、ほかの取得には掛けない
+- 検索は `yt-dlp --flat-playlist --dump-json` で `ytsearch1000:<語>` を読む。実際の件数は `--playlist-end` で絞り、URL の 1000 はページあたりの件数を稼ぐための固定の上限。検索結果ページ(`youtube.com/results?search_query=`)は 1 ページ約 9 件・`ytsearchN:` は 1 ページ約 20 件で、後者の方がページ数が少なく速い(実測: 200 件で 23 ページ 17.1 秒 → 10 ページ 14.9 秒)。`ytsearchN:` の行はチャンネルを含まないが、`ie_key` が `Youtube` の行だけを残す絞り込みは安全側として検索にだけ残している
 - 件数は `--playlist-end` で渡す。検索は `[search] limit`、フィードは 30 件(`:ytrec` は制限しないと 167 件返った)、チャンネルのタブとプレイリストは 50 件で、`limit` とは関係しない
 - 動画の一覧を取るときは `--extractor-args youtubetab:approximate_date` を付けて `timestamp` を入れさせ、新しい順に安定ソートする。フィードだけは YouTube の並びのまま使う(「後で見る」で足した順が崩れないように)。ショート・ライブのタブと `:ythis`・`:ytsubs` には `timestamp` が入らないので、並びは変わらない
 - yt-dlp の出力は終了してからまとめて読む。1000 件の検索では最初の行が出るまで 11 秒かかり、残りはほぼ同時に届いた。このため「もっと見る」は差分を足すのでなく、件数を増やして丸ごと取り直す。増やす量も `limit`、上限は 1000
