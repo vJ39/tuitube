@@ -282,6 +282,15 @@ pub(crate) fn search_return_mode(app: &App) -> Mode {
     }
 }
 
+/// 検索欄の確定 (Enter キーでも、検索欄の枠のクリックでも同じ入口を通す)。
+/// プレイリストの URL ならその中身を開き、それ以外は検索する。
+pub fn submit_query(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
+    match crate::youtube_url::playlist_id(app.query.text()) {
+        Some(id) => crate::screen::playlists::open_playlist_by_url(app, tx, session, id),
+        None => start_search(app, tx, session),
+    }
+}
+
 pub fn start_search(app: &mut App, tx: &UnboundedSender<AppEvent>, session: &mut Session) {
     start_search_with(app, tx, session, RealYtDlp);
 }

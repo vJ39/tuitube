@@ -5,7 +5,7 @@
 use crate::actions::{
     Oauth, Session, config_path_from_env, hide_current_channel, hide_selected, leave_background,
     leave_channel, load_more, move_selection, open_channel, reload_channel_tab, reload_tab,
-    save_video, select_channel_tab, select_tab, start_playback, start_search, subscribe_channel,
+    save_video, select_channel_tab, select_tab, start_playback, submit_query, subscribe_channel,
     switch_channel_tab, switch_tab, toggle_search_layout,
 };
 use crate::app::{App, AppEvent, ChannelView, Mode, format_time};
@@ -19,8 +19,7 @@ use crate::query::QueryEditor;
 use crate::screen::download::open_download;
 use crate::screen::playing as playing_screen;
 use crate::screen::playlists::{
-    self as playlists_screen, is_playlists_key, leave_playlist, open_playlist_by_url,
-    open_playlists, reload_playlist,
+    self as playlists_screen, is_playlists_key, leave_playlist, open_playlists, reload_playlist,
 };
 use crate::screen::settings::{is_settings_key, open_settings};
 use crate::ui::{draw_footer, grid_layout, search_areas};
@@ -95,10 +94,7 @@ pub async fn handle_key_input(
 ) {
     let extend = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
-        KeyCode::Enter => match crate::youtube_url::playlist_id(app.query.text()) {
-            Some(id) => open_playlist_by_url(app, tx, session, id),
-            None => start_search(app, tx, session),
-        },
+        KeyCode::Enter => submit_query(app, tx, session),
         KeyCode::Tab => switch_tab(app, tx, session, true),
         KeyCode::BackTab => switch_tab(app, tx, session, false),
         KeyCode::Backspace => app.query.backspace(),
@@ -301,7 +297,20 @@ fn is_select_all_key(c: char, modifiers: KeyModifiers) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputClick {
     Tab(usize),
+    Submit,
     Cursor(usize),
+}
+
+/// 検索欄の枠 (上下のボーダー行) の押し込みか。文字が並ぶ内側の行とは別に判定する。
+fn search_submit_hit(app: &App, mouse: MouseEvent) -> bool {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return false;
+    }
+    let area = search_areas(app.screen)[0];
+    if !area.contains(Position::new(mouse.column, mouse.row)) {
+        return false;
+    }
+    mouse.row == area.y || mouse.row == area.y + area.height.saturating_sub(1)
 }
 
 /// 押し込みだけを見るので、ドラッグや離した位置では動かない。
@@ -312,6 +321,9 @@ fn input_click(app: &App, mouse: MouseEvent) -> Option<InputClick> {
     }
     if let Some(index) = tab_at_point(app, mouse.column, mouse.row) {
         return Some(InputClick::Tab(index));
+    }
+    if search_submit_hit(app, mouse) {
+        return Some(InputClick::Submit);
     }
     query_index_at_point(app, mouse.column, mouse.row).map(InputClick::Cursor)
 }
@@ -324,6 +336,7 @@ pub fn handle_mouse_input(
 ) {
     match input_click(app, mouse) {
         Some(InputClick::Tab(index)) => select_tab(app, tx, session, index),
+        Some(InputClick::Submit) => submit_query(app, tx, session),
         Some(InputClick::Cursor(index)) => app.query.move_to(index),
         None => {}
     }
@@ -333,6 +346,7 @@ pub fn handle_mouse_input(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResultsClick {
     Tab(usize),
+    Submit,
     Play(usize),
 }
 
@@ -343,6 +357,9 @@ fn results_click(app: &App, cell: CellSize, mouse: MouseEvent) -> Option<Results
     }
     if let Some(index) = tab_at_point(app, mouse.column, mouse.row) {
         return Some(ResultsClick::Tab(index));
+    }
+    if search_submit_hit(app, mouse) {
+        return Some(ResultsClick::Submit);
     }
     // 描いた後に結果が入れ替わっていると、同じ座標が別の動画を指す。
     // タブ行と違って再生が走ってしまうので、次の描画まで待つ。
@@ -360,6 +377,7 @@ pub async fn handle_mouse_results(
 ) {
     match results_click(app, cell_size(), mouse) {
         Some(ResultsClick::Tab(index)) => select_tab(app, tx, session, index),
+        Some(ResultsClick::Submit) => submit_query(app, tx, session),
         Some(ResultsClick::Play(index)) => {
             app.set_view_selected(index);
             start_playback(app, tx, session).await;
@@ -377,6 +395,7 @@ pub async fn handle_mouse_channel(
 ) {
     match results_click(app, cell_size(), mouse) {
         Some(ResultsClick::Tab(index)) => select_channel_tab(app, tx, session, index),
+        Some(ResultsClick::Submit) => submit_query(app, tx, session),
         Some(ResultsClick::Play(index)) => {
             app.set_view_selected(index);
             start_playback(app, tx, session).await;
@@ -2628,6 +2647,66 @@ mod tests {
             assert_eq!(app.selected, 3);
             assert!(session.player.is_none());
             assert_eq!(session.player_nonce, 0);
+        }
+
+        /// 検索欄の枠 (上端 y=0) の押し込み。
+        fn search_box_border_click(column: u16) -> MouseEvent {
+            mouse(MouseEventKind::Down(MouseButton::Left), column, 0)
+        }
+
+        #[tokio::test]
+        async fn clicking_the_search_box_border_submits_from_input() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = query_app("ラーメン");
+
+            handle_mouse(&mut app, search_box_border_click(5), &tx, &mut session).await;
+
+            assert!(take_search(&mut session), "検索を投げる");
+        }
+
+        #[tokio::test]
+        async fn clicking_the_search_box_border_submits_from_results() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = grid_app(3);
+            app.query = QueryEditor::from("ラーメン");
+
+            handle_mouse(&mut app, search_box_border_click(5), &tx, &mut session).await;
+
+            assert!(
+                take_search(&mut session),
+                "結果一覧の枠クリックでも検索を投げる"
+            );
+        }
+
+        #[tokio::test]
+        async fn clicking_the_search_box_border_submits_from_channel() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = channel_app(2);
+            app.query = QueryEditor::from("ラーメン");
+
+            handle_mouse(&mut app, search_box_border_click(5), &tx, &mut session).await;
+
+            assert!(
+                take_search(&mut session),
+                "チャンネル画面の枠クリックでも検索を投げる"
+            );
+        }
+
+        #[tokio::test]
+        async fn clicking_inside_the_search_box_still_just_moves_the_cursor() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = query_app("ラーメン");
+
+            handle_mouse(&mut app, box_click(5), &tx, &mut session).await;
+
+            assert!(
+                !take_search(&mut session),
+                "内側は今までどおりカーソル移動のまま"
+            );
         }
 
         #[tokio::test]
