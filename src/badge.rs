@@ -31,6 +31,12 @@ impl Badge {
         }
     }
 
+    /// list 表示での色。塗り色 (fill) と同じ RGB を ratatui の Color に変えるだけ。
+    pub fn color(self) -> ratatui::style::Color {
+        let [r, g, b] = self.fill();
+        ratatui::style::Color::Rgb(r, g, b)
+    }
+
     /// list 表示 (サムネイルを描かない) 向けの文字での印。記号は再生画面の
     /// アクション行 (screen::playing::ActionKind) と揃える。
     pub fn symbol(self) -> &'static str {

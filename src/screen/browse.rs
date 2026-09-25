@@ -505,8 +505,18 @@ pub fn draw_search(frame: &mut Frame, app: &App) {
         app.query.text(),
         query_scroll(&app.query, input_width(areas[0])),
     );
-    let input = Paragraph::new(query_line(&app.query, scrolled, app.mode == Mode::Input))
-        .block(Block::default().borders(Borders::ALL).title(" 検索 "));
+    // 検索欄はどの画面でも常に出ているので、フォーカスの有無を枠の色で示す。
+    let border_color = if app.mode == Mode::Input {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let input = Paragraph::new(query_line(&app.query, scrolled, app.mode == Mode::Input)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(" 検索 "),
+    );
     frame.render_widget(input, areas[0]);
     draw_tabs(frame, app, areas[1]);
 
@@ -826,34 +836,39 @@ fn draw_grid(frame: &mut Frame, app: &App, area: Rect, layout: &grid::Layout) {
     }
 }
 
+/// list 表示の 1 行。印は Badge の色を付け、残りは既定のスタイルで続ける。
+/// サムネイルを描かない list 表示では present_thumbs のバッジ (#66) が乗らないので、
+/// 行の文字に印を足す。
+fn list_row_line(app: &App, result: &crate::search::SearchResult, shorts: bool) -> Line<'static> {
+    let uploader = result.uploader.clone().unwrap_or_else(|| "-".to_string());
+    let marks: Vec<badge::Badge> = shorts
+        .then_some(badge::Badge::Shorts)
+        .into_iter()
+        .chain(badge::badges_for(&app.engagement, result))
+        .collect();
+    let mut spans: Vec<Span<'static>> = marks
+        .iter()
+        .map(|b| Span::styled(b.symbol(), Style::default().fg(b.color())))
+        .collect();
+    if !marks.is_empty() {
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::raw(format!(
+        "{}  {}  [{}]",
+        format_time(result.duration),
+        result.title,
+        uploader
+    )));
+    Line::from(spans)
+}
+
 /// Kitty graphics protocol 非対応の端末と、格子を組めない狭さのときの従来表示。
 fn draw_list(frame: &mut Frame, app: &App, area: Rect) {
     let shorts = viewing_shorts(app);
     let items: Vec<ListItem> = app
         .view_results()
         .iter()
-        .map(|r| {
-            let uploader = r.uploader.as_deref().unwrap_or("-");
-            // サムネイルを描かない list 表示では present_thumbs のバッジ (#66) が
-            // 乗らないので、行の文字に印を足す。
-            let marks: String = shorts
-                .then_some(badge::Badge::Shorts)
-                .into_iter()
-                .chain(badge::badges_for(&app.engagement, r))
-                .map(|b| b.symbol())
-                .collect();
-            let prefix = if marks.is_empty() {
-                String::new()
-            } else {
-                format!("{marks} ")
-            };
-            ListItem::new(format!(
-                "{prefix}{}  {}  [{}]",
-                format_time(r.duration),
-                r.title,
-                uploader
-            ))
-        })
+        .map(|r| ListItem::new(list_row_line(app, r, shorts)))
         .collect();
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" 結果 "))
@@ -3514,6 +3529,15 @@ mod tests {
             [(rect.x, rect.y), (rect.right() - 1, rect.bottom() - 1)]
         }
 
+        /// TestBackend に 1 フレーム描いて、Buffer をそのまま返す。色を見るテスト用。
+        fn rendered_buffer(app: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("端末");
+            terminal.draw(|frame| draw(frame, app)).expect("描ける");
+            terminal.backend().buffer().clone()
+        }
+
         /// TestBackend に 1 フレーム描いて、画面の文字だけを行ごとに取り出す。
         fn rendered(app: &App, width: u16, height: u16) -> String {
             let mut terminal =
@@ -4447,6 +4471,68 @@ mod tests {
         }
 
         #[test]
+        fn the_search_box_border_is_brighter_while_focused() {
+            // 検索欄はどの画面でも常に出ているので、フォーカスの有無を枠の色で示す。
+            let focused = input_app("q");
+            let unfocused = grid_app(1);
+
+            let focused_buf = rendered_buffer(&focused, 80, 24);
+            let unfocused_buf = rendered_buffer(&unfocused, 80, 24);
+            // 枠の左上角 (area.y 行, area.x 列)。
+            let focused_fg = focused_buf[(0, 0)].fg;
+            let unfocused_fg = unfocused_buf[(0, 0)].fg;
+
+            assert_eq!(focused_fg, Color::Cyan, "{:?}", focused_buf[(0, 0)]);
+            assert_eq!(unfocused_fg, Color::DarkGray, "{:?}", unfocused_buf[(0, 0)]);
+            assert_ne!(focused_fg, unfocused_fg);
+        }
+
+        #[test]
+        fn the_list_view_colors_the_liked_and_subscribed_marks() {
+            // 記号だけでなく色でも目立たせる (badge::Badge::color と同じ色)。
+            let mut app = grid_app(1);
+            app.settings.search.layout = LayoutMode::List;
+            app.results[0].channel_id = Some("UC1".to_string());
+            app.engagement
+                .remember_like("id0", true, std::time::SystemTime::now());
+            app.engagement
+                .remember_subscription("UC1", true, std::time::SystemTime::now());
+
+            let buffer = rendered_buffer(&app, 80, 24);
+            let row = (0..buffer.area.height)
+                .find(|&y| {
+                    let text: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    text.contains("title 0")
+                })
+                .expect("結果の行がある");
+
+            let liked_cell = (0..buffer.area.width)
+                .map(|x| &buffer[(x, row)])
+                .find(|cell| cell.symbol() == Badge::Liked.symbol())
+                .expect("いいねの印がある");
+            assert_eq!(liked_cell.fg, Color::Rgb(220, 40, 40), "{liked_cell:?}");
+
+            let subscribed_cell = (0..buffer.area.width)
+                .map(|x| &buffer[(x, row)])
+                .find(|cell| cell.symbol() == Badge::Subscribed.symbol())
+                .expect("登録の印がある");
+            assert_eq!(
+                subscribed_cell.fg,
+                Color::Rgb(40, 190, 90),
+                "{subscribed_cell:?}"
+            );
+
+            // タイトルなど地の文には色を付けない。
+            let title_cell = (0..buffer.area.width)
+                .map(|x| &buffer[(x, row)])
+                .find(|cell| cell.symbol() == "t")
+                .expect("タイトルの文字がある");
+            assert_eq!(title_cell.fg, Color::Reset, "{title_cell:?}");
+        }
+
+        #[test]
         fn the_list_view_marks_liked_and_subscribed_rows() {
             // list 表示はサムネイルを描かないので、present_thumbs のバッジ (#66) が
             // 乗らない。行のテキストに印を足して、ここでも分かるようにする。
@@ -4490,6 +4576,33 @@ mod tests {
                 .find(|line| line.contains("title 1"))
                 .expect("2 行目がある");
             assert!(!line1.contains(Badge::Live.symbol()), "{line1}");
+        }
+
+        #[test]
+        fn list_row_line_has_no_leading_space_without_marks() {
+            let app = grid_app(1);
+            let line = list_row_line(&app, &app.results[0], false);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, "--:--  title 0  [-]", "{line:?}");
+        }
+
+        #[test]
+        fn list_row_line_shows_the_uploader_when_it_has_one() {
+            let mut app = grid_app(1);
+            app.results[0].uploader = Some("Some Channel".to_string());
+            let line = list_row_line(&app, &app.results[0], false);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, "--:--  title 0  [Some Channel]", "{line:?}");
+        }
+
+        #[test]
+        fn list_row_line_puts_exactly_one_space_after_the_marks() {
+            let mut app = grid_app(1);
+            app.engagement
+                .remember_like("id0", true, std::time::SystemTime::now());
+            let line = list_row_line(&app, &app.results[0], false);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, "♥ --:--  title 0  [-]", "{line:?}");
         }
 
         #[test]
