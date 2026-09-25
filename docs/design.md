@@ -145,6 +145,7 @@ tuitube に手を入れる人向けの説明。使い方は [README](../README.m
 - 登録状態が分からないチャンネルは未登録と同じ見た目にする
 - `engagement.json` は `<名前>.tmp.<pid>` に書いてから `rename` する。控えが空なら書かない
 - 再生画面の登録(`u`)は、再生を始めたときの行の `channel_id` を使う。`channel_id` の無い行から始めた再生では登録できない
+- 結果一覧・チャンネル・プレイリストの中身では、`l`(いいね)・`u`(登録)を選んでいる行に対して使う。`u` は行が `channel_id` を持つ場合だけ効く(`actions::like_video` は `App::view_selected_result()` を見る。`actions::subscribe_selected_channel` は行の `channel_id` を使うので、チャンネルタブの行(`channel_id` を欠く)では効かない。そちらは `subscribe_channel` が `app.channel.channel_id` を使う)
 
 ## チャンネル
 

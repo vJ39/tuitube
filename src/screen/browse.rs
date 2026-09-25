@@ -4,9 +4,10 @@
 
 use crate::actions::{
     Oauth, Session, config_path_from_env, hide_current_channel, hide_selected, jump_to_search,
-    leave_background, leave_channel, load_more, move_selection, open_channel, reload_channel_tab,
-    reload_tab, save_video, select_channel_tab, select_tab, start_playback, submit_query,
-    subscribe_channel, switch_channel_tab, switch_tab, toggle_search_layout,
+    leave_background, leave_channel, like_video, load_more, move_selection, open_channel,
+    reload_channel_tab, reload_tab, save_video, select_channel_tab, select_tab, start_playback,
+    submit_query, subscribe_channel, subscribe_selected_channel, switch_channel_tab, switch_tab,
+    toggle_search_layout,
 };
 use crate::app::{App, AppEvent, ChannelView, Mode, format_time};
 use crate::badge;
@@ -172,6 +173,8 @@ async fn handle_key_results_with<B: oauth::Backend + 'static>(
         KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('a') => save_video(app, tx, session, deps),
+        KeyCode::Char('l') => like_video(app, tx, session, deps),
+        KeyCode::Char('u') => subscribe_selected_channel(app, tx, session, deps),
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         KeyCode::Char('p') => open_playlists(app, tx, session),
         // もっと見られる状態でだけ動く (App::can_load_more で判定し、load_more_with が弾く)。
@@ -226,6 +229,7 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         KeyCode::Char('s') => subscribe_channel(app, tx, session, deps),
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('a') => save_video(app, tx, session, deps),
+        KeyCode::Char('l') => like_video(app, tx, session, deps),
         KeyCode::Char('h') => hide_current_channel(app, session, std::time::Instant::now()),
         // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
         KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
@@ -272,6 +276,8 @@ async fn handle_key_playlist_with<B: oauth::Backend + 'static>(
         KeyCode::Char('c') => open_channel(app, tx, session),
         KeyCode::Char('d') => open_download(app, session),
         KeyCode::Char('a') => save_video(app, tx, session, deps),
+        KeyCode::Char('l') => like_video(app, tx, session, deps),
+        KeyCode::Char('u') => subscribe_selected_channel(app, tx, session, deps),
         // プレイリストごと隠す手はないので、チャンネルと違い動画 1 件だけを隠す。
         KeyCode::Char('h') => hide_selected(app, std::time::Instant::now()),
         // grid/list の即時切替+自動保存。mpv には触れないので同期のまま呼べる。
@@ -919,6 +925,8 @@ pub fn results_hints(can_load_more: bool, background: bool) -> Vec<String> {
     }
     hints.push("v:表示切替".to_string());
     hints.push("a:保存".to_string());
+    hints.push("l:いいね".to_string());
+    hints.push("u:登録".to_string());
     hints
 }
 
@@ -942,6 +950,7 @@ pub fn channel_hints(background: bool) -> Vec<String> {
     }
     hints.push("v:表示切替".to_string());
     hints.push("a:保存".to_string());
+    hints.push("l:いいね".to_string());
     hints
 }
 
@@ -963,6 +972,8 @@ pub fn playlist_hints(background: bool) -> Vec<String> {
     }
     hints.push("v:表示切替".to_string());
     hints.push("a:保存".to_string());
+    hints.push("l:いいね".to_string());
+    hints.push("u:登録".to_string());
     hints
 }
 
@@ -1759,6 +1770,111 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn l_on_the_results_list_likes_the_selected_video() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = grid_app(3);
+            app.selected = 1;
+
+            handle_key_results_with(
+                &mut app,
+                key(KeyCode::Char('l')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+
+            assert_eq!(app.notice.as_deref(), Some(crate::oauth::LIKE_NOTICE));
+            assert!(session.oauth_task.is_some(), "送信が積まれている");
+        }
+
+        #[tokio::test]
+        async fn u_on_the_results_list_subscribes_the_selected_video_channel() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = channel_source_app();
+            app.selected = 1;
+
+            handle_key_results_with(
+                &mut app,
+                key(KeyCode::Char('u')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+
+            assert_eq!(app.notice.as_deref(), Some(crate::oauth::SUBSCRIBE_NOTICE));
+            assert!(session.oauth_task.is_some(), "送信が積まれている");
+        }
+
+        #[tokio::test]
+        async fn l_on_a_channel_video_list_likes_the_selected_video() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = channel_app(3);
+            app.selected = 1;
+
+            handle_key_channel_with(
+                &mut app,
+                key(KeyCode::Char('l')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+
+            assert_eq!(app.notice.as_deref(), Some(crate::oauth::LIKE_NOTICE));
+            assert!(session.oauth_task.is_some(), "送信が積まれている");
+        }
+
+        #[tokio::test]
+        async fn l_on_a_playlist_likes_the_selected_video() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlist_app(3);
+            app.selected = 1;
+
+            handle_key_playlist_with(
+                &mut app,
+                key(KeyCode::Char('l')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+
+            assert_eq!(app.notice.as_deref(), Some(crate::oauth::LIKE_NOTICE));
+            assert!(session.oauth_task.is_some(), "送信が積まれている");
+        }
+
+        #[tokio::test]
+        async fn u_on_a_playlist_subscribes_the_selected_video_channel() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlist_app(3);
+            app.selected = 1;
+
+            handle_key_playlist_with(
+                &mut app,
+                key(KeyCode::Char('u')),
+                &tx,
+                &mut session,
+                fake_oauth(),
+                None,
+            )
+            .await;
+
+            assert_eq!(app.notice.as_deref(), Some(crate::oauth::SUBSCRIBE_NOTICE));
+            assert!(session.oauth_task.is_some(), "送信が積まれている");
+        }
+
+        #[tokio::test]
         async fn s_on_a_channel_starts_the_subscription() {
             let (tx, _rx) = channel();
             let mut session = Session::default();
@@ -1816,10 +1932,10 @@ mod tests {
         #[tokio::test]
         async fn the_other_channel_keys_do_not_subscribe() {
             let (tx, _rx) = channel();
+            // l は今は「いいね」用に使うので、ここでは登録(subscribe)だけを見る。
             for code in [
                 KeyCode::Char('r'),
                 KeyCode::Char('c'),
-                KeyCode::Char('l'),
                 KeyCode::Down,
                 KeyCode::Up,
             ] {
@@ -2441,6 +2557,7 @@ mod tests {
             // Esc はプレイリストの中へではなく、検索欄まで一気に戻る。
             assert_eq!(app.mode, Mode::Input);
             assert!(app.playlist.is_none(), "プレイリスト側も畳む");
+            assert!(app.channel.is_none(), "チャンネル側も畳む");
         }
 
         #[tokio::test]
@@ -4005,7 +4122,7 @@ mod tests {
         #[test]
         fn the_channel_help_names_the_hide_and_subscribe_keys() {
             let help = help_80(Mode::Channel, DisplayMode::Embedded);
-            for key in ["s:登録", "h:隠す"] {
+            for key in ["s:登録", "h:隠す", "Esc:検索"] {
                 assert!(help.contains(key), "{key} が無い: {help}");
             }
             assert!(grid::display_width(&help) <= 80, "{help}");
@@ -4036,17 +4153,25 @@ mod tests {
         }
 
         #[test]
-        fn the_list_help_names_the_save_key_last() {
-            for hints in [
-                results_hints(false, false),
-                channel_hints(false),
-                playlist_hints(false),
+        fn the_list_help_names_the_engagement_keys_last() {
+            // 幅の狭い端末で落ちるのはここに並べた末尾から。優先度が最も低いものを置く。
+            for (hints, wanted, last) in [
+                (
+                    results_hints(false, false),
+                    vec!["a:保存", "l:いいね", "u:登録"],
+                    "u:登録",
+                ),
+                (channel_hints(false), vec!["a:保存", "l:いいね"], "l:いいね"),
+                (
+                    playlist_hints(false),
+                    vec!["a:保存", "l:いいね", "u:登録"],
+                    "u:登録",
+                ),
             ] {
-                assert_eq!(
-                    hints.last().map(String::as_str),
-                    Some("a:保存"),
-                    "{hints:?}"
-                );
+                assert_eq!(hints.last().map(String::as_str), Some(last), "{hints:?}");
+                for key in wanted {
+                    assert!(hints.iter().any(|h| h == key), "{key} が無い: {hints:?}");
+                }
             }
         }
 

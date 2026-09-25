@@ -600,7 +600,7 @@ pub fn subscribe_playing_channel<B>(
     subscribe_to(app, tx, session, channel_id, deps);
 }
 
-/// 再生中の動画にいいねする。動画 ID を取れなければ何もしない。
+/// いいねする。再生中はその動画、それ以外では選んでいる動画。動画 ID を取れなければ何もしない。
 pub fn like_video<B>(
     app: &mut App,
     tx: &UnboundedSender<AppEvent>,
@@ -609,10 +609,36 @@ pub fn like_video<B>(
 ) where
     B: oauth::Backend + 'static,
 {
-    let Some(video_id) = oauth::video_id_from_url(&app.playback.url) else {
+    let video_id = match app.mode {
+        Mode::Playing => oauth::video_id_from_url(&app.playback.url),
+        _ => app
+            .view_selected_result()
+            .map(|result| result.id.clone())
+            .filter(|id| !id.is_empty()),
+    };
+    let Some(video_id) = video_id else {
         return;
     };
     start_oauth(app, tx, session, oauth::Action::Like(video_id), deps);
+}
+
+/// 選んでいる動画のチャンネルを登録する。行が channel_id を持たなければ何もしない
+/// (チャンネル画面のタブの行は channel_id を欠くので、そちらは subscribe_channel を使う)。
+pub fn subscribe_selected_channel<B>(
+    app: &mut App,
+    tx: &UnboundedSender<AppEvent>,
+    session: &mut Session,
+    deps: Oauth<B>,
+) where
+    B: oauth::Backend + 'static,
+{
+    let Some(channel_id) = app
+        .view_selected_result()
+        .and_then(|r| r.channel_id.clone())
+    else {
+        return;
+    };
+    subscribe_to(app, tx, session, channel_id, deps);
 }
 
 /// 動画を tuitube のプレイリストへ保存する。再生中はその動画、一覧では選んでいる動画。
