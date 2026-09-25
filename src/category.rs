@@ -1,6 +1,6 @@
 //! 擬似カテゴリタブ。YouTube 側の本物のカテゴリは廃止済みなので固定キーワードで代える。
 
-use crate::cookies::{Feed, Target};
+use crate::cookies::{CookieState, Feed, Target};
 use crate::search::SearchResult;
 use std::cell::Cell;
 
@@ -146,6 +146,22 @@ impl Tabs {
         &self.states[self.selected]
     }
 
+    /// 検索語がちょうど一致するタブの位置。無ければ None。
+    pub fn index_of_query(&self, query: &str) -> Option<usize> {
+        self.categories.iter().position(|c| c.query == query)
+    }
+
+    /// 起動時に開く先。cookie 連携があればおすすめのタブ、無ければ先頭のカテゴリ。
+    /// どちらも無ければ (「すべて」しか無い設定) None。
+    pub fn startup_index(&self, cookies: &CookieState) -> Option<usize> {
+        if !matches!(cookies, CookieState::Off)
+            && let Some(index) = self.index_of_query(Feed::Recommended.keyword())
+        {
+            return Some(index);
+        }
+        (self.categories.len() > 1).then_some(1)
+    }
+
     pub fn state_mut(&mut self) -> &mut TabState {
         &mut self.states[self.selected]
     }
@@ -159,6 +175,7 @@ impl Tabs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cookies::CookieSource;
     use crate::cookies::Feed;
 
     fn result(id: &str) -> SearchResult {
@@ -336,6 +353,43 @@ mod tests {
         tabs.select_all();
         assert!(tabs.is_all());
         assert_eq!(tabs.selected(), 0);
+    }
+
+    #[test]
+    fn index_of_query_finds_the_matching_tab() {
+        let tabs = Tabs::default();
+        assert_eq!(
+            tabs.index_of_query(":ytrec"),
+            Some(6),
+            "音楽/ゲーム/ニュース/アニメ/スポーツの次"
+        );
+        assert_eq!(tabs.index_of_query("ないクエリ"), None);
+    }
+
+    #[test]
+    fn startup_index_prefers_recommended_when_cookies_are_configured() {
+        let tabs = Tabs::default();
+        let cookies = CookieState::Armed(CookieSource::from_spec(Some("chrome")).unwrap());
+        assert_eq!(tabs.startup_index(&cookies), tabs.index_of_query(":ytrec"));
+    }
+
+    #[test]
+    fn startup_index_falls_back_to_the_first_category_without_cookies() {
+        let tabs = Tabs::default();
+        assert_eq!(tabs.startup_index(&CookieState::Off), Some(1));
+    }
+
+    #[test]
+    fn startup_index_falls_back_when_the_feed_tab_is_missing() {
+        let tabs = Tabs::with_categories(vec![Category::new("音楽", "音楽")]);
+        let cookies = CookieState::Armed(CookieSource::from_spec(Some("chrome")).unwrap());
+        assert_eq!(tabs.startup_index(&cookies), Some(1));
+    }
+
+    #[test]
+    fn startup_index_is_none_with_only_the_all_tab() {
+        let tabs = Tabs::with_categories(vec![]);
+        assert_eq!(tabs.startup_index(&CookieState::Off), None);
     }
 
     #[test]

@@ -136,6 +136,11 @@ async fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         thumbs::prune_cache(&dir, app.settings.thumbnails.max_cached);
     }
     let mut session = Session::default();
+    // cookie 連携があればおすすめ、無ければ先頭のカテゴリを起動直後に取りに行く。
+    // 検索できないタブなら startup_index が None を返すので、その場合は検索欄のまま待つ。
+    if let Some(index) = app.tabs.startup_index(&app.cookies) {
+        actions::select_tab(&mut app, &tx, &mut session, index);
+    }
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
 
     loop {
