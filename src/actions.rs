@@ -799,6 +799,16 @@ fn hide_failed(reason: &str) -> String {
     format!("非表示リストを保存できません: {reason}")
 }
 
+/// Esc で検索欄へ直接戻る。leave_channel/leave_playlist/leave_playlists と同じ
+/// 後始末を経由しつつ、ネストの深さに関わらず必ず検索欄で止める。
+pub fn jump_to_search(app: &mut App, session: &mut Session) {
+    leave_channel(app, session);
+    crate::screen::playlists::leave_playlist(app, session);
+    crate::screen::playlists::leave_playlists(app, session);
+    app.mode = Mode::Input;
+    app.set_error(None);
+}
+
 pub fn leave_channel(app: &mut App, session: &mut Session) {
     if app.channel.is_none() {
         return;
@@ -4184,6 +4194,55 @@ mod tests {
             "読み終えたタブは取り直さない"
         );
         assert_eq!(app.view_result_ids(), ["s"]);
+    }
+
+    #[tokio::test]
+    async fn jump_to_search_leaves_a_channel_straight_to_input() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut session = Session::default();
+        let mut app = channel_grid_app();
+        open_channel_with(&mut app, &tx, &mut session, StubYtDlp);
+
+        jump_to_search(&mut app, &mut session);
+
+        assert!(app.channel.is_none());
+        assert_eq!(app.mode, Mode::Input, "1段だけでなく検索欄まで直接戻る");
+    }
+
+    #[test]
+    fn jump_to_search_leaves_a_playlist_and_its_list_straight_to_input() {
+        let mut app = App {
+            playlists: Some(PlaylistsView {
+                entries: vec![entry("PL1", "作業用BGM")],
+                selected: 0,
+                loaded: true,
+            }),
+            playlist: Some(PlaylistView::new(
+                "PL1".to_string(),
+                "作業用BGM".to_string(),
+            )),
+            mode: Mode::Playlist,
+            ..App::default()
+        };
+
+        jump_to_search(&mut app, &mut Session::default());
+
+        assert!(app.playlist.is_none());
+        assert!(app.playlists.is_none(), "1段(一覧)だけでなく両方畳む");
+        assert_eq!(app.mode, Mode::Input);
+    }
+
+    #[test]
+    fn jump_to_search_does_nothing_extra_from_plain_results() {
+        let mut app = App {
+            mode: Mode::Results,
+            results: vec![result("v0")],
+            ..App::default()
+        };
+
+        jump_to_search(&mut app, &mut Session::default());
+
+        assert_eq!(app.mode, Mode::Input);
     }
 
     #[tokio::test]

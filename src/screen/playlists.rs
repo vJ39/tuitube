@@ -3,7 +3,8 @@
 //! 開いたプレイリストの中身 (Mode::Playlist) の描画とキー処理は結果一覧と同じ側にある。
 
 use crate::actions::{
-    Session, cancel_search, leave_background, request_reload, search_return_mode, spawn_search,
+    Session, cancel_search, jump_to_search, leave_background, request_reload, search_return_mode,
+    spawn_search,
 };
 use crate::app::{App, AppEvent, Mode, PlaylistView};
 use crate::screen::browse;
@@ -85,7 +86,8 @@ pub async fn handle_key_playlists(
         KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
         KeyCode::Char('b') => leave_background(app, session).await,
-        KeyCode::Char('/') | KeyCode::Esc => leave_playlists(app, session),
+        KeyCode::Char('/') => leave_playlists(app, session),
+        KeyCode::Esc => jump_to_search(app, session),
         KeyCode::Char('q') => app.confirm_quit = true,
         _ => {}
     }
@@ -128,7 +130,7 @@ pub fn playlists_hints(background: bool) -> Vec<String> {
     let mut hints = vec![
         "↑↓:選択".to_string(),
         "Enter:開く".to_string(),
-        "Esc:戻る".to_string(),
+        "Esc:検索".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ];
@@ -582,19 +584,30 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn esc_and_slash_fold_the_playlists_list() {
-            for code in [KeyCode::Esc, KeyCode::Char('/')] {
-                let (tx, _rx) = channel();
-                let mut session = Session::default();
-                let mut app = playlists_app(3);
+        async fn slash_folds_the_playlists_list() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlists_app(3);
 
-                handle_key(&mut app, key(code), &tx, &mut session).await;
+            handle_key(&mut app, key(KeyCode::Char('/')), &tx, &mut session).await;
 
-                assert!(app.playlists.is_none(), "{code:?}");
-                assert_eq!(app.mode, Mode::Results, "{code:?}");
-                assert_eq!(app.view_result_ids(), ["id0", "id1", "id2", "id3"]);
-                assert!(!take_search(&mut session), "戻るだけでは取り直さない");
-            }
+            assert!(app.playlists.is_none());
+            assert_eq!(app.mode, Mode::Results);
+            assert_eq!(app.view_result_ids(), ["id0", "id1", "id2", "id3"]);
+            assert!(!take_search(&mut session), "戻るだけでは取り直さない");
+        }
+
+        #[tokio::test]
+        async fn esc_jumps_straight_to_the_search_box_from_the_playlists_list() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlists_app(3);
+
+            handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+
+            assert!(app.playlists.is_none());
+            assert_eq!(app.mode, Mode::Input);
+            assert!(!take_search(&mut session));
         }
 
         #[tokio::test]
@@ -698,7 +711,7 @@ mod tests {
         fn the_playlists_help_names_the_open_and_back_keys() {
             // タイトルだけの一覧なので、案内に出ないと開き方も戻り方も分からない。
             let help = ui::fit_hints(&playlists_hints(false), 80);
-            for key in ["↑↓:選択", "Enter:開く", "Esc:戻る", "q:終了", "S:設定"] {
+            for key in ["↑↓:選択", "Enter:開く", "Esc:検索", "q:終了", "S:設定"] {
                 assert!(help.contains(key), "{key} が無い: {help}");
             }
             assert!(grid::display_width(&help) <= 80, "{help}");

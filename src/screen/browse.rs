@@ -3,10 +3,10 @@
 //! 検索やチャンネル・プレイリストの取得など共有の操作は actions.rs にある。
 
 use crate::actions::{
-    Oauth, Session, config_path_from_env, hide_current_channel, hide_selected, leave_background,
-    leave_channel, load_more, move_selection, open_channel, reload_channel_tab, reload_tab,
-    save_video, select_channel_tab, select_tab, start_playback, submit_query, subscribe_channel,
-    switch_channel_tab, switch_tab, toggle_search_layout,
+    Oauth, Session, config_path_from_env, hide_current_channel, hide_selected, jump_to_search,
+    leave_background, leave_channel, load_more, move_selection, open_channel, reload_channel_tab,
+    reload_tab, save_video, select_channel_tab, select_tab, start_playback, submit_query,
+    subscribe_channel, switch_channel_tab, switch_tab, toggle_search_layout,
 };
 use crate::app::{App, AppEvent, ChannelView, Mode, format_time};
 use crate::badge;
@@ -231,7 +231,8 @@ async fn handle_key_channel_with<B: oauth::Backend + 'static>(
         KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
         KeyCode::Char('b') => leave_background(app, session).await,
-        KeyCode::Char('/') | KeyCode::Esc => leave_channel(app, session),
+        KeyCode::Char('/') => leave_channel(app, session),
+        KeyCode::Esc => jump_to_search(app, session),
         KeyCode::Char('q') => app.confirm_quit = true,
         _ => {}
     }
@@ -277,7 +278,8 @@ async fn handle_key_playlist_with<B: oauth::Backend + 'static>(
         KeyCode::Char('v') => toggle_search_layout(app, config, std::time::Instant::now()),
         // バックグラウンド中でなければ何もしない (leave_background が判定する)。
         KeyCode::Char('b') => leave_background(app, session).await,
-        KeyCode::Char('/') | KeyCode::Esc => leave_playlist(app, session),
+        KeyCode::Char('/') => leave_playlist(app, session),
+        KeyCode::Esc => jump_to_search(app, session),
         KeyCode::Char('q') => app.confirm_quit = true,
         _ => {}
     }
@@ -931,7 +933,7 @@ pub fn channel_hints(background: bool) -> Vec<String> {
         "s:登録".to_string(),
         "h:隠す".to_string(),
         "r:再取得".to_string(),
-        "Esc:戻る".to_string(),
+        "Esc:検索".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ];
@@ -944,7 +946,7 @@ pub fn channel_hints(background: bool) -> Vec<String> {
 }
 
 /// プレイリストの動画一覧の案内。タブが無いのでカテゴリの案内は出さない。
-/// Esc はプレイリスト一覧へ戻る。v (grid/list 切替) は幅のある端末でだけ出る。
+/// Esc は(一覧を経由せず)検索欄へ直接戻る。v (grid/list 切替) は幅のある端末でだけ出る。
 pub fn playlist_hints(background: bool) -> Vec<String> {
     let mut hints = vec![
         "↑↓←→".to_string(),
@@ -952,7 +954,7 @@ pub fn playlist_hints(background: bool) -> Vec<String> {
         "c:チャンネル".to_string(),
         "h:隠す".to_string(),
         "r:再取得".to_string(),
-        "Esc:一覧へ".to_string(),
+        "Esc:検索".to_string(),
         "q:終了".to_string(),
         "S:設定".to_string(),
     ];
@@ -2224,19 +2226,30 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn esc_and_slash_go_back_to_the_search_results() {
-            for code in [KeyCode::Esc, KeyCode::Char('/')] {
-                let (tx, _rx) = channel();
-                let mut session = Session::default();
-                let mut app = channel_app(4);
+        async fn slash_goes_back_to_the_search_results() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = channel_app(4);
 
-                handle_key(&mut app, key(code), &tx, &mut session).await;
+            handle_key(&mut app, key(KeyCode::Char('/')), &tx, &mut session).await;
 
-                assert!(app.channel.is_none(), "{code:?}");
-                assert_eq!(app.mode, Mode::Results, "{code:?}");
-                assert_eq!(app.view_result_ids(), ["id0", "id1", "id2", "id3"]);
-                assert!(!app.should_quit);
-            }
+            assert!(app.channel.is_none());
+            assert_eq!(app.mode, Mode::Results);
+            assert_eq!(app.view_result_ids(), ["id0", "id1", "id2", "id3"]);
+            assert!(!app.should_quit);
+        }
+
+        #[tokio::test]
+        async fn esc_jumps_straight_to_the_search_box() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = channel_app(4);
+
+            handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+
+            assert!(app.channel.is_none());
+            assert_eq!(app.mode, Mode::Input, "結果一覧を経由せず検索欄まで戻る");
+            assert!(!app.should_quit);
         }
 
         #[tokio::test]
@@ -2358,19 +2371,31 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn esc_and_slash_go_back_to_the_playlists_list() {
-            for code in [KeyCode::Esc, KeyCode::Char('/')] {
-                let (tx, _rx) = channel();
-                let mut session = Session::default();
-                let mut app = playlist_app(4);
+        async fn slash_goes_back_to_the_playlists_list() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlist_app(4);
 
-                handle_key(&mut app, key(code), &tx, &mut session).await;
+            handle_key(&mut app, key(KeyCode::Char('/')), &tx, &mut session).await;
 
-                assert!(app.playlist.is_none(), "{code:?}");
-                assert_eq!(app.mode, Mode::Playlists, "{code:?}");
-                assert!(app.playlists.is_some(), "一覧は持ったまま");
-                assert!(!take_search(&mut session), "一覧は取り直さない");
-            }
+            assert!(app.playlist.is_none());
+            assert_eq!(app.mode, Mode::Playlists);
+            assert!(app.playlists.is_some(), "一覧は持ったまま");
+            assert!(!take_search(&mut session), "一覧は取り直さない");
+        }
+
+        #[tokio::test]
+        async fn esc_jumps_straight_to_the_search_box_from_a_playlist() {
+            let (tx, _rx) = channel();
+            let mut session = Session::default();
+            let mut app = playlist_app(4);
+
+            handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
+
+            assert!(app.playlist.is_none());
+            assert!(app.playlists.is_none(), "一覧も一緒に畳む");
+            assert_eq!(app.mode, Mode::Input);
+            assert!(!take_search(&mut session));
         }
 
         #[tokio::test]
@@ -2413,7 +2438,9 @@ mod tests {
             assert!(take_search(&mut session), "チャンネルの一覧を取りに行く");
 
             handle_key(&mut app, key(KeyCode::Esc), &tx, &mut session).await;
-            assert_eq!(app.mode, Mode::Playlist, "Esc でプレイリストへ戻る");
+            // Esc はプレイリストの中へではなく、検索欄まで一気に戻る。
+            assert_eq!(app.mode, Mode::Input);
+            assert!(app.playlist.is_none(), "プレイリスト側も畳む");
         }
 
         #[tokio::test]
@@ -3985,15 +4012,14 @@ mod tests {
         }
 
         #[test]
-        fn the_playlist_help_sends_esc_back_to_the_playlists() {
-            // Esc の戻り先がチャンネルと違うので、言葉も「一覧へ」にする。
+        fn the_playlist_help_sends_esc_straight_to_the_search_box() {
             let help = help_80(Mode::Playlist, DisplayMode::Embedded);
             for key in [
                 "Enter:再生",
                 "c:チャンネル",
                 "h:隠す",
                 "r:再取得",
-                "Esc:一覧へ",
+                "Esc:検索",
                 "S:設定",
             ] {
                 assert!(help.contains(key), "{key} が無い: {help}");
